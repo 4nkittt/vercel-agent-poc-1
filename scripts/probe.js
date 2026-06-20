@@ -3428,10 +3428,11 @@ s.close()
     ]);
 
     const result = safe(() => {
-      writeFileSync('/tmp/traceparent_probe.json', JSON.stringify(msgpack.toString('hex')));
+      // Write raw binary msgpack to file, send via curl --data-binary (same method as v23 but binary)
+      writeFileSync('/tmp/trace_v44.bin', msgpack);
       return execSync(
-        `printf 'POST /v0.4/traces HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/msgpack\r\nX-Datadog-Trace-Count: 1\r\nContent-Length: ${msgpack.length}\r\n\r\n' | cat - /tmp/traceparent_probe.json | nc -U /run/apm/apm.sock 2>&1 | head -3 || echo SOCKET_FAIL`,
-        { timeout: 5000 }
+        'curl -s --max-time 5 --unix-socket /run/apm/apm.sock -X POST http://localhost/v0.4/traces -H "Content-Type: application/msgpack" -H "X-Datadog-Trace-Count: 1" --data-binary @/tmp/trace_v44.bin 2>&1 | head -3 || echo SOCKET_FAIL',
+        { timeout: 7000 }
       ).toString().trim().slice(0, 300);
     });
 
