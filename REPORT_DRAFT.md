@@ -1416,14 +1416,24 @@ Vercel's build log redaction identifies "secret" env var values as any string of
 
 v33 probed `/run/cell/cell.sock` and `/run/containerd/containerd.sock` via `existsSync()`. Both returned `{exists: false}`. Key finding:
 
-The sockets appear in `/proc/net/unix` (shared network namespace) but are NOT visible in the build container's filesystem (mount namespace). This means:
-- Network namespace is shared (we see all sockets in `/proc/net/unix`)
-- Mount namespace is ALSO shared (confirmed v30 — `mnt:[4026532066]` identical between PID 1 and our process)
-- But the socket files are in `/run/` on the overlayfs host layer, not the container's writable layer
+The sockets appear in `/proc/net/unix` (shared network namespace) but are NOT visible in the build container's filesystem (mount namespace). v34 `namespaceCheck` confirmed:
 
-The socket files were created before the container started and live in the lower (read-only) overlayfs layers. They are visible via `/proc/1/root/run/` but not directly at `/run/`. This is the exact same pattern as `/var/task/` being host-only.
+```
+selfNsMnt:  mnt:[4026532066]   ← container's mount namespace
+pid1NsMnt:  mnt:[4026532066]   ← SAME (orchestrator and probe share this ns)
+selfNsNet:  net:[4026531864]   ← network namespace (SHARED with Firecracker VM host)
+pid1NsNet:  net:[4026531864]   ← SAME
+selfNsPid:  pid:[4026532069]   ← PID namespace (container-scoped)
+pid1NsPid:  pid:[4026532069]   ← SAME (PID 1 = orchestrator, not host systemd)
+```
 
-**Implication:** The containerd socket (`/run/containerd/containerd.sock`) IS accessible via `/proc/1/root/run/containerd/containerd.sock` — the same path-prefix that allows reading orchestrator source via `/proc/1/root/var/task/`. V36 probe is staged to confirm.
+**Correct interpretation**: PID 1 in our PID namespace IS the orchestrator (Node.js), NOT the Firecracker VM's systemd. Both PID 1 and our process are in the CONTAINER's mount namespace (mnt:4026532066), NOT the host's. Therefore `/proc/1/root/` gives access to the CONTAINER's root filesystem — the SAME filesystem as `/` in our process.
+
+The sockets (cell.sock, containerd.sock) exist on the Firecracker VM's HOST filesystem (the VM's `/run/`), which is in a DIFFERENT mount namespace that we CANNOT access via `/proc/1/root/`. The network namespace IS shared (explaining why `/proc/net/unix` shows the host sockets), but the filesystem is NOT.
+
+**v38 empirical test:** Tests `/proc/1/root/run/cell/cell.sock` and `/proc/1/root/run/containerd/containerd.sock`. Based on the namespace analysis, these are expected to return `{exists: false}` (same result as accessing `/run/cell/cell.sock` directly). If v38 unexpectedly returns `{exists: true}`, it would indicate an overlooked path to the host's filesystem.
+
+**Alternative access path (not yet tested):** With all capabilities (CapEff: 000001ffffffffff including CAP_SYS_ADMIN and CAP_SYS_PTRACE), `nsenter` into the Firecracker VM host's mount namespace may be possible. If the host's mount namespace inode is discoverable (via /proc/*/ns/mnt scanning for the parent namespace), `nsenter --mount=/proc/HOST_PID/ns/mnt` + socket connect would be the correct attack path for a v39 probe.
 
 ---
 
