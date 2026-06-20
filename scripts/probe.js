@@ -165,8 +165,12 @@ const report = {
     // W3C distributed tracing headers — identify internal trace for this build
     traceparent: process.env.TRACEPARENT,
     tracestate: process.env.TRACESTATE,
+    // Datadog APM integration — DD_TAGS may contain ec2_host:i-xxx (AWS instance ID) and other host metadata
+    ddTags: process.env.DD_TAGS,
+    ddTraceStartupLogs: process.env.DD_TRACE_STARTUP_LOGS,
     // Observability config (may contain internal endpoints)
     observabilityConfig: process.env.VERCEL_OBSERVABILITY_CLIENT_CONFIG,
+    nextPublicObsConfig: process.env.NEXT_PUBLIC_VERCEL_OBSERVABILITY_CLIENT_CONFIG,
     // Additional env values for completeness
     nodeVersion: process.env.VERCEL_PROJECT_SETTINGS_NODE_VERSION,
     cliRollout: process.env.VERCEL_CLI_ROLLOUT_VERSION,
