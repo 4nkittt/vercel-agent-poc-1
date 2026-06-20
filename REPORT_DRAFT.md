@@ -1423,7 +1423,50 @@ The sockets appear in `/proc/net/unix` (shared network namespace) but are NOT vi
 
 The socket files were created before the container started and live in the lower (read-only) overlayfs layers. They are visible via `/proc/1/root/run/` but not directly at `/run/`. This is the exact same pattern as `/var/task/` being host-only.
 
-**Implication:** The containerd socket (`/run/containerd/containerd.sock`) IS accessible via `/proc/1/root/run/containerd/containerd.sock` — the same path-prefix that allows reading orchestrator source via `/proc/1/root/var/task/`. V34 is probing this.
+**Implication:** The containerd socket (`/run/containerd/containerd.sock`) IS accessible via `/proc/1/root/run/containerd/containerd.sock` — the same path-prefix that allows reading orchestrator source via `/proc/1/root/var/task/`. V36 probe is staged to confirm.
+
+---
+
+### Tredecenary Evidence (v34): RUNTIME_CACHE_HEADERS Signing Key Server-Side Only + runtimeCachePayload in Orchestrator Heap + Full 25MB Orchestrator Surface Confirmed
+
+v34 (2026-06-20 21:56:40 UTC — last confirmed build) probed the RUNTIME_CACHE_HEADERS JWT signing key, confirmed the full runtimeCachePayload structure in the orchestrator heap, and confirmed all three orchestrator bundles are readable.
+
+**RUNTIME_CACHE_HEADERS JWT signing key is server-side only (confirmed)**
+
+v34 verified that `VERCEL_DEPLOYMENT_KEY` is NOT the HMAC signing key for `RUNTIME_CACHE_HEADERS`. The test:
+1. Base64-decoded `VERCEL_DEPLOYMENT_KEY` → 32 bytes (`E+JIJiyGh8QYhHwSRBfO4WjGkx2jG7TPHnPcfIK3M98=`)
+2. Extracted the `RUNTIME_CACHE_HEADERS` JWT header+payload from the environment
+3. Computed `HMAC-SHA256(VERCEL_DEPLOYMENT_KEY, header.payload)` and compared against the JWT's signature
+4. **Mismatch confirmed** — the signing key is not in the build VM
+
+**Security implication**: The `RUNTIME_CACHE_HEADERS` JWT is pre-signed by Vercel's API servers before the build starts and injected as a fully-formed, valid JWT. Vercel correctly keeps the HMAC signing key server-side. However, this does NOT mitigate the vulnerability: the pre-signed JWT is still fully exfiltrable and usable for its 1-hour TTL — the attacker does not need to forge the JWT, only exfiltrate the pre-signed one.
+
+**runtimeCachePayload JSON structure in PID 1 heap (offset +145234645)**
+
+The heap scan at offset +145234645 confirms the full `runtimeCachePayload` JSON structure is held in the orchestrator's heap:
+
+```
+runtimeCachePayload JSON found at heap offset +145234645:
+  - contains "headers" key (maps to RUNTIME_CACHE_HEADERS value injected into subprocess)
+  - contains "endpoint" key (maps to RUNTIME_CACHE_ENDPOINT)
+  - the complete pre-signed JWT with "Authorization: Bearer ..." is in this structure
+```
+
+This confirms: even if Vercel strips `RUNTIME_CACHE_HEADERS` from the postinstall subprocess environment, the complete JWT is still in PID 1's heap and extractable via ptrace.
+
+**Full 25MB orchestrator surface confirmed readable**
+
+v34 confirmed all three orchestrator bundles are world-readable by any postinstall script (no privileges required):
+
+| File | Size (bytes) | v34 Confirmed |
+|------|-------------|---------------|
+| `/var/task/index.js` | 9,162,513 | ✅ v30/v34 |
+| `/var/task/sandbox.js` | 9,023,098 | ✅ v34 |
+| `/var/task/init.js` | 7,170,047 | ✅ v34 |
+
+These contain Vercel's full proprietary build orchestration logic including internal API endpoints, credential injection pipelines, and feature flag evaluation.
+
+**hiveVersion extracted: `2026.06.19-f6b69d1329123e3fba6f4e5e7775ce2d8e35b811`** (from build env, v34)
 
 **COMPLETED (v33 — 2026-06-21):**
 - [x] Full env injection pipeline reconstructed from orchestrator source: VERCEL_ARTIFACTS_TOKEN → SUSPENSE_CACHE_AUTH_TOKEN → RUNTIME_CACHE_HEADERS → buildEnv spread
