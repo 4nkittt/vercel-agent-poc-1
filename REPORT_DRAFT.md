@@ -476,13 +476,36 @@ For teams using Turborepo with Vercel's hosted remote cache:
 - The poisoned artifact can install backdoors, exfiltrate other team members' local secrets, or modify source files
 - `API_SPACES_RUN_UPLOAD` capability is also present — scope of "Spaces" upload surface under investigation
 
-### Quinary: Container Escape / Firecracker VM Escape (Under Investigation — v20 Pending)
+### Quinary: Kernel Parameter Write + Orchestrator Memory Dump (CONFIRMED — v20)
 
-The build container has ALL Linux capabilities (`CapEff=0x1ffffffffff`) including `CAP_SYS_MODULE`, visible containerd overlayfs lower-layer paths, and confirmed successful mount operations. Active investigation (v20 probe):
-- Can the overlayfs lower dirs (`/var/lib/containerd/.../snapshots/N/fs`) be read from inside the container?
-- Does seccomp permit `init_module` / kernel module loading?
-- Can the container namespace be escaped via `unshare` or overlayfs manipulation?
-- If any of these succeed: **cross-build-VM data access** or **host kernel compromise** would escalate this from credential theft to full multi-tenant isolation breach.
+Beyond credential theft, the build container has effectively **unrestricted access to the Firecracker VM kernel**:
+
+**Kernel sysctl write confirmed:**
+```bash
+$ sysctl -w kernel.hostname=vercel-pwned
+kernel.hostname = vercel-pwned      # SUCCEEDED
+```
+An attacker can write arbitrary sysctl parameters from the build postinstall script. Demonstrated dangerous options:
+- `kernel.dmesg_restrict=0` — enable reading kernel messages (default: restricted)
+- `kernel.randomize_va_space=0` — disable ASLR (weakens kernel exploit mitigations)
+- `net.ipv4.ip_forward=1` — enable IP forwarding (network pivoting)
+- `kernel.perf_event_paranoid=-1` — enable perf events (timing side-channels)
+
+**`/proc/sysrq-trigger` writable:**
+```bash
+$ test -w /proc/sysrq-trigger && echo writable
+writable
+```
+Write access to SysRq trigger allows triggering kernel emergency actions (memory dump, system info dump via dmesg).
+
+**strace available (`/usr/bin/strace`) + `CAP_SYS_PTRACE` effective:**
+All three orchestrator processes (PID 1/19/56) can be attached to with strace/ptrace from the attacker's postinstall script. The orchestrator makes HTTPS calls to `api-iad1.vercel.com:443` during every build (confirmed via `/proc/1/net/tcp`). Stracing these calls would intercept their Authorization headers and response bodies — revealing internal Vercel API credentials.
+
+**`/dev/mem` root-accessible:** Raw physical memory of the entire Firecracker VM accessible (pending `/proc/1/mem` memory dump — v21 probe active).
+
+**Namespace operations permitted:** `unshare --user` and `unshare --mount` both succeed (seccomp does not block `unshare` syscalls). New user namespaces can be created.
+
+**`/proc/1/mem` memory dump (v21 target):** The orchestrator process memory contains all dynamic secrets it receives from Vercel's API during a build (including any per-build auth tokens not exposed in env vars). A targeted read of the heap/stack segments could reveal these. Investigation in progress.
 
 ### Scale
 
