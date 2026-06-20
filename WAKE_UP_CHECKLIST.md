@@ -1,5 +1,5 @@
 # Wake-Up Checklist — Vercel Bug Bounty Session
-# Updated: 2026-06-21 SESSION COMPLETE — v27 analyzed, VERCEL_ENV_ENC_KEY extracted from heap
+# Updated: 2026-06-21 ACTIVE — v28 probe pushed (2f42320), building now
 
 ## Session Summary
 
@@ -8,10 +8,11 @@ Testing ONLY on own repos + own team (hackerone-sandbox-s-projects). No DoS, no 
 
 Active webhook: https://webhook.site/77ec85f4-79b9-4fb0-a0f6-4e44566f2eac (8 beacons, expires 2026-06-28)
 Old webhook (full): https://webhook.site/f5861d76-4ccc-4b6b-817c-803cb8806962 (50 beacons, v18-v19 only)
-Branch: poc/agent-review (HEAD: 093388c, pushed 2026-06-21)
+Branch: poc/agent-review (HEAD: 2f42320, pushed 2026-06-21)
 
 **CORRECTION: v20-v25 probes never beaconed** (both webhook tokens hit 50-req free limit).
 **v26/v27** re-ran with fresh token and corrected dynamic heap addressing — all critical findings now confirmed.
+**v28**: pushed 2f42320 — s3PresignedFull (X-Amz-Signature from heap) + oidcClaims (decode-only). Awaiting beacon.
 
 ---
 
