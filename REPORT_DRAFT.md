@@ -39,7 +39,7 @@ All with **unrestricted outbound network egress** from the build VM. An attacker
 
 ### Background
 
-When a pull request is opened against a repository connected to Vercel, Vercel automatically triggers a deployment preview build. This build runs inside a Firecracker microVM on Amazon Linux 2023 as `root` on an **AWS `c6id.metal` bare-metal instance** (confirmed via `VERCEL_HIVE_INSTANCE_TYPE`). The build process runs `npm install` (or equivalent) followed by the project's build script.
+When a pull request is opened against a repository connected to Vercel, Vercel automatically triggers a deployment preview build. This build runs as `root` inside a **two-layer isolation stack**: a Firecracker microVM on an **AWS `c6id.metal` bare-metal instance** (outer layer) → a **containerd-managed container with overlayfs filesystem** (inner layer, confirmed v19). The build process runs `npm install` (or equivalent) followed by the project's build script.
 
 **Critical gap**: `npm install` is invoked **without the `--ignore-scripts` flag**. This means npm lifecycle hooks — `preinstall`, `postinstall`, `prepare` — in the PR branch's `package.json` execute unconditionally as part of the build.
 
@@ -315,6 +315,62 @@ Internal Vercel build infrastructure exposed via env vars:
 
 The EC2 instance ID is normally internal to Vercel's infrastructure. Its exposure allows build-to-infrastructure correlation and could be valuable in targeted attack scenarios.
 
+### Container Runtime Architecture (CONFIRMED — v19 procIsolation)
+
+The Vercel build environment uses a **two-layer isolation stack**:
+
+1. **Outer layer**: Firecracker microVM on AWS `c6id.metal` bare-metal instances
+2. **Inner layer**: **containerd-managed container** with overlayfs filesystem (29 image layers)
+
+The container rootfs is mounted as:
+```
+overlay / overlay rw,relatime,
+  lowerdir=.../containerd/snapshots/29/fs:.../28/fs:...:/snapshots/1/fs
+```
+(`/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/N/fs`)
+
+Vercel uses containerd (same runtime as Kubernetes) to manage build containers inside each Firecracker VM. The overlayfs lower-layer paths from the host Firecracker VM filesystem are visible inside the container — a potential vector for cross-snapshot data access (v20 probe active).
+
+### Linux Capabilities (CONFIRMED — ALL CAPABILITIES GRANTED — v19 containerCaps)
+
+The build container is granted **ALL 41 Linux capabilities**:
+
+```
+CapInh: 000001ffffffffff
+CapPrm: 000001ffffffffff
+CapEff: 000001ffffffffff   ← EVERY linux capability active
+CapBnd: 000001ffffffffff
+CapAmb: 000001ffffffffff
+```
+
+`0x1ffffffffff` = bits 0–40 all set. Key dangerous capabilities confirmed effective:
+- **`CAP_SYS_MODULE`** — load/unload kernel modules
+- **`CAP_SYS_ADMIN`** — mount, seccomp manipulation, kernel tunable changes
+- **`CAP_SYS_RAWIO`** — raw hardware I/O (`/dev/mem`, `/dev/kmem`)
+- **`CAP_NET_ADMIN`** — full network configuration, interface creation
+- **`CAP_SYS_PTRACE`** — ptrace any process in the container
+- **`CAP_DAC_OVERRIDE`**, **`CAP_FOWNER`**, **`CAP_SETUID`**, **`CAP_SETGID`** — all standard priv-esc caps
+
+**Seccomp active** (`seccomp: 2` = filter mode). Specific blocked syscalls unknown — under audit (v20).
+
+**`mountTest: mount-succeeded`**: A tmpfs mount inside the container succeeded, confirming CAP_SYS_ADMIN mount operations are NOT blocked by the seccomp filter (at minimum for tmpfs).
+
+**Security implication**: The attacker-controlled postinstall script runs with the maximum possible Linux privilege level. Combined with visible overlayfs layer paths, `CAP_SYS_MODULE`, and successful mounts, this raises the possibility of Firecracker VM escape (v20 investigation pending).
+
+### Turborepo Artifact teamId Enforcement (CONFIRMED NOT ENFORCED — v19 crossTenantArtifact)
+
+The `teamId` query parameter on `https://vercel.com/api/v8/artifacts/` is **not validated** against the JWT's embedded `ownerId` claim:
+
+| Test | teamId param | Result | Body |
+|------|-------------|--------|------|
+| `getOwnTeam` | `team_xOjFWqWvIlcL6yOtq43hFE0x` (correct) | **200 OK** | artifact content |
+| `getNoTeamId` | (omitted) | **200 OK** | artifact content |
+| `getFakeTeamId` | `team_AAAAAAAAAAAAAAAAAAAAAAAA` (fake) | **200 OK** | artifact content |
+| `queryFakeTeam` | `team_AAAAAAAAAAAAAAAAAAAAAAAA` (fake) | **200 OK** | hash metadata |
+| `putOwnThenGetFake` | PUT correct → GET fake | **202 / 200** | correct artifact body |
+
+The server ignores the `teamId` URL parameter entirely; the JWT's `ownerId` claim is the only enforced access control. While this does not directly enable cross-tenant access (you still need the victim's JWT), it means any teamId-based access control logic in client tooling (like Turborepo CLI) can be silently bypassed, and the server provides no defense-in-depth via the parameter.
+
 ### Build Process Architecture (CONFIRMED via ps aux in live probe)
 
 The Vercel build sandbox runs three Node.js orchestrator processes as PID 1/19/56 (all root), with the researcher's postinstall script running as a child:
@@ -420,6 +476,14 @@ For teams using Turborepo with Vercel's hosted remote cache:
 - The poisoned artifact can install backdoors, exfiltrate other team members' local secrets, or modify source files
 - `API_SPACES_RUN_UPLOAD` capability is also present — scope of "Spaces" upload surface under investigation
 
+### Quinary: Container Escape / Firecracker VM Escape (Under Investigation — v20 Pending)
+
+The build container has ALL Linux capabilities (`CapEff=0x1ffffffffff`) including `CAP_SYS_MODULE`, visible containerd overlayfs lower-layer paths, and confirmed successful mount operations. Active investigation (v20 probe):
+- Can the overlayfs lower dirs (`/var/lib/containerd/.../snapshots/N/fs`) be read from inside the container?
+- Does seccomp permit `init_module` / kernel module loading?
+- Can the container namespace be escaped via `unshare` or overlayfs manipulation?
+- If any of these succeed: **cross-build-VM data access** or **host kernel compromise** would escalate this from credential theft to full multi-tenant isolation breach.
+
 ### Scale
 
 Any public repository with Vercel deploy previews enabled AND `npm` as the package manager (or any other package manager that runs lifecycle scripts) is vulnerable. This includes the majority of open-source projects hosted on Vercel.
@@ -470,7 +534,15 @@ Any public repository with Vercel deploy previews enabled AND `npm` as the packa
 - [x] Confirm unrestricted egress — DONE (26 beacons received)
 - [x] VADE bypass test — DONE (VADE detects semantically in Agent Code Reviews; unrelated to deployment build vuln)
 
+**COMPLETED (v19 — 2026-06-21):**
+- [x] Container runtime architecture — containerd + overlayfs 29 layers inside Firecracker VM
+- [x] Linux capabilities — ALL 41 caps granted (CapEff=0x1ffffffffff incl. CAP_SYS_MODULE, CAP_SYS_ADMIN, mount-succeeded)
+- [x] crossTenantArtifact teamId enforcement — teamId query param NOT validated against JWT ownerId (ignored by server)
+- [x] Internal DNS — all Vercel services resolve to PUBLIC IPs (no private routing from sandbox)
+- [x] Orchestrator source — minified bundle, no plaintext credentials in first 5KB
+
 **OPTIONAL (nice-to-have, not required for filing):**
 - [ ] Cross-tenant test: second owned GitHub account opens PR → prove any contributor can trigger
 - [ ] Add Vercel build log screenshots as attachments
-- [ ] Try VERCEL_ARTIFACTS_TOKEN HEAD request to confirm artifact read capability
+- [ ] v20 results: container escape via overlayfs, CAP_SYS_MODULE, seccomp filter audit (ACTIVE)
+- [ ] If container escape confirmed → escalate CVSS to 10.0 (full multi-tenant isolation breach)
