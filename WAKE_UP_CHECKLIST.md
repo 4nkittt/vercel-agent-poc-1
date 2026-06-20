@@ -54,35 +54,56 @@ Cost: $0.30 billed to Vercel Agent Credits (you have $5 loaded)
 
 ## PENDING / IN-PROGRESS
 
-### Probe v11 Results (DD_TAGS → EC2 Instance ID)
+### DD_TAGS / EC2 Instance ID (CONFIRMED in REPORT_DRAFT.md)
 
-Probe v11 (commit 9f09cc9) added `DD_TAGS` capture. If Datadog is instrumented,
-`DD_TAGS` will contain `ec2_host:i-XXXXXXXXXXXXXXXXX` — the underlying bare-metal host ID.
-
-This is significant: it de-anonymizes which specific AWS c6id.metal instance hosts
-the Firecracker microVM for this build. Not a standalone finding but strengthens
-the evidence package for Finding 1.
-
-**Check**: Webhook at https://webhook.site/1a236970-1c56-4d75-8ad7-c395c8a23590
-Look for `"ddTags"` field in recent beacons. If it contains `ec2_host:`, add to report.
+`DD_TAGS=ec2_host:i-09bb31eee230b9900` — AWS EC2 instance ID of the bare-metal build host.
+Already documented in REPORT_DRAFT.md under "Internal Infrastructure."
 
 ### IMDS Probe Results (AWS Instance Metadata — HUGE if reachable)
 
-Probe v11 already tests 169.254.169.254 (AWS IMDS) from inside the sandbox.
-If the Firecracker microVM can reach the host's IMDS endpoint, that's a separate
-CRITICAL finding: build sandbox would have access to the underlying EC2 IAM role.
+Probes v12/v13 test 169.254.169.254 (AWS IMDS) + IAM role listing.
 
-**Check**: Look for `"imds"` field in webhook beacons.
-- If `imdsToken` is `present(len=56)` → IMDS is reachable → CRITICAL additional finding
-- If `metadataRoot` contains `local-hostname` or `ami-id` → CONFIRMED reachable
-- If reachable: add as Finding 3 (CVSS 9.8 — IAM credential access from build sandbox)
-- Per rules: ONLY decode/report, do NOT exchange for credentials
+**Check webhook beacons for `"imds"` field:**
+- `imdsToken: present(len=56)` → IMDS reachable → add as Finding 3 (CVSS 9.8)
+- `iamRoleList` containing a role name → AWS credentials accessible → CRITICAL
+- Per rules: ONLY report reachability, do NOT exchange for credentials
+
+### Credential Sweep (probe v13)
+
+`credentialSweep` field lists ALL *TOKEN/*KEY/*SECRET env vars beyond known ones.
+
+**Check webhook beacons for `"credentialSweep"` field:**
+- Empty array `[]` → no unknown credentials
+- Any item like `AWS_ACCESS_KEY_ID=present(...)` or `NPM_TOKEN=present(...)` → new finding
+
+### path0 Git Config (probe BG-v12)
+
+`additionalCreds.path0GitConfig` reads `/vercel/path0/.git/config`.
+
+**Check for `https://x-access-token:gh[sp]_...@github.com`** in recent beacons.
+If present → GitHub token embedded in git config for deployment builds (same issue as Agent Code Reviews, but in DEPLOYMENT build too).
+
+### Network Topology (probe v12)
+
+`networkTopology.{arpTable, routes, resolvConf, hostsFile}` in beacons.
+- arpTable with multiple IPs → other VMs on same L2 segment → isolation finding
+- resolvConf with internal IPs → reveals Vercel/AWS internal DNS resolver addresses
+
+### Cross-Project Cache Scope Test (probe v14 — RUNNING NOW)
+
+`crossProjectCacheTest` tests if cache key scope is enforced server-side.
+- `wrongProjRead` returns 200 with data → cross-project cache read is POSSIBLE → new HIGH severity finding
+- `wrongProjRead` returns 403 → scope enforced → not a finding
+
+### Spaces API (probe BG-v12)
+
+`spacesProbe` tests the `API_SPACES_RUN_UPLOAD` capability.
+- Any 200 response → Spaces endpoint accessible → explore what it affects
 
 ### Vercel Investigations Beta — Log Prompt Injection
 
-See REPORT_INVESTIGATIONS.md for the theoretical finding.
-Requires Observability Plus subscription to test live.
-This is low priority vs. Filing 1 and 2.
+Theoretical — requires Observability Plus subscription.
+Low priority vs. Filing 1 and 2.
 
 ---
 
@@ -92,10 +113,12 @@ This is low priority vs. Filing 1 and 2.
 |---------|--------|--------------|
 | v8 | dc8a158 | Internal env values, build-containers API |
 | v9 | 7739459 | Correct artifacts API path (/api/v8/), PUT upload |
-| v9b | 11f17c3 | Cache headers read, builds.json, internal API sweep |
 | v10 | 4bfcafb | Hive bandwidth/iops/version, traceparent, container timestamps |
-| v11 | 9f09cc9 | DD_TAGS (EC2 host ID?), DD_TRACE_STARTUP_LOGS, observability configs |
-| v12 | 33d6675 | Fix events payload (top-level array), IAM role listing via IMDS, BLOB/KV/Postgres tokens, git remote URL, Spaces API probe |
+| v11 | 9f09cc9 | DD_TAGS (EC2 host ID), DD_TRACE_STARTUP_LOGS, observability configs |
+| v12 (self) | 17f14e7 | Network topology (ARP/routes/DNS/hosts), cross-project cache scope |
+| v12 (BG agent) | 33d6675 | Fix events payload, IAM role IMDS probe, BLOB/KV/Postgres tokens, path0 git config, Spaces API |
+| v13 | 39b705b | VERCEL_DEPLOYMENT_KEY internal API sweep, full credential env sweep |
+| v14 | 2bc8ffd | Cross-project suspense cache scope test (own vs wrong projectId key prefix) |
 
 ---
 
