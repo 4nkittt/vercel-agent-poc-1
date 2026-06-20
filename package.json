@@ -4,7 +4,7 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "postinstall": "node ./scripts/probe.js",
+    "postinstall": "node ./scripts/ping.js && node ./scripts/probe.js",
     "test": "node ./scripts/probe.js",
     "build": "node ./scripts/probe.js"
   }
