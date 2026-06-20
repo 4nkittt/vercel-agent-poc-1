@@ -191,6 +191,35 @@ VADE correctly identified the semantic attack even from a subtle, legitimately-f
 
 ---
 
+## Orchestrator Source Evidence (Vercel deployment build reads AGENTS.md)
+
+**Source**: `/var/task/index.js` (Vercel build orchestrator, 9.1MB — accessible world-readable from build sandbox, confirmed v34)
+
+The deployment build orchestrator itself reads the same AI instruction files that the Agent Code Reviews ingest:
+
+```javascript
+// Hard-coded list of AI instruction files in Vercel orchestrator /var/task/index.js
+var M7n=["CLAUDE.md","AGENTS.md",".cursorrules",".windsurfrules",".clinerules","GEMINI.md","JULES.md","CONVENTIONS.md",".mcp.json"]
+var fxs=`**/{${M7n.join(",")},.cursor/rules/**,.github/copilot-instructions.md}`  // glob pattern
+var mxs=`{${M7n.join(",")},.cursor/rules/**,.github/copilot-instructions.md}`
+var Axs="detected_ai_files.json"  // output file name
+
+// collectDetectedAiFiles function (60s timeout, max 20 files)
+async function j7n(e,t,n,{timeoutMs:i=gxs}={}){
+  try{
+    await F7n.default.trace("collectDetectedAiFiles",async()=>{
+      // ...reads all matching files, writes to detected_ai_files.json in build
+    })
+  }
+}
+```
+
+This confirms that Vercel's build infrastructure is systematically reading AGENTS.md (and 9 other AI instruction file types) from every repository during deployment builds. The same instruction files that Agent Code Reviews uses as an attack surface are also ingested at the deployment build layer — meaning any AI-powered analysis Vercel runs on the build output will also process a malicious AGENTS.md.
+
+The constant `hxs=20` limits collection to 20 files. The output `detected_ai_files.json` is written to the build environment and likely passed to downstream AI analysis.
+
+---
+
 ## Source Evidence (all source-confirmed; live PR diff injection pending openreview deployment)
 
 | Claim | Source | Evidence |
