@@ -363,7 +363,7 @@ Any public repository with Vercel deploy previews enabled AND `npm` as the packa
 
 ## TODO before filing
 
-**COMPLETED (26 beacons received, all findings live-confirmed):**
+**COMPLETED (35+ beacons received, all findings live-confirmed):**
 - [x] Confirm VERCEL_ENV_ENC_KEY + VERCEL_ENCRYPTED_ENV_CONTENT accessible — DONE
 - [x] Confirm AES-256-CBC decryption algorithm — DONE (609 bytes decrypted)
 - [x] Get full decrypted env content — DONE (21 variables, full 609-byte plaintext)
@@ -372,6 +372,11 @@ Any public repository with Vercel deploy previews enabled AND `npm` as the packa
 - [x] Decode VERCEL_OIDC_TOKEN claims — DONE (sub, iss, aud, project, environment)
 - [x] Decode VERCEL_ARTIFACTS_TOKEN JWT — DONE (capabilities: UPLOAD, DOWNLOAD, SPACES_RUN_UPLOAD)
 - [x] Probe VERCEL_DEPLOYMENT_KEY — DONE (NOT Vercel API token, returns `invalidToken: true`)
+- [x] VERCEL_ARTIFACTS_TOKEN events endpoint — DONE (POST 200 confirmed with fixed payload format)
+- [x] DD_TAGS EC2 instance ID — DONE (ec2_host:i-0c845faf05a32c3a3 confirmed across multiple builds, different hosts each build)
+- [x] IMDS probe — DONE (Firecracker MMDS blocks all EC2 metadata paths — "Resource not found")
+- [x] Network topology — DONE (CGNAT 100.64.0.0/16, gateway 100.64.0.1, DNS 172.31.0.2, unrestricted internet egress)
+- [x] Internal API auth scope — DONE (VERCEL_ARTIFACTS_TOKEN and VERCEL_OIDC_TOKEN both return invalidToken:true against api-iad1.vercel.com — correctly scoped)
 - [x] Confirm internal API endpoints — DONE (api-iad1.vercel.com, build-containers)
 - [x] Confirm unrestricted egress — DONE (26 beacons received)
 - [x] VADE bypass test — DONE (VADE detects semantically in Agent Code Reviews; unrelated to deployment build vuln)
