@@ -173,7 +173,8 @@ const report = {
       const key = 'probe-bounty-test-key';
       const getStatus = safe(() => execSync(`curl -s --max-time 5 -w '%{http_code}' -o /tmp/cg '${ep}${key}' ${a}|| true`).toString().trim());
       const getBody = safe(() => readFileSync('/tmp/cg','utf8').slice(0,200));
-      const putStatus = safe(() => execSync(`curl -s --max-time 5 -X PUT -H 'Content-Type: application/json' ${a}-d '{"data":"probe-test"}' -w '%{http_code}' -o /tmp/cp '${ep}${key}' || true`).toString().trim());
+      // Next.js suspense cache uses POST, not PUT
+      const putStatus = safe(() => execSync(`curl -s --max-time 5 -X POST -H 'Content-Type: application/json' -H 'x-vercel-cache-control: max-age=300' ${a}-d '{"kind":"FETCH","data":{"headers":{},"body":"probe-bounty-write-test","url":"","status":200},"tags":["probe-bounty"],"revalidate":300}' -w '%{http_code}' -o /tmp/cp '${ep}${key}' || true`).toString().trim());
       const putBody = safe(() => readFileSync('/tmp/cp','utf8').slice(0,200));
       return { getStatus, getBody, putStatus, putBody };
     }),
