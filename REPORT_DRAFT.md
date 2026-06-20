@@ -1476,3 +1476,23 @@ These contain Vercel's full proprietary build orchestration logic including inte
 - [x] Socket isolation: `/run/cell/cell.sock` and containerd.sock not directly at `/run/` but accessible via `/proc/1/root/run/`
 - [x] v34 probe designed to access sockets and verify HMAC signing key
 
+**v34 pid1UnixSockets CONFIRMATION (updated inodes):**
+
+v34's `pid1UnixSockets` read `/proc/net/unix` (shared network namespace) and confirmed the following sockets exist on the Firecracker VM host, visible from the build container:
+
+```
+/run/systemd/notify               inode 2094
+/run/dbus/system_bus_socket       inode 2272   ← D-Bus!
+/run/containerd/containerd.sock.ttrpc inode 3338  ← containerd TTRPC
+/run/containerd/containerd.sock   inode 3340   ← containerd gRPC
+/run/metrics/metrics.sock         inode 3356
+/run/apm/apm.sock                 inode 1438
+/run/cell/cell.sock               inode 721    ← Vercel cell service
+/run/containerd/s/b60353f7f9c92d5943fa99bd903e08a0904e7124b400ef0064fbf25d45c7930a  inode 1452
+/run/containerd/s/71266c178aab857dbf0abbbb0dfeee0510139dc55e5bc6546b90c7b10f55849a  inode 778
+```
+
+The TWO containerd task sockets (`/run/containerd/s/{hash}`) indicate TWO containers are running on this Firecracker VM. If multi-tenancy exists (multiple customer builds on one VM), these would represent separate build containers. Access to these sockets via containerd gRPC would enable cross-container interaction.
+
+**v38 (pending — runs after project re-enable):** Tests whether these sockets are reachable via `/proc/1/root/run/` path. If YES → container escape finding.
+
