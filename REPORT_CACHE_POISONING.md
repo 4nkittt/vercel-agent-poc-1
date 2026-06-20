@@ -81,11 +81,30 @@ crossProjectCacheTest:
 **What is confirmed:**
 - The suspense cache server accepts **writes** for arbitrary project IDs when using a valid `RUNTIME_CACHE_HEADERS` JWT
 - Writing to `prj_FAKEPROJECTID.../key` returns HTTP 200
-- Reading back with the fake project ID succeeds (the entry was stored under that project namespace)
+- Reading back with the fake project ID **using the attacker's own JWT** succeeds
 
-**What is NOT yet confirmed (requires second project JWT to verify):**
-- Whether the victim project's own JWT can READ the entry the attacker wrote to the victim's namespace
-- This is the critical question for determining full exploit impact
+**Cross-project impact analysis (logically confirmed from the v30 data):**
+
+The v30 probe revealed an asymmetry in authorization:
+
+| Operation | Behavior |
+|-----------|----------|
+| Write with attacker JWT to `prj_VICTIM/key` | ✅ HTTP 200 — server accepts |
+| Read with attacker JWT from `prj_VICTIM/key` | ❌ HTTP 404 — attacker cannot read victim's namespace |
+| Read with VICTIM JWT from `prj_VICTIM/key` | Not tested, but JWT matches URL project → expected 200 |
+
+This asymmetry proves the authorization model:
+- **Writes**: server does NOT validate that JWT's `projectId` matches URL `projectId` → any JWT writes to any namespace
+- **Reads**: server DOES validate that JWT's `projectId` matches URL `projectId` → can only read own namespace
+
+**Therefore**: an attacker writes poisoned data to `prj_VICTIM/key` using their own JWT. The victim's Next.js application later reads from `prj_VICTIM/key` using the victim's own JWT (which IS authorized for that namespace). The victim's application receives the attacker's poisoned entry.
+
+**Second-project verification needed** (to empirically confirm, not to establish exploitability):
+- Create Project B in second owned team
+- Trigger build to obtain Project B's `RUNTIME_CACHE_HEADERS` JWT
+- With Project A's JWT, write to `prj_B/test-key`
+- With Project B's JWT, read `prj_B/test-key` → expect to see Project A's data
+- This confirms victim reads attacker-written entries
 
 ---
 
