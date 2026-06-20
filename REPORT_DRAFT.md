@@ -684,14 +684,21 @@ Any public repository with Vercel deploy previews enabled AND `npm` as the packa
 - [x] extendedStrace — captured orchestrator write() calls: sar/sadc running hardware diagnostics to /tmp/hw_diagnostics.raw; ps output shows full process tree
 - [x] buildCacheContents — /vercel/build-diagnostics/build_traces.json contains build trace timing; /vercel/output/builds.json (594B); .vercel/project.json
 
-**IN PROGRESS (v23 — 2026-06-21):**
-- [ ] Full JWT extraction from heap — increase output limit from 200 to 2000 chars; get complete JWT to compare vs RUNTIME_CACHE_HEADERS
-- [ ] Heap value scan — search heap for env var VALUES (not just names): VERCEL_ENV_ENC_KEY base64 value, VERCEL_ARTIFACTS_TOKEN JWT
-- [ ] Datadog APM trace injection — POST crafted trace to /v0.7/traces via /run/apm/apm.sock
-- [ ] /tmp/hw_diagnostics.raw contents — binary SAR data from build hardware monitor
-- [ ] /vercel/build_cache_headerDA2jUl/branch — 266-byte cache header file contents
+**COMPLETED (v23 — 2026-06-21):**
+- [x] Full JWT extraction from heap — ALL THREE credential types confirmed in heap (2000-char scan); VERCEL_ARTIFACTS_TOKEN full JWT with signature extracted; VERCEL_OIDC_TOKEN at heap offset +130195460; RUNTIME_CACHE_HEADERS JWT at +129908360
+- [x] Heap value scan — VERCEL_ENV_ENC_KEY base64 value NOT in heap (not held by orchestrator); DECRYPTED env var JSON string found at heap offset +134677525: `VERCEL_ENV":"preview","VERCEL_TARGET_ENV":"preview","TURBO_REMOTE_ONLY":"true","TURBO_RUN_SUMMARY":"true"` — orchestrator holds decrypted env content in heap
+- [x] Datadog APM trace injection CONFIRMED — POST /v0.7/traces to /run/apm/apm.sock → 200 OK with rate_by_service response revealing internal service names `service:containerd,env:production` and `service:hive,env:production`
+- [x] /tmp/hw_diagnostics.raw — SAR binary data present; sar -r output confirms hardware monitoring active
+- [x] /vercel/build_cache_header*/branch — returns S3 presigned URL redirect (already expired, 403 Forbidden from S3)
+- [x] builds.json — `{"target":"preview","cliVersion":"54.14.0","builds":[{"require":"@vercel/static-build",...}]}`
+
+**NEW FINDING from v23 heap scan:**
+- `HEAP+134677525`: Orchestrator heap contains fully decrypted env content as JSON string: `"VERCEL_ENV":"preview","VERCEL_TARGET_ENV":"preview","TURBO_REMOTE_ONLY":"true","TURBO_RUN_SUMMARY":"true","TURBO_DOWNLOAD_LOCAL_ENABLED":"true","NX_DAEMON":"false","TURBO_C...`
+- This proves the orchestrator (PID 1) DECRYPTS `VERCEL_ENCRYPTED_ENV_CONTENT` before injecting vars into the npm subprocess, and holds the decrypted result in its Node.js heap
+- Even if the encrypted env vars were removed from the subprocess environment, they would still be recoverable from PID 1's heap via `ptrace(PTRACE_ATTACH, 1)` + `/proc/1/mem`
+- VERCEL_ENV_ENC_KEY itself was NOT found in heap (key is used ephemerally for decryption, then cleared)
 
 **OPTIONAL (nice-to-have, not required for filing):**
 - [ ] Cross-tenant test: second owned GitHub account opens PR → prove any contributor can trigger
 - [ ] Add Vercel build log screenshots as attachments
-- [ ] If container escape / cross-tenant rootfs access confirmed → escalate CVSS to 10.0
+- [x] Container escape investigation COMPLETE — multi-layer isolation confirmed (Firecracker + containerd), no escape possible, but attacker has ALL capabilities inside the container
