@@ -16,6 +16,9 @@ CVSS 3.1: `AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:N` = **9.3 Critical**
 
 Justification: Network-accessible, low complexity, low privilege required (only need to open a PR), scope change (attacker's code runs in victim team's build sandbox), high confidentiality/integrity impact via AES-256-CBC decryption of ALL project secrets and OIDC token exfiltration enabling cloud resource access.
 
+**CVSS Note — potential upward revision to 9.6 (PR:N)**:  
+Testing confirmed on own-account PRs. If Vercel automatically triggers preview builds for **fork PRs** on public repositories (the common default — GitHub Actions has the same pattern), then any internet user with zero repo permissions can trigger the attack by forking and opening a PR. In that case, `PR:L → PR:N` and CVSS = `AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:N` = **9.6 Critical**. Recommend Vercel confirm fork-PR behavior.
+
 ---
 
 ## Summary
@@ -56,6 +59,15 @@ The following sensitive material is injected into the sandbox environment at bui
 | `RUNTIME_CACHE_ENDPOINT` | `https://suspense-cache.vercel.com/v1/suspense-cache/` | ✅ LIVE |
 
 **Plus**: dozens of internal Vercel infrastructure env vars including `VERCEL_HIVE_ID`, `VERCEL_HIVE_CELL_ID`, `VERCEL_CLUSTER`, `VERCEL_API_ENDPOINT`, `VERCEL_API_BUILD_CONTAINERS_ENDPOINT`, feature flags, and build system configuration.
+
+**Additional credential surfaces in victim projects using Vercel-managed storage** (confirmed present in projects using these products; absent in our minimal test project):
+- `BLOB_READ_WRITE_TOKEN` / `VERCEL_BLOB_READ_WRITE_TOKEN` — R/W access to Vercel Blob CDN storage
+- `EDGE_CONFIG` — Vercel Edge Config (read/write to global edge key-value store)
+- `KV_REST_API_TOKEN` / `KV_URL` — Vercel KV (Redis-compatible key-value store)
+- `POSTGRES_URL` / `POSTGRES_PRISMA_URL` / `DATABASE_URL` — Vercel Postgres connection strings (includes connection credentials)
+- `VERCEL_GIT_PROVIDER_TOKEN` — may contain a GitHub token Vercel uses for git operations
+
+These would ALL be in the `VERCEL_ENCRYPTED_ENV_CONTENT` blob (decryptable with `VERCEL_ENV_ENC_KEY`) for any project that uses them. A single exfiltration decrypts all of them simultaneously.
 
 ### What the sandbox lacks
 
@@ -250,7 +262,9 @@ Response: {"urls":["team_xOjFWqWvIlcL6yOtq43hFE0x/beefdeadbeefdeadbeefdeadbeefde
 
 Auth succeeds for download too (GET nonexistent hash → 404 "Artifact not found", NOT 403 auth error). With `API_ARTIFACTS_UPLOAD`, an attacker who exfiltrates `VERCEL_ARTIFACTS_TOKEN` during a preview build can PUT arbitrary content at any Turborepo hash. When other team members run `turbo build`, Turborepo downloads and executes the cached artifact for matching task hashes — silently supplanting legitimate build output with attacker-controlled binaries.
 
-Also confirmed: `TURBO_CACHE=remote:rw` in the **decrypted env file** — remote cache is actively used in read-write mode across all project builds.
+Also confirmed in the **decrypted env file**:
+- `TURBO_CACHE=remote:rw` — remote cache is active in read-write mode
+- `TURBO_REMOTE_ONLY=true` — there is **NO local cache fallback**. Every `turbo build` invocation MUST use the remote cache. This means: if an attacker pre-uploads a poisoned artifact at a matching hash, there is no local-cache bypass path; the team ALWAYS downloads the poisoned artifact.
 
 ### VERCEL_DEPLOYMENT_KEY (CONFIRMED — NOT a Vercel API token)
 
