@@ -86,7 +86,8 @@ function tryDecrypt(keyStr, contentStr) {
       const ct = raw.slice(16);
       const d = createDecipheriv('aes-256-cbc', useKey, iv);
       const pt = Buffer.concat([d.update(ct), d.final()]);
-      return `cbc: DECRYPTED(${pt.length}b): ${pt.toString('utf8').replace(/\0/g,'').slice(0,300)}`;
+      // Full content — critical evidence that all project env vars are decryptable
+      return `cbc: DECRYPTED(${pt.length}b): ${pt.toString('utf8').replace(/\0/g,'')}`;
     } catch (e) { return `cbc: ERR(${e.message.slice(0,60)})`; }
   };
 
