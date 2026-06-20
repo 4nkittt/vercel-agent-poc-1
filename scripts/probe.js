@@ -151,10 +151,26 @@ const report = {
     hiveCellId: process.env.VERCEL_HIVE_CELL_ID,
     hiveRealm: process.env.VERCEL_HIVE_REALM,
     hiveInstanceType: process.env.VERCEL_HIVE_INSTANCE_TYPE,
+    hiveBandwidth: process.env.VERCEL_HIVE_BANDWIDTH,
+    hiveIops: process.env.VERCEL_HIVE_IOPS,
+    hiveVersion: process.env.VERCEL_HIVE_VERSION,
     deploymentId: process.env.VERCEL_DEPLOYMENT_ID,
     projectId: process.env.VERCEL_PROJECT_ID,
     orgId: process.env.VERCEL_ORG_ID,
     encFilename: process.env.VERCEL_ENCRYPTED_ENV_FILENAME,
+    buildImageId: process.env.VERCEL_IMAGE_ID,
+    buildProvider: process.env.VERCEL_BUILD_PROVIDER,
+    cellCreateTs: process.env.VERCEL_CELL_CREATE_TIMESTAMP,
+    containerStartTime: process.env.VERCEL_CONTAINER_START_TIME,
+    // W3C distributed tracing headers — identify internal trace for this build
+    traceparent: process.env.TRACEPARENT,
+    tracestate: process.env.TRACESTATE,
+    // Observability config (may contain internal endpoints)
+    observabilityConfig: process.env.VERCEL_OBSERVABILITY_CLIENT_CONFIG,
+    // Additional env values for completeness
+    nodeVersion: process.env.VERCEL_PROJECT_SETTINGS_NODE_VERSION,
+    cliRollout: process.env.VERCEL_CLI_ROLLOUT_VERSION,
+    buildImageId2: process.env.VERCEL_BUILD_IMAGE,
   })),
   // RUNTIME_CACHE_ENDPOINT — may allow accessing shared build cache (cross-project?)
   runtimeCache: safe(() => ({
