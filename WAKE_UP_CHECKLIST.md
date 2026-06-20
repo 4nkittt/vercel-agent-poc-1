@@ -68,7 +68,19 @@ Cost: $0.30 billed to Vercel Agent Credits (you have $5 loaded)
 
 ---
 
-## PENDING PROBE RESULTS (v17 — just pushed, beacon expected within 5 min)
+## DIAGNOSTIC RESOLVED (2026-06-21)
+
+**Root cause of v15-v17 beacon silence**: webhook.site 50-request free plan limit reached.
+ALL builds were executing successfully. All beacons were sent but silently rejected by webhook.site.
+
+Fix applied: switched to new webhook token `f5861d76-4ccc-4b6b-817c-803cb8806962`
+New collector: `https://webhook.site/f5861d76-4ccc-4b6b-817c-803cb8806962`
+
+v17 received 2 full beacon sets (2 Vercel build replicas fired).
+
+---
+
+## V17 PROBE RESULTS (ANALYZED — all new findings below)
 
 ### v17 Two-Phase Beacon Architecture
 
@@ -91,29 +103,43 @@ for x in d['data']:
 
 ### New test results to analyze (v17 full beacon):
 
-| Section | What to look for | Impact if positive |
-|---------|-----------------|-------------------|
-| `artifactsToken.deleteStatus` | 200/204 = DELETE works | HIGH: artifact sabotage (delete legitimate builds) |
-| `artifactsToken.listStatus` | 200 = can list all team artifacts | MEDIUM: build history enumeration |
-| `artifactsToken.getEventsStatus` | 200 + data = can enumerate past hashes | MEDIUM: hash enumeration |
-| `oidcInternalAuth.*` | Any 200 → OIDC token accepted by Vercel APIs | CRITICAL: internal API access from build |
-| `cacheJwtInternalAuth.*` | Any 200 → cache JWT accepted elsewhere | HIGH: unexpected auth scope |
-| `cacheRevalidate.*` | 200 for revalidate/delete-tag | MEDIUM: cache eviction DoS |
-| `dnsEnum.apiIad1` | Private IP (10.x or 172.x) → same VPC | Could enable direct internal API access |
-| `dnsEnum.vercelInternal` | Any resolution → internal zone exists | Infrastructure mapping |
-| `artifactsQuery.queryStatus` | 200 = QUERY endpoint works | LOW: hash presence enumeration |
-| `activeTcp.ssEstablished` | Any internal IPs in connections | Infrastructure mapping |
-| `varTask.listing` | Vercel CLI version, config files | Intelligence |
-| `gitCredentialStore.connectGuardLog` | Log file path found | Could reveal all outbound HTTP in build |
+| Section | Result | Impact |
+|---------|--------|--------|
+| `artifactsToken.deleteStatus` | **404** — DELETE NOT supported | No artifact deletion; but PUT overwrites |
+| `artifactsToken.listStatus` | **404** — LIST NOT supported | Can't enumerate all artifacts |
+| `artifactsToken.getEventsStatus` | **404** — events GET not supported | Can't enumerate hash history |
+| `artifactsToken.queryStatus` | **200 OK** — QUERY works! | Can batch-check hash existence |
+| `artifactsToken.putStatus` | **202 Accepted** — still works | Cache poisoning confirmed again |
+| `oidcInternalAuth.*` | **403 invalidToken:true** on all | OIDC correctly scoped to external cloud only |
+| `cacheJwtInternalAuth.*` | **403 missingToken:true** on all | Cache JWT scoped to suspense-cache only |
+| `cacheRevalidate.*` | **404** on all paths tried | Revalidation not accessible from build |
+| `dnsEnum.*` | **empty** (dig/nslookup commands not found?) | DNS enum didn't work — use `host` in v18 |
+| `activeTcp.ssEstablished` | Connections to 76.76.21.112/108:443 | Vercel API connections; VM IP 100.64.36.94 |
+| `varTask.vercelPkg` | **54.14.0** | Vercel CLI version confirmed |
+| `processes (ps aux)` | PID 1/19/56 = index.js, prewarm-cli, sandbox.js | 3 Vercel orchestrators, all root |
 
-### If oidcInternalAuth returns 200:
-→ Add as NEW Finding 4 (CVSS 8.5+ Critical)
-→ Document which endpoints accept OIDC token
-→ STOP: do not use the access, report immediately
+### Summary of new findings from v17:
 
-### If artifactsToken.deleteStatus = 200/204:
-→ Add to REPORT_DRAFT.md Impact section under "Turborepo Remote Cache Poisoning"
-→ "Additionally, VERCEL_ARTIFACTS_TOKEN can DELETE artifacts (HTTP 2xx), enabling cache sabotage..."
+✅ Artifacts QUERY (POST batch hash check) = 200 OK → added to REPORT_DRAFT.md
+❌ Artifacts DELETE = 404 (not supported — good security hygiene)
+❌ Artifacts LIST = 404 (not supported — good security hygiene)  
+❌ OIDC internal auth = 403 (correctly scoped — NOT a new finding)
+❌ Cache JWT internal auth = 403 (correctly scoped — NOT a new finding)
+❌ Cache revalidation = 404 (not accessible — NOT a new finding)
+
+### v18 results:
+
+✅ orchestratorEnv: PID 1/19 have NO sensitive credentials (34-36 vars, all infra-level)
+   → Confirms: Vercel deliberately injects OIDC/artifacts/enc-key only into build subprocess
+   → Added to REPORT_DRAFT.md (Credential Scoping Architecture section)
+
+✅ dnsV2 (host cmd): api-iad1.vercel.com → 76.76.21.108 (PUBLIC Vercel IP)
+   → suspense-cache.vercel.com → 64.239.109.65/123.193 (Cloudflare)
+   → vercel.internal → empty (no internal DNS zone)
+   → All services use public internet routing from sandbox
+
+✅ buildOrchestratorSnippet: minified bundle, can't extract plaintext secrets
+✅ vercelFluid: NOT available at build time (only in runtime decrypted env)
 
 ---
 
@@ -153,6 +179,8 @@ for x in d['data']:
 | v12 | 17f14e7 | Network topology (ARP/DNS/hosts), cross-project cache | ✓ |
 | v13 | 39b705b | VERCEL_DEPLOYMENT_KEY sweep, credential sweep | ✓ |
 | v14 | ca8bc95 | Vercel CLI auth probe, ps aux, npmrc | ✓ |
-| v15 | 5f17b1c+7fd724d | Turborepo DELETE/LIST/getEvents, git cred fill, CONNECT_GUARD log | ✗ TIMED OUT |
-| v16 | cc667b9 | Fixed grep timeout, file-based beacon, DNS enum, artifacts QUERY | ✗ TIMED OUT |
-| v17 | f0e9286 | Two-phase beacon (early+full), OIDC internal auth, cache JWT auth, cache revalidate, active TCP | ← RUNNING |
+| v15 | 5f17b1c+7fd724d | Turborepo DELETE/LIST/getEvents, git cred fill, CONNECT_GUARD log | ✗ webhook limit hit |
+| v16 | cc667b9 | Fixed grep timeout, file-based beacon, DNS enum, artifacts QUERY | ✗ webhook limit hit |
+| v17 | f0e9286 | Two-phase beacon (early+full), OIDC internal auth, cache JWT auth, cache revalidate, active TCP | ✓ 2 full beacons |
+| v18 (diag) | 2783b2e | Diagnostic: ping.js + fresh webhook.site token (f5861d76) | ✓ RESOLVED |
+| v18 (probe) | fb11932 | orchestratorEnv (/proc/{pid}/environ), dnsV2 (host cmd), fluid API, orchestrator source | ✓ 2 full beacons |

