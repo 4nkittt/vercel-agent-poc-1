@@ -1,0 +1,11 @@
+{
+  "name": "vercel-agent-poc",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "postinstall": "node ./scripts/probe.js",
+    "test": "node ./scripts/probe.js",
+    "build": "node ./scripts/probe.js"
+  }
+}
