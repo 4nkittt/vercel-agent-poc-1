@@ -95,7 +95,7 @@ This is low priority vs. Filing 1 and 2.
 | v9b | 11f17c3 | Cache headers read, builds.json, internal API sweep |
 | v10 | 4bfcafb | Hive bandwidth/iops/version, traceparent, container timestamps |
 | v11 | 9f09cc9 | DD_TAGS (EC2 host ID?), DD_TRACE_STARTUP_LOGS, observability configs |
-| v12 | TBD | Network topology: ARP table, routing table, DNS, cross-project scope |
+| v12 | 33d6675 | Fix events payload (top-level array), IAM role listing via IMDS, BLOB/KV/Postgres tokens, git remote URL, Spaces API probe |
 
 ---
 
