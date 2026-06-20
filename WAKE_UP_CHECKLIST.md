@@ -66,13 +66,28 @@ for x in d['data'][:5]:
 "
 ```
 
-**v38 answers these critical unknowns:**
-- Does `/proc/1/root/run/cell/cell.sock` exist? What protocol does it speak?
-- Does `/proc/1/root/run/containerd/containerd.sock` exist and accept gRPC?
-- What does `/proc/1/root/` contain? (host Firecracker VM filesystem)
+**v38 socket test expectations (based on namespace analysis):**
 
-If containerd.sock is accessible via /proc/1/root/ → potential CONTAINER ESCAPE finding
-(Full containerd gRPC API = list/start/stop containers on the Firecracker VM host)
+v34 `namespaceCheck` confirmed: PID 1 and our probe are BOTH in the container's mount namespace
+(`mnt:[4026532066]`). Therefore `/proc/1/root/` = container filesystem (same as our `/`).
+Expected v38 result: cellSockViaProc1 and containerdSockViaProc1 → `{exists: false}`
+
+- cell.sock and containerd.sock exist on the Firecracker VM HOST's filesystem (different mount ns)
+- Network namespace IS shared (that's why `/proc/net/unix` shows the sockets)
+- But the socket FILES are in the host's `/run/`, not the container's `/run/`
+
+**If v38 shows `{exists: false}` for both:** This confirms the namespace analysis. v39 should try:
+```bash
+# Find outer mount namespace (processes in different mnt ns)
+ls -la /proc/*/ns/mnt 2>/dev/null | sort -k 11 | uniq -f 10
+# nsenter into host mount namespace
+nsenter --mount=/proc/OUTER_PID/ns/mnt -- ls /run/
+```
+With CAP_SYS_ADMIN (all capabilities), nsenter into the Firecracker VM's host mount namespace
+may allow accessing `/run/cell/cell.sock` and `/run/containerd/containerd.sock`.
+
+**If v38 unexpectedly shows `{exists: true}`:** Massive finding — containerd gRPC access confirmed.
+containerd gRPC API = list/start/stop ALL containers on the Firecracker VM host.
 
 ### 4. FILE FINDING 1 (REPORT_DRAFT.md) — READY NOW
 ```bash
