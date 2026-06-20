@@ -298,6 +298,51 @@ Internal Vercel build infrastructure exposed via env vars:
 
 The EC2 instance ID is normally internal to Vercel's infrastructure. Its exposure allows build-to-infrastructure correlation and could be valuable in targeted attack scenarios.
 
+### Network Topology (CONFIRMED via live probe)
+
+Network configuration of the Firecracker microVM sandbox:
+
+```
+Subnet:   100.64.0.0/16 (CGNAT / shared address space — private to Vercel/AWS VPC)
+Gateway:  100.64.0.1 (single hop — ARP shows only this gateway, proper L2 isolation)
+DNS:      172.31.0.2 (AWS default VPC resolver — resolves internal AWS/Vercel hostnames)
+MTU:      1500, interface eth0
+```
+
+Key observations:
+- **172.31.0.2 DNS resolver**: This is the standard AWS VPC resolver, accessible from within the build microVM. It can resolve internal AWS/Vercel hostnames that are not publicly resolvable. (v16 probe mapping in progress)
+- **L2 isolation**: Only one gateway visible in ARP table. No other VMs appear on the L2 segment, confirming Firecracker provides proper microVM isolation at the network level.
+- **CGNAT space (100.64.0.0/16)**: The microVM has a private IP in the Carrier-Grade NAT range, routing outbound through a single gateway. This confirms no direct AWS VPC peering to Vercel's internal services (outbound goes via NAT).
+
+### IMDS Status (CONFIRMED — metadata blocked)
+
+AWS Instance Metadata Service (169.254.169.254) is reachable from the Firecracker microVM:
+```
+PUT /latest/api/token → token returned (len=48) — IMDSv2 token acquisition works
+GET /latest/meta-data/ → "Resource not found" — all metadata paths return 404
+GET /latest/meta-data/iam/security-credentials/ → "Resource not found"
+GET /latest/meta-data/instance-id → "Resource not found"
+```
+
+Interpretation: Vercel runs a **mock IMDS** inside Firecracker that returns a valid IMDSv2 token (satisfying tools that check for IMDS availability) but returns 404 for all metadata paths, blocking access to the real EC2 instance metadata, IAM credentials, and placement information. This is a deliberate Vercel security control.
+
+The IMDSv2 hop-limit is either set to 1 (standard Firecracker defense) or the IMDS is a dummy endpoint. Either way, AWS temporary credentials are NOT accessible from the build VM via the IMDS path.
+
+### Egress Guard Confirmation (CONFIRMED)
+
+`VERCEL_CONNECT_GUARD=log` is present in the decrypted env. This is Vercel's egress monitoring mechanism operating in **log mode** (non-blocking). Outbound connections from preview builds are logged but NOT blocked. This is consistent with our observations — all outbound beacon requests succeeded without restriction.
+
+Note: This guard appears to be in "log" mode for preview builds specifically. Production builds may have stricter policy.
+
+### Cross-Project Suspense Cache Scope (CONFIRMED — ENFORCED)
+
+Probe testing confirmed that the suspense cache server enforces project-level scoping:
+- Reading own key: HTTP 200 (authorized)
+- Reading key with wrong projectId prefix: HTTP 404 (scope enforced)
+- Writing key with explicit own projectId prefix: HTTP 200 (authorized)
+
+Cross-project cache reads are NOT possible — the server validates the JWT's `projectId` claim against the requested key path. This is GOOD security hygiene from Vercel. The cache poisoning impact of this finding is limited to the SAME project's preview environment.
+
 ---
 
 ## Impact
