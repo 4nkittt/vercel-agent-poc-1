@@ -1406,5 +1406,5 @@ v34's `pid1UnixSockets` read `/proc/net/unix` (shared network namespace) and con
 
 The TWO containerd task sockets (`/run/containerd/s/{hash}`) indicate TWO containers are running on this Firecracker VM. If multi-tenancy exists (multiple customer builds on one VM), these would represent separate build containers. Access to these sockets via containerd gRPC would enable cross-container interaction.
 
-**v38 (pending — runs after project re-enable):** Tests whether these sockets are reachable via `/proc/1/root/run/` path. If YES → container escape finding.
+**Follow-up probes (v39–v42, pending project re-enable):** Testing namespace escape via `nsenter`, abstract Unix socket discovery, `/dev/vsock` for Firecracker guest↔host communication, `tcpdump` network topology, and D-Bus/containerd reachability. Additional findings will be filed as separate reports if container escape is confirmed.
 
