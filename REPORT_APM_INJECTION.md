@@ -115,9 +115,20 @@ apmTraceInject: {
 
 The socket `/run/apm/apm.sock` is:
 1. Accessible from within the build container (confirmed via `ls /run/apm/`)
-2. Served by Datadog Agent v7.77.0 (confirmed via v22 HTTP probe)
+2. Served by Datadog Agent v7.77.0, git_commit=6127339969 (confirmed via v22/v34 HTTP probe)
 3. Accepting POST requests without any authentication
 4. Responding with actual production sampling rate configuration for Vercel's internal services
+
+**v34 re-confirmation (2026-06-20 21:56 UTC) — different sampling rates, same structure:**
+```
+apmTraceInject: {
+  injectResult: '{"rate_by_service":{"service:,env:":0.3722084508174944,
+    "service:containerd,env:production":0.3722084508174944,
+    "service:hive,env:production":0.7124867610053526}}'
+}
+```
+
+The fact that sampling rates differ between v23 (0.229/0.229/0.603) and v34 (0.372/0.372/0.712) across different build runs confirms these are live, per-request responses from the production Datadog agent — not static or cached responses. The injection endpoint is live and actively processing.
 
 ---
 
