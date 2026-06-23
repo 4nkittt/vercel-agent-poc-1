@@ -1,5 +1,4 @@
 {
-  "buildCommand": "node ./scripts/probe.js",
   "outputDirectory": "public",
   "framework": null,
   "installCommand": "npm install"
